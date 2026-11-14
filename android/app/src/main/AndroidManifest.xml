@@ -60,6 +60,12 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
 
         <activity
+            android:name="org.vera20k.MixActivity"
+            android:exported="false"
+            android:label="MIX 归档"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
+
+        <activity
             android:name="org.vera20k.SettingsActivity"
             android:exported="false"
             android:label="设置"

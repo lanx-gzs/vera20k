@@ -182,16 +182,45 @@ class MapActivity : Activity() {
     }
 
     /** The preview, its schematic and the fields the INI actually carried. */
-    private fun buildPreviewCard(info: MapInfo): LinearLayout {
+    /** `[width][height][RGBA]` from the bridge, as an immutable bitmap. */
+    private fun decodePreview(bytes: ByteArray): android.graphics.Bitmap? {
+        if (bytes.size < 8) return null
+        val width = java.nio.ByteBuffer.wrap(bytes, 0, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN).int
+        val height = java.nio.ByteBuffer.wrap(bytes, 4, 4).order(java.nio.ByteOrder.LITTLE_ENDIAN).int
+        if (width !in 1..4096 || height !in 1..4096) return null
+        val pixels = bytes.copyOfRange(8, bytes.size)
+        if (pixels.size != width * height * 4) return null
+        val bitmap = android.graphics.Bitmap.createBitmap(width, height, android.graphics.Bitmap.Config.ARGB_8888)
+        bitmap.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(pixels))
+        return bitmap
+    }
+
+    private fun buildPreviewCard(info: MapInfo, preview: android.graphics.Bitmap? = null): LinearLayout {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = pill(COL_SURFACE_HI, 14, COL_OUTLINE)
             setPadding(dp(10), dp(10), dp(10), dp(12))
         }
 
-        card.addView(MapPreviewView(this, info), LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-        ))
+        if (preview != null) {
+            card.addView(android.widget.ImageView(this).apply {
+                setImageBitmap(preview)
+                scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+                adjustViewBounds = true
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+            card.addView(TextView(this).apply {
+                text = "地图自带缩略图（[PreviewPack]）"
+                sp(10f)
+                setTextColor(COL_TEXT_DIM)
+                setPadding(0, dp(6), 0, 0)
+            })
+        } else {
+            card.addView(MapPreviewView(this, info), LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }
 
         val rows = mutableListOf<Pair<String, String>>()
         if (info.parsed) {
@@ -228,7 +257,11 @@ class MapActivity : Activity() {
             card.addView(row)
         }
         card.addView(TextView(this).apply {
-            text = "缩略图是位置与规模示意，不含地形贴图：贴图在 ra2.mix / ra2md.mix 里，属游戏资源，本应用不随包分发。\n地形渲染需要解析 mix + tmp + 调色板，属于下一步；编辑请用 PC 端的 World-Altering Editor（GPLv3）。"
+            text = if (preview != null) {
+                "上面的图是地图作者打包进 [PreviewPack] 的原图，与遭遇战选图界面看到的一致；地形细节仍不随包分发。\n编辑请用 PC 端的 World-Altering Editor（GPLv3）。"
+            } else {
+                "这张地图没有 [PreviewPack]，下面是位置与规模示意，不含地形贴图：贴图在 ra2.mix / ra2md.mix 里，属游戏资源，本应用不随包分发。\n编辑请用 PC 端的 World-Altering Editor（GPLv3）。"
+            }
             sp(10f)
             setTextColor(COL_TEXT_FAINT)
             setLineSpacing(dp(2).toFloat(), 1f)
@@ -252,6 +285,8 @@ class MapActivity : Activity() {
                 // the card off the UI thread, then show it.
                 Thread {
                     val info = MapFile.read(map)
+                    // The map's own [PreviewPack] thumbnail, when it has one.
+                    val preview = MixBridge.mapPreview(map.absolutePath)?.let(::decodePreview)
                     runOnUiThread {
                         if (isFinishing) return@runOnUiThread
                         darkSheet(
@@ -262,7 +297,7 @@ class MapActivity : Activity() {
                                 append("路径  ").append(map.absolutePath)
                             },
                             actions = listOf("关闭" to {}),
-                            content = buildPreviewCard(info),
+                            content = buildPreviewCard(info, preview),
                         )
                     }
                 }.start()

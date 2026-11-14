@@ -749,6 +749,9 @@ class LauncherActivity : Activity() {
             FileKinds.isImageViewable(entry.name) -> startActivity(
                 Intent(this, ImageViewerActivity::class.java).putExtra("path", entry.absolutePath),
             )
+            entry.name.endsWith(".mix", ignoreCase = true) -> startActivity(
+                Intent(this, MixActivity::class.java).putExtra("path", entry.absolutePath),
+            )
             else -> showFileActions(entry)
         }
     }
@@ -765,6 +768,13 @@ class LauncherActivity : Activity() {
             actions += SheetAction("用文本方式打开") {
                 startActivity(
                     Intent(this, TextViewerActivity::class.java).putExtra("path", entry.absolutePath),
+                )
+            }
+        }
+        if (!entry.isDirectory && entry.name.endsWith(".mix", ignoreCase = true)) {
+            actions += SheetAction("查看 MIX 内容") {
+                startActivity(
+                    Intent(this, MixActivity::class.java).putExtra("path", entry.absolutePath),
                 )
             }
         }

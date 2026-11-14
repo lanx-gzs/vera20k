@@ -417,3 +417,264 @@ fn claim_event_loop() -> bool {
     static CLAIMED: OnceLock<()> = OnceLock::new();
     CLAIMED.set(()).is_ok()
 }
+
+// ---------------------------------------------------------------------------
+// MIX browsing for the Android file layer.
+//
+// `LauncherActivity` and `MixActivity` are plain Java activities that never run
+// the engine, but the archive and thumbnail readers already live in
+// `vera20k::assets` and `vera20k::map`. Exposing them over JNI keeps one
+// implementation instead of a Kotlin port of RSA, Blowfish and LZO. Everything
+// here is read-only: MIX bodies are plain bytes, and re-writing an archive needs
+// the private key Westwood never shipped, so extraction is the only direction.
+//
+// Registration happens in `JNI_OnLoad` because these methods are static on an
+// object the engine's own activity registration never sees.
+// ---------------------------------------------------------------------------
+
+use jni::objects::JClass;
+use jni::sys::{jboolean, jbyteArray, jint, JNI_ERR, JNI_FALSE, JNI_TRUE, JNI_VERSION_1_6};
+use std::ffi::c_void;
+use std::path::Path;
+
+/// Registers the MIX bridge as soon as the library is loaded.
+///
+/// Returns the JNI version even when registration fails: refusing to load the
+/// library would take the whole game down over a file browser.
+#[unsafe(no_mangle)]
+pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
+    let Ok(mut env) = vm.get_env() else {
+        return JNI_VERSION_1_6;
+    };
+    let Ok(class) = env.find_class("org/vera20k/MixBridge") else {
+        let _ = env.exception_clear();
+        return JNI_VERSION_1_6;
+    };
+    let methods = [
+        jni::NativeMethod {
+            name: "nativeEntries".into(),
+            sig: "(Ljava/lang/String;I)Ljava/lang/String;".into(),
+            fn_ptr: Java_org_vera20k_MixBridge_nativeEntries as *mut c_void,
+        },
+        jni::NativeMethod {
+            name: "nativeExtract".into(),
+            sig: "(Ljava/lang/String;IILjava/lang/String;)Z".into(),
+            fn_ptr: Java_org_vera20k_MixBridge_nativeExtract as *mut c_void,
+        },
+        jni::NativeMethod {
+            name: "nativeMapPreview".into(),
+            sig: "(Ljava/lang/String;)[B".into(),
+            fn_ptr: Java_org_vera20k_MixBridge_nativeMapPreview as *mut c_void,
+        },
+    ];
+    if env.register_native_methods(class, &methods).is_err() {
+        let _ = env.exception_clear();
+        return JNI_ERR;
+    }
+    JNI_VERSION_1_6
+}
+
+fn open_archive(path: &str, parent: i32) -> Result<vera20k::assets::mix_archive::MixArchive, String> {
+    use vera20k::assets::mix_archive::MixArchive;
+    let top = MixArchive::load(Path::new(path)).map_err(|error| error.to_string())?;
+    if parent == 0 {
+        return Ok(top);
+    }
+    top.nested_archive_by_id(parent)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "这个条目不是 MIX 归档".to_string())
+}
+
+/// `{"ok":true,"count":n,"bytes":n,"entries":[{id,size,offset,nested}]}`.
+///
+/// Hand-built rather than serde: the shape is three numbers per entry and adding
+/// a dependency to the Android crate would touch the lockfile the build pins.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_MixBridge_nativeEntries(
+    mut env: jni::JNIEnv,
+    _class: JClass,
+    path: JString,
+    parent: jint,
+) -> jstring {
+    let path_text = match env.get_string(&path) {
+        Ok(value) => value.to_string_lossy().into_owned(),
+        Err(_) => {
+            let _ = env.exception_clear();
+            return json_reply(&mut env, "{\"ok\":false,\"error\":\"路径无效\"}");
+        }
+    };
+    let archive = match open_archive(&path_text, parent) {
+        Ok(archive) => archive,
+        Err(error) => return json_reply(&mut env, &format!("{{\"ok\":false,\"error\":{}}}", quote(&error))),
+    };
+
+    let mut out = String::from("{\"ok\":true,\"count\":");
+    out.push_str(&archive.entry_count().to_string());
+    out.push_str(",\"bytes\":");
+    out.push_str(&archive.byte_len().to_string());
+    out.push_str(",\"entries\":[");
+    for (index, entry) in archive.entries().iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let nested = archive
+            .get_by_id(entry.id)
+            .map(vera20k::assets::mix_archive::MixArchive::looks_like_mix)
+            .unwrap_or(false);
+        out.push_str(&format!(
+            "{{\"id\":{},\"size\":{},\"offset\":{},\"nested\":{}}}",
+            entry.id, entry.size, entry.offset, nested
+        ));
+    }
+    out.push_str("]}");
+    json_reply(&mut env, &out)
+}
+
+/// Writes one entry to `out`. Returns whether the file landed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_MixBridge_nativeExtract(
+    mut env: jni::JNIEnv,
+    _class: JClass,
+    path: JString,
+    parent: jint,
+    id: jint,
+    out: JString,
+) -> jboolean {
+    let read = |env: &mut jni::JNIEnv, value: &JString| -> Option<String> {
+        env.get_string(value)
+            .ok()
+            .map(|text| text.to_string_lossy().into_owned())
+    };
+    let (Some(path_text), Some(out_text)) = (read(&mut env, &path), read(&mut env, &out)) else {
+        let _ = env.exception_clear();
+        return JNI_FALSE;
+    };
+    let Ok(archive) = open_archive(&path_text, parent) else {
+        return JNI_FALSE;
+    };
+    let Some(bytes) = archive.get_by_id(id) else {
+        return JNI_FALSE;
+    };
+    let target = Path::new(&out_text);
+    if let Some(parent) = target.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(target, bytes) {
+        Ok(()) => JNI_TRUE,
+        Err(error) => {
+            log::warn!("MIX extract to {out_text} failed: {error}");
+            JNI_FALSE
+        }
+    }
+}
+
+/// The map's own preview, as `[width][height][RGBA...]`, or an empty array.
+///
+/// Retail maps carry `[PreviewPack]`: base64 LZO over 8-bit palette indices, the
+/// picture the skirmish screen shows. Decoding it needs no MIX archive and no
+/// terrain tiles, which is why this is the cheap way to replace the schematic.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_MixBridge_nativeMapPreview(
+    mut env: jni::JNIEnv,
+    _class: JClass,
+    path: JString,
+) -> jbyteArray {
+    let empty = |env: &mut jni::JNIEnv| -> jbyteArray {
+        match env.new_byte_array(0) {
+            Ok(array) => array.into_raw(),
+            Err(_) => {
+                let _ = env.exception_clear();
+                std::ptr::null_mut()
+            }
+        }
+    };
+    let Ok(path_text) = env
+        .get_string(&path)
+        .map(|text| text.to_string_lossy().into_owned())
+    else {
+        let _ = env.exception_clear();
+        return empty(&mut env);
+    };
+    let Ok(bytes) = std::fs::read(&path_text) else {
+        return empty(&mut env);
+    };
+    let Some((width, height, pack)) = preview_fields(&bytes) else {
+        return empty(&mut env);
+    };
+    let Ok(decoded) = vera20k::map::preview::decode_preview_pack(&pack, width, height) else {
+        return empty(&mut env);
+    };
+
+    let mut payload = Vec::with_capacity(8 + decoded.rgba.len());
+    payload.extend_from_slice(&(decoded.width as u32).to_le_bytes());
+    payload.extend_from_slice(&(decoded.height as u32).to_le_bytes());
+    payload.extend_from_slice(&decoded.rgba);
+    match env.byte_array_from_slice(&payload) {
+        Ok(array) => array.into_raw(),
+        Err(_) => {
+            let _ = env.exception_clear();
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// `[Preview] Size` and the concatenated `[PreviewPack]` values.
+fn preview_fields(bytes: &[u8]) -> Option<(u32, u32, String)> {
+    let text = String::from_utf8_lossy(bytes);
+    let mut section = String::new();
+    let mut size: Option<(u32, u32)> = None;
+    let mut pack = String::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            section = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        match section.as_str() {
+            // `Size` is a ReadRect: x, y, width, height.
+            "preview" if key == "size" => {
+                let numbers: Vec<i64> = value
+                    .split(',')
+                    .filter_map(|part| part.trim().parse().ok())
+                    .collect();
+                if let [_, _, width, height] = numbers.as_slice() {
+                    if *width > 0 && *height > 0 {
+                        size = Some((*width as u32, *height as u32));
+                    }
+                }
+            }
+            "previewpack" => pack.push_str(value.trim()),
+            _ => {}
+        }
+    }
+    size.map(|(width, height)| (width, height, pack))
+}
+
+fn quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn json_reply(env: &mut jni::JNIEnv, body: &str) -> jstring {
+    match env.new_string(body) {
+        Ok(value) => value.into_raw(),
+        Err(_) => {
+            let _ = env.exception_clear();
+            std::ptr::null_mut()
+        }
+    }
+}
