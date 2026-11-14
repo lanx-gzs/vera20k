@@ -945,6 +945,12 @@ impl ApplicationHandler for App {
                 event.state.is_pressed(),
                 paused,
             );
+            // The on-screen chips are not keys: nothing else would carry them
+            // past this event, which rebuilt the modifier views above.
+            crate::app::input::sticky_modifiers::apply(&mut state.platform.live_modifiers);
+            crate::app::input::sticky_modifiers::apply(
+                &mut state.match_state.input.hotkey_modifiers,
+            );
         }
         // Keep physical button/modifier releases above alive while the modal
         // load owns input, so a key released here cannot stick after restore.
@@ -1927,6 +1933,12 @@ impl ApplicationHandler for App {
                 return;
             }
             Self::follow_window_full_screen(state);
+            // Ctrl / Shift / Alt held from the on-screen chips: re-asserted
+            // every frame, because a focus change clears both modifier views.
+            crate::app::input::sticky_modifiers::apply(&mut state.platform.live_modifiers);
+            crate::app::input::sticky_modifiers::apply(
+                &mut state.match_state.input.hotkey_modifiers,
+            );
             // cursor lock: the OS drops the clip on focus loss /
             // Windows key, so re-assert the player's choice every frame while
             // the window is focused. Presentation-only, never part of the sim.
@@ -1934,6 +1946,10 @@ impl ApplicationHandler for App {
             // Captures keep their sealed input; they never ask for an IME.
             if self.shell_capture.is_none() && self.hidden_run.is_none() {
                 crate::app::input::ime::sync(state);
+                // Text from the Android keyboard overlay arrives here rather
+                // than as a winit event: that backend has no input connection.
+                #[cfg(target_os = "android")]
+                crate::app::input::ime::drain_injected(state);
             }
             Self::update_saved_seed_browser_scroll(state, false);
             Self::update_load_saved_game_scroll(state, false);

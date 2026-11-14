@@ -172,6 +172,77 @@ pub extern "system" fn Java_org_vera20k_VeraActivity_nativeImportProgress(
     import_status::note(ImportEvent::Progress(copied_bytes.max(0) as u64));
 }
 
+/// The activity's keyboard overlay: the finished run, committed into the chat
+/// edit that currently takes keys.
+///
+/// NativeActivity has no input connection, so winit never asks for a system
+/// keyboard here. The activity shows its own `EditText` and calls this; the
+/// engine queues the run and commits it on the event thread, which is where
+/// every other `Ime::Commit` is applied.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTypeText(
+    mut env: jni::JNIEnv,
+    _activity: JObject,
+    text: JString,
+) {
+    match env.get_string(&text) {
+        Ok(text) => {
+            let text = text.to_string_lossy().into_owned();
+            log::info!("ime overlay: committing {} chars", text.chars().count());
+            vera20k::inject_ime_commit(&text);
+        }
+        Err(error) => {
+            log::error!("ime overlay: cannot read the text: {error}");
+            let _ = env.exception_clear();
+        }
+    }
+}
+
+/// Whether a chat edit takes text now. The overlay asks first: text typed while
+/// none is open would be dropped by the commit's `None` arm, so the player is
+/// told to open the chat instead of losing what they typed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeImeChatOpen(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) -> jni::sys::jboolean {
+    if vera20k::ime_chat_open() { 1 } else { 0 }
+}
+
+/// Toggle one on-screen modifier chip. Returns whether that chip is now held.
+///
+/// Touch-screen players cannot hold Ctrl while tapping a target, and a
+/// synthetic key event would be overwritten by winit's next modifier rebuild.
+/// The flag lives in the engine's input layer instead, so "force attack" stays
+/// armed until the same chip is tapped again.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeSetModifier(
+    mut env: jni::JNIEnv,
+    _activity: JObject,
+    name: JString,
+    down: jni::sys::jboolean,
+) -> jni::sys::jboolean {
+    let held = match env.get_string(&name) {
+        Ok(name) => vera20k::set_sticky_modifier(&name.to_string_lossy(), down != 0).unwrap_or(false),
+        Err(error) => {
+            log::error!("modifier chip: cannot read the name: {error}");
+            let _ = env.exception_clear();
+            false
+        }
+    };
+    if held { 1 } else { 0 }
+}
+
+/// Which chips are lit: 1 Ctrl, 2 Shift, 4 Alt. Read after the overlay is
+/// re-attached, so a rotation cannot leave the chips lying about the state.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeModifierMask(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) -> jni::sys::jint {
+    i32::from(vera20k::sticky_modifier_mask())
+}
+
 /// Bind `nativeOnFolderPicked` to this activity's class.
 ///
 /// Registered from `android_main`, not `JNI_OnLoad`: `FindClass` on the loading
@@ -210,6 +281,26 @@ fn register_folder_picker_native() -> bool {
                 sig: "(Ljava/lang/String;)Ljava/lang/String;".into(),
                 fn_ptr: Java_org_vera20k_VeraActivity_nativeConfigForImport
                     as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeTypeText".into(),
+                sig: "(Ljava/lang/String;)V".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeTypeText as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeImeChatOpen".into(),
+                sig: "()Z".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeImeChatOpen as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeSetModifier".into(),
+                sig: "(Ljava/lang/String;Z)Z".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeSetModifier as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeModifierMask".into(),
+                sig: "()I".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeModifierMask as *mut std::ffi::c_void,
             },
         ];
         let registered = env.register_native_methods(class, &methods).is_ok();

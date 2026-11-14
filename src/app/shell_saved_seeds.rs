@@ -312,7 +312,7 @@ impl App {
         }
     }
 
-    pub(super) fn handle_saved_seed_browser_key(
+    pub(crate) fn handle_saved_seed_browser_key(
         state: &mut AppState,
         code: Option<KeyCode>,
         text: Option<&str>,

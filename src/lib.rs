@@ -91,3 +91,38 @@ mod browser_lifecycle;
 #[cfg(all(feature = "wasm", any(test, all(target_arch = "wasm32", target_os = "unknown"))))]
 #[path = "web/ime_protocol.rs"]
 mod browser_ime;
+
+/// Text from the Android keyboard overlay, as if the system input method had
+/// committed it.
+///
+/// Only Android needs this: `android-native-activity` gives winit no input
+/// connection, so `Window::set_ime_allowed` does nothing and no `Ime` event
+/// arrives. The activity hosts an `EditText` and calls this with the finished
+/// run; the event loop drains it once per frame, so the text lands in the same
+/// chat edit an OS commit would and nowhere else.
+#[cfg(target_os = "android")]
+pub fn inject_ime_commit(text: &str) {
+    crate::app::input::ime::inject_commit(text);
+}
+
+/// Whether a chat edit takes text on the last frame, for the same overlay.
+#[cfg(target_os = "android")]
+pub fn ime_chat_open() -> bool {
+    crate::app::input::ime::chat_open()
+}
+
+/// Set or clear one on-screen modifier chip (Ctrl, Shift, Alt).
+///
+/// The flags are OR-ed into every modifier read the input layer does, so a chip
+/// behaves like a held key until it is tapped again. Returns the new state of
+/// that chip; `None` when the name is unknown.
+#[cfg(target_os = "android")]
+pub fn set_sticky_modifier(name: &str, down: bool) -> Option<bool> {
+    crate::app::input::sticky_modifiers::set(name, down)
+}
+
+/// Which chips are lit, so the activity can redraw them after re-attaching.
+#[cfg(target_os = "android")]
+pub fn sticky_modifier_mask() -> u8 {
+    crate::app::input::sticky_modifiers::mask()
+}

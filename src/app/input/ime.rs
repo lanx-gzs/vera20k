@@ -131,6 +131,9 @@ pub(crate) fn sync(state: &mut AppState) {
     }
     let found = target(state);
     let target = found.map(|(target, _)| target);
+    // Asks about every NewEdit, not just the chat lines: the overlay's button
+    // must open for a save-name field too.
+    let text_open = text_entry_open(state);
     let platform = &mut state.platform;
     let ime = &mut platform.ime;
     if ime.target != target {
@@ -159,6 +162,8 @@ pub(crate) fn sync(state: &mut AppState) {
     if ime.allowed {
         crate::web::ime::keep_focus();
     }
+    #[cfg(target_os = "android")]
+    CHAT_OPEN.store(text_open, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// One winit `Ime` event.
@@ -184,18 +189,111 @@ pub(crate) fn event(state: &mut AppState, event: Ime) {
     state.platform.window.request_redraw();
 }
 
+/// Whether a chat edit took IME text on the last frame.
+///
+/// The Android overlay asks before it opens a keyboard, so a player who forgot
+/// to open the chat is told, rather than typing into a dialog whose text is
+/// then dropped by [`commit`]'s `None` arm.
+#[cfg(target_os = "android")]
+static CHAT_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Text runs typed outside the event loop.
+///
+/// Android's `android-native-activity` backend has no input connection, so
+/// winit never delivers an `Ime` event there and the system keyboard cannot be
+/// asked for one. The activity shows its own `EditText` instead and posts the
+/// finished run here; the loop drains it at the top of each frame (see
+/// `AppHandler::about_to_wait`), so every commit still happens on the thread
+/// that owns the state, in the same order an OS commit would.
+#[cfg(target_os = "android")]
+static INJECTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_os = "android")]
+pub(crate) fn inject_commit(text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let mut queue = INJECTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // A burst of frames cannot hold more than a chat line's worth; dropping the
+    // excess keeps a stuck overlay from growing the queue without bound.
+    if queue.len() < 8 {
+        queue.push(text.to_owned());
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn drain_injected(state: &mut AppState) {
+    let pending = {
+        let mut queue = INJECTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *queue)
+    };
+    for text in pending {
+        event(state, Ime::Commit(text));
+    }
+}
+
+/// Whether a chat edit takes text now, for the activity's overlay button.
+#[cfg(target_os = "android")]
+pub(crate) fn chat_open() -> bool {
+    CHAT_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// WM_IME_CHAR's consumers: the in-game queue and NewEdit's WM_CHAR insertion,
 /// here each screen's own text path.
+///
+/// The chat lines keep their own paths; every other NewEdit (the save-game
+/// description field, the saved-seed name field, the skirmish player name)
+/// ignores text unless its own editor holds focus, so trying them in order is
+/// safe and no screen can steal another's run.
 fn commit(state: &mut AppState, text: &str) {
-    match target(state).map(|(target, _)| target) {
-        Some(ImeTarget::InGameChat) => crate::app::input::chat::commit_text(state, text),
-        Some(ImeTarget::LanLobbyChat) => crate::app::shell_lan::key_press(state, None, Some(text)),
-        Some(ImeTarget::SetupChat) => {
-            crate::app::input::multiplayer_setup::key_press(state, None, Some(text))
+    if let Some(target) = target(state).map(|(target, _)| target) {
+        match target {
+            ImeTarget::InGameChat => crate::app::input::chat::commit_text(state, text),
+            ImeTarget::LanLobbyChat => crate::app::shell_lan::key_press(state, None, Some(text)),
+            ImeTarget::SetupChat => {
+                crate::app::input::multiplayer_setup::key_press(state, None, Some(text))
+            }
+            ImeTarget::WolLobbyChat => {
+                crate::app::shell_wol::lobby::key_press(state, None, Some(text))
+            }
         }
-        Some(ImeTarget::WolLobbyChat) => {
-            crate::app::shell_wol::lobby::key_press(state, None, Some(text))
-        }
-        None => {}
+        return;
     }
+    // Save Game / Saved Seeds name fields (both are `SavedSeedBrowserState`).
+    crate::app::App::saved_game_key(state, None, Some(text));
+    crate::app::App::handle_saved_seed_browser_key(state, None, Some(text));
+    if state.frontend.skirmish_shell_state.player_name_edit.focused {
+        state
+            .frontend
+            .skirmish_shell_state
+            .player_name_edit
+            .insert_text(text);
+    }
+}
+
+/// Whether any NewEdit takes committed text now — not only the chat lines.
+///
+/// The Android overlay asks this before it opens a keyboard: a save-name field
+/// is as much a text field as a chat line, and refusing there was the bug that
+/// made saving unusable.
+#[cfg(target_os = "android")]
+fn text_entry_open(state: &AppState) -> bool {
+    target(state).is_some()
+        || state
+            .match_state
+            .match_presentation
+            .saved_game_browser
+            .as_ref()
+            .is_some_and(|browser| browser.description_edit.focused)
+        || state
+            .frontend
+            .skirmish_shell_state
+            .saved_seed_browser
+            .as_ref()
+            .is_some_and(|browser| browser.description_edit.focused)
+        || state.frontend.skirmish_shell_state.player_name_edit.focused
 }

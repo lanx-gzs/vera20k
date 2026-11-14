@@ -27,6 +27,7 @@ pub(crate) mod precedence;
 pub(crate) mod radar;
 pub(crate) mod sidebar_eva;
 pub(crate) mod state;
+pub(crate) mod sticky_modifiers;
 #[cfg(feature = "phobos")]
 pub(crate) mod sw_sidebar;
 pub(crate) mod superweapon_cameo;

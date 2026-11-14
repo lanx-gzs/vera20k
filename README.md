@@ -1,3 +1,8 @@
+> **This is VeraZip**, an unofficial Android build of VERA20K. It is not VERA20K and is not
+> affiliated with or endorsed by the VERA20K project; it is marked as changed, uses its own
+> name, icon and package id (`org.verazip`), and ships no game files. What changed, how to build
+> it, and the licensing terms are in [VERAZIP.md](VERAZIP.md).
+
 <img src="docs/images/new-conscirpt-hero-image.png" alt="VERA20K hero image" width="100%">
 
 <p align="center" dir="ltr">

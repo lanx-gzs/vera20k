@@ -18,12 +18,64 @@
         android:required="false" />
 
     <application
-        android:label="VERA20K"
+        android:label="VeraZip"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:hasCode="true"
         android:largeHeap="true"
         android:extractNativeLibs="false"
         android:allowBackup="false"
         android:theme="@style/Theme.Vera20k">
+
+        <!-- The entry point: a resource inspector for the imported game files,
+             with a button that starts the engine. It exists in this build
+             because the engine's own shell cannot show a player what the import
+             put on the phone; it also carries the "modified version" notice.
+             Portrait is fine here, unlike the game surface. -->
+        <activity
+            android:name="org.vera20k.LauncherActivity"
+            android:exported="true"
+            android:label="VeraZip"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection">
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- The browser's own screens: readers for text and images, and the
+             switches. None of them takes a content URI from another app, so
+             they stay unexported. -->
+        <activity
+            android:name="org.vera20k.TextViewerActivity"
+            android:exported="false"
+            android:label="文本查看器"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
+
+        <activity
+            android:name="org.vera20k.ImageViewerActivity"
+            android:exported="false"
+            android:label="图片查看器"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
+
+        <activity
+            android:name="org.vera20k.SettingsActivity"
+            android:exported="false"
+            android:label="设置"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
+
+        <activity
+            android:name="org.vera20k.CampaignActivity"
+            android:exported="false"
+            android:label="战役"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
+
+        <activity
+            android:name="org.vera20k.MapActivity"
+            android:exported="false"
+            android:label="地图"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
 
         <!-- NativeActivity loads android.app.lib_name and calls android_main in
              libvera20k_android.so (android/src/lib.rs). configChanges lists
@@ -31,7 +83,7 @@
              reaches Rust as a resize instead of destroying the activity. -->
         <activity
             android:name="org.vera20k.VeraActivity"
-            android:exported="true"
+            android:exported="false"
             android:launchMode="singleTask"
             android:screenOrientation="sensorLandscape"
             android:resizeableActivity="true"
@@ -43,10 +95,6 @@
                 android:name="android.app.lib_name"
                 android:value="vera20k_android" />
 
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
         </activity>
     </application>
 

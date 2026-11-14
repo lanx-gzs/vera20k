@@ -37,7 +37,10 @@ android {
     ndkVersion = "28.2.13676358"
 
     defaultConfig {
-        applicationId = "org.vera20k"
+        // This is a changed version, so it installs and identifies itself apart
+        // from the official app; LEGAL.md reserves the VERA20K name and package
+        // for the upstream builds.
+        applicationId = "org.verazip"
         // cpal 0.17's Android backend is AAudio, which needs API 26.
         minSdk = 26
         targetSdk = 36
