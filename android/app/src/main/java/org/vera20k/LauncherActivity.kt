@@ -7,6 +7,7 @@ import android.graphics.Color
 import android.graphics.PorterDuff
 import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
 import android.text.InputType
@@ -91,6 +92,14 @@ class LauncherActivity : Activity() {
     private lateinit var pathView: TextView
     private lateinit var upButton: TextView
     private lateinit var enterButton: TextView
+    private lateinit var heroSub: TextView
+
+    private var activeTab = 0
+    private lateinit var tabHome: View
+    private lateinit var tabFiles: View
+    private lateinit var tabMine: View
+    private val navIcons = mutableListOf<ImageView>()
+    private val navLabels = mutableListOf<TextView>()
 
     private var progressDialog: Dialog? = null
     private var progressText: TextView? = null
@@ -121,6 +130,7 @@ class LauncherActivity : Activity() {
 
         setContentView(buildLayout())
         showDirectory(gameRoot)
+        showTab(0)
         // Nothing to browse until the two archives are in place: lead with the
         // wizard instead of showing an empty folder and a red status card.
         if (!archivesPresent(gameRoot)) showWizard()
@@ -133,15 +143,22 @@ class LauncherActivity : Activity() {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(COL_BG)
         }
-        root.addView(buildHeader())
-        root.addView(buildStatusCard())
-        root.addView(buildEntryRow())
-        root.addView(buildSearchBar())
-        root.addView(buildPathBar())
-        root.addView(buildListArea(), LinearLayout.LayoutParams(
+
+        tabHome = buildHomeTab()
+        tabFiles = buildFilesTab()
+        tabMine = buildMineTab()
+
+        val host = FrameLayout(this).apply {
+            addView(tabHome, full())
+            addView(tabFiles, full())
+            addView(tabMine, full())
+        }
+        root.addView(host, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
         ))
-        root.addView(buildFooter())
+        root.addView(buildBottomBar(), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
 
         // The wizard is a full-screen layer rather than a second activity, so a
         // failed import can fall back to the folder it was already browsing.
@@ -150,6 +167,307 @@ class LauncherActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
         ))
         return overlayHost
+    }
+
+    private fun full() = FrameLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+    )
+
+    /** 0 首页, 1 文件, 2 我的. One content pane at a time, no fragments needed. */
+    private fun showTab(index: Int) {
+        activeTab = index
+        tabHome.visibility = if (index == 0) View.VISIBLE else View.GONE
+        tabFiles.visibility = if (index == 1) View.VISIBLE else View.GONE
+        tabMine.visibility = if (index == 2) View.VISIBLE else View.GONE
+        for (i in 0 until 3) {
+            val colour = if (i == index) COL_ACCENT else COL_TEXT_DIM
+            navIcons.getOrNull(i)?.setColorFilter(colour, PorterDuff.Mode.SRC_IN)
+            navLabels.getOrNull(i)?.setTextColor(colour)
+        }
+        // Coming back to the browser after an import elsewhere should show that
+        // import rather than a list read before it happened.
+        if (index == 1) currentDir?.let { showDirectory(it) }
+    }
+
+    private fun buildHomeTab(): View {
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        column.addView(buildHeader())
+        column.addView(buildStatusCard())
+        column.addView(buildHeroCard())
+        column.addView(buildEntryRow())
+        column.addView(buildQuickRow())
+        return ScrollView(this).apply {
+            isFillViewport = true
+            clipToPadding = false
+            addView(column, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }
+    }
+
+    /** The one warm surface here: launching is the only thing this screen is for. */
+    private fun buildHeroCard(): View {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(17), dp(18), dp(16))
+            background = GradientDrawable(
+                GradientDrawable.Orientation.TL_BR,
+                intArrayOf(0xFF27221A.toInt(), 0xFF14161A.toInt()),
+            ).apply {
+                cornerRadius = dp(20).toFloat()
+                setStroke(dp(1), 0x40EFB44C)
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                leftMargin = dp(18)
+                rightMargin = dp(18)
+                topMargin = dp(12)
+            }
+        }
+        card.addView(TextView(this).apply {
+            text = "开始游戏"
+            sp(21f)
+            setTextColor(COL_TEXT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            letterSpacing = 0.02f
+        })
+        heroSub = TextView(this).apply {
+            text = "RA2: YR 引擎 · 正在检查资源"
+            sp(11f)
+            setTextColor(COL_TEXT_DIM)
+            setPadding(0, dp(4), 0, 0)
+        }
+        card.addView(heroSub)
+        enterButton = TextView(this).apply {
+            text = "进入游戏"
+            sp(16f)
+            setTextColor(COL_DARK_TEXT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            gravity = Gravity.CENTER
+            letterSpacing = 0.05f
+            background = ripple(accentButton(26), 0x40FFFFFF)
+            setOnClickListener { launchGame() }
+        }
+        card.addView(enterButton, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(50),
+        ).apply { topMargin = dp(14) })
+        return card
+    }
+
+    /** Import and rescan, as two equal pills rather than a footer toolbar. */
+    private fun buildQuickRow(): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(18), dp(10), dp(18), dp(16))
+        }
+        val import = TextView(this).apply {
+            text = "导入资源"
+            sp(13f)
+            gravity = Gravity.CENTER
+            setTextColor(COL_ACCENT)
+            background = ripple(pill(COL_SURFACE, 14, 0x33EFB44C), 0x26FFFFFF)
+            setOnClickListener { showImportSheet() }
+        }
+        val rescan = TextView(this).apply {
+            text = "重新检查"
+            sp(13f)
+            gravity = Gravity.CENTER
+            setTextColor(COL_TEXT)
+            background = ripple(pill(COL_SURFACE_HI, 14, COL_OUTLINE))
+            setOnClickListener { currentDir?.let { showDirectory(it) } }
+        }
+        row.addView(import, LinearLayout.LayoutParams(0, dp(46), 1f).apply { rightMargin = dp(10) })
+        row.addView(rescan, LinearLayout.LayoutParams(0, dp(46), 1f))
+        return row
+    }
+
+    private fun buildFilesTab(): View {
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        column.addView(TextView(this).apply {
+            text = "文件"
+            sp(19f)
+            setTextColor(COL_TEXT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setPadding(dp(18), dp(14), dp(18), dp(0))
+        })
+        column.addView(buildSearchBar())
+        column.addView(buildPathBar())
+        column.addView(buildListArea(), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
+        ))
+        column.addView(buildFooter())
+        return column
+    }
+
+    private fun buildMineTab(): View {
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        column.addView(TextView(this).apply {
+            text = "我的"
+            sp(19f)
+            setTextColor(COL_TEXT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setPadding(dp(18), dp(14), dp(18), dp(2))
+        })
+
+        val tools = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = cardBg()
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                leftMargin = dp(18)
+                rightMargin = dp(18)
+                topMargin = dp(10)
+            }
+        }
+        tools.addView(mineRow(R.drawable.ic_settings, "设置", "导入方式、引擎参数、跳过检查器") {
+            startActivity(Intent(this@LauncherActivity, SettingsActivity::class.java))
+        })
+        tools.addView(divider())
+        tools.addView(mineRow(R.drawable.ic_tools, "战役浏览", "4 个战役 · 关卡名") {
+            startActivity(Intent(this@LauncherActivity, CampaignActivity::class.java))
+        })
+        tools.addView(divider())
+        tools.addView(mineRow(R.drawable.ic_folder_tool, "地图浏览", ".map / .mpr / .yrm 缩略图") {
+            startActivity(Intent(this@LauncherActivity, MapActivity::class.java))
+        })
+        column.addView(tools)
+
+        val about = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = cardBg()
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                leftMargin = dp(18)
+                rightMargin = dp(18)
+                topMargin = dp(10)
+                bottomMargin = dp(18)
+            }
+        }
+        about.addView(TextView(this).apply {
+            text = "VeraZip 0.2.7"
+            sp(14f)
+            setTextColor(COL_TEXT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        })
+        about.addView(TextView(this).apply {
+            text = "org.verazip · arm64-v8a · 非官方修改版"
+            sp(11f)
+            setTextColor(COL_TEXT_DIM)
+            setPadding(0, dp(4), 0, dp(10))
+        })
+        about.addView(TextView(this).apply {
+            text = "本应用基于 VERA20K 修改，按 GPLv3 第 5(a) 条标注修改、第 6 条随附源码。" +
+                "VERA20K 的名称与图标权属其作者，本改名版不使用其商标，仅作事实性署名。\n" +
+                "源码：github.com/lanx-gzs/vera20k（分支 verazip）"
+            sp(11f)
+            setTextColor(COL_TEXT_DIM)
+            setLineSpacing(dp(3).toFloat(), 1.05f)
+        })
+        column.addView(about)
+
+        return ScrollView(this).apply {
+            isFillViewport = true
+            addView(column, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }
+    }
+
+    private fun mineRow(icon: Int, title: String, sub: String, onClick: () -> Unit): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(13), dp(14), dp(13))
+            setOnClickListener { onClick() }
+            background = ripple(square(Color.TRANSPARENT, 0))
+            val image = ImageView(this@LauncherActivity).apply {
+                setImageResource(icon)
+                setColorFilter(COL_ACCENT, PorterDuff.Mode.SRC_IN)
+                scaleType = ImageView.ScaleType.FIT_CENTER
+            }
+            val column = LinearLayout(this@LauncherActivity).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), 0, dp(10), 0)
+            }
+            column.addView(TextView(this@LauncherActivity).apply {
+                text = title
+                sp(13f)
+                setTextColor(COL_TEXT)
+            })
+            column.addView(TextView(this@LauncherActivity).apply {
+                text = sub
+                sp(10f)
+                setTextColor(COL_TEXT_DIM)
+                setPadding(0, dp(2), 0, 0)
+            })
+            val chevron = ImageView(this@LauncherActivity).apply {
+                setImageResource(R.drawable.ic_chevron)
+                setColorFilter(COL_TEXT_FAINT, PorterDuff.Mode.SRC_IN)
+            }
+            addView(image, LinearLayout.LayoutParams(dp(20), dp(20)))
+            addView(column, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(chevron, LinearLayout.LayoutParams(dp(14), dp(14)))
+        }
+
+    private fun divider(): View = View(this).apply {
+        setBackgroundColor(0x14FFFFFF)
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(1),
+        )
+    }
+
+    /** A floating pill over the content, the shape modern phone apps settled on. */
+    private fun buildBottomBar(): View {
+        val wrap = FrameLayout(this).apply {
+            setPadding(dp(12), dp(6), dp(12), dp(10))
+        }
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(6), dp(6), dp(6), dp(6))
+            background = pill(COL_SURFACE, 26, COL_OUTLINE)
+        }
+        bar.addView(navItem(R.drawable.ic_home, "首页", 0),
+            LinearLayout.LayoutParams(0, dp(52), 1f))
+        bar.addView(navItem(R.drawable.ic_folder, "文件", 1),
+            LinearLayout.LayoutParams(0, dp(52), 1f))
+        bar.addView(navItem(R.drawable.ic_person, "我的", 2),
+            LinearLayout.LayoutParams(0, dp(52), 1f))
+        wrap.addView(bar, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(64),
+        ))
+        return wrap
+    }
+
+    private fun navItem(icon: Int, label: String, index: Int): View {
+        val item = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            isClickable = true
+            background = ripple(square(Color.TRANSPARENT, 20))
+            setOnClickListener { showTab(index) }
+        }
+        val image = ImageView(this).apply {
+            setImageResource(icon)
+            setColorFilter(COL_TEXT_DIM, PorterDuff.Mode.SRC_IN)
+            scaleType = ImageView.ScaleType.FIT_CENTER
+        }
+        val text = TextView(this).apply {
+            text = label
+            sp(10f)
+            setTextColor(COL_TEXT_DIM)
+            setPadding(0, dp(3), 0, 0)
+            letterSpacing = 0.06f
+        }
+        item.addView(image, LinearLayout.LayoutParams(dp(21), dp(21)))
+        item.addView(text)
+        navIcons.add(image)
+        navLabels.add(text)
+        return item
     }
 
     /** Two doors into the reference screens, kept next to the status they explain. */
@@ -463,45 +781,31 @@ class LauncherActivity : Activity() {
     }
 
     private fun buildFooter(): View {
-        val footer = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(18), dp(10), dp(18), dp(12))
-        }
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(18), dp(8), dp(18), dp(10))
         }
         val refresh = TextView(this).apply {
             text = "刷新"
-            sp(13f)
+            sp(12f)
             setTextColor(COL_TEXT)
             gravity = Gravity.CENTER
-            background = ripple(pill(COL_SURFACE_HI, 14, COL_OUTLINE))
+            background = ripple(pill(COL_SURFACE_HI, 13, COL_OUTLINE))
             setOnClickListener { currentDir?.let { showDirectory(it) } }
         }
-        enterButton = TextView(this).apply {
-            text = "进入游戏"
-            sp(15f)
+        val import = TextView(this).apply {
+            text = "导入文件或 ZIP"
+            sp(13f)
             setTextColor(COL_DARK_TEXT)
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             gravity = Gravity.CENTER
-            letterSpacing = 0.04f
-            background = ripple(accentButton(26), 0x40FFFFFF)
-            setOnClickListener { launchGame() }
+            background = ripple(accentButton(23), 0x40FFFFFF)
+            setOnClickListener { showImportSheet() }
         }
-        row.addView(refresh, LinearLayout.LayoutParams(dp(84), dp(52)).apply { rightMargin = dp(10) })
-        row.addView(enterButton, LinearLayout.LayoutParams(0, dp(52), 1f))
-
-        val source = TextView(this).apply {
-            text = "基于 VERA20K 修改 · 源码 github.com/lanx-gzs/vera20k"
-            sp(10f)
-            setTextColor(COL_TEXT_FAINT)
-            gravity = Gravity.CENTER
-            setPadding(0, dp(10), 0, 0)
-        }
-        footer.addView(row)
-        footer.addView(source)
-        return footer
+        row.addView(refresh, LinearLayout.LayoutParams(dp(78), dp(44)).apply { rightMargin = dp(10) })
+        row.addView(import, LinearLayout.LayoutParams(0, dp(44), 1f))
+        return row
     }
 
     // --- file list ----------------------------------------------------------
@@ -689,11 +993,16 @@ class LauncherActivity : Activity() {
                     "两个 *.mix 都在位，可以开始游戏"
                 } else {
                     "缺 " + REQUIRED_ARCHIVES.filter { present[it] != true }.joinToString(" / ") +
-                        " · 可用右上角导入补齐"
+                        " · 用下面的导入补齐"
                 }
                 sizeValue.text = formatSize(bytes)
                 sizeCount.text = String.format(Locale.US, "%,d 个文件", files)
                 enterButton.text = if (complete) "进入游戏" else "进入游戏 · 缺资源"
+                heroSub.text = if (complete) {
+                    "ra2md.mix / ra2.mix 就位 · 可直接进入"
+                } else {
+                    "还缺 " + REQUIRED_ARCHIVES.filter { present[it] != true }.joinToString(" / ")
+                }
             }
         }.start()
     }
