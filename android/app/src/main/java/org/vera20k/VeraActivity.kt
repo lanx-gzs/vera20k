@@ -77,7 +77,7 @@ class VeraActivity : NativeActivity() {
         /** What the engine opens directly; a folder without these is not RA2. */
         val REQUIRED_ARCHIVES = listOf("ra2md.mix", "ra2.mix")
 
-        const val TAG = "VERA20K"
+        const val TAG = "VeraZip"
     }
 
     /** Which picker the player chose in [showImportMethodDialog]. */

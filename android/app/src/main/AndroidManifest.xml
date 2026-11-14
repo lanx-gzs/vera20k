@@ -25,7 +25,7 @@
         android:largeHeap="true"
         android:extractNativeLibs="false"
         android:allowBackup="false"
-        android:theme="@style/Theme.Vera20k">
+        android:theme="@style/Theme.VeraZip">
 
         <!-- The entry point: a resource inspector for the imported game files,
              with a button that starts the engine. It exists in this build

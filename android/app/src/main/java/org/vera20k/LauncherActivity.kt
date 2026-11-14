@@ -51,7 +51,7 @@ class LauncherActivity : Activity() {
         /** The engine opens these directly; without them it cannot start a game. */
         val REQUIRED_ARCHIVES = listOf("ra2md.mix", "ra2.mix")
 
-        const val TAG = "VERA20K"
+        const val TAG = "VeraZip"
         const val REQUEST_IMPORT_FILES = 0x5654
         const val REQUEST_IMPORT_ZIP = 0x5655
         const val REQUEST_IMPORT_TREE = 0x5656
@@ -493,7 +493,7 @@ class LauncherActivity : Activity() {
         row.addView(enterButton, LinearLayout.LayoutParams(0, dp(52), 1f))
 
         val source = TextView(this).apply {
-            text = "基于 VERA20K · 源码 github.com/YuriPlanet/vera20k"
+            text = "基于 VERA20K 修改 · 源码 github.com/lanx-gzs/vera20k"
             sp(10f)
             setTextColor(COL_TEXT_FAINT)
             gravity = Gravity.CENTER

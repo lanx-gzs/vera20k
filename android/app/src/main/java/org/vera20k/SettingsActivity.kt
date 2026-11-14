@@ -122,7 +122,8 @@ class SettingsActivity : Activity() {
         aboutCard.addView(divider())
         aboutCard.addView(hintRow(
             "本应用基于 VERA20K 修改，按 GPLv3 第 5(a) 条标注修改、第 6 条随附源码。\n" +
-                "源码：github.com/YuriPlanet/vera20k",
+                "VERA20K 的名称与图标权属其作者，本改名版不使用其商标，仅作事实性署名。\n" +
+                "源码：github.com/lanx-gzs/vera20k（分支 verazip）",
         ))
         aboutCard.addView(divider())
         aboutCard.addView(hintRow(

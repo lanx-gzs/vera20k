@@ -135,28 +135,28 @@ pub const WINDOW_TITLE: &str = match (
     crate::rules::NPATCH_ENABLED,
     crate::rules::NPBUG_ENABLED,
 ) {
-    (true, true, true, false) => "VERA20K [Ares+Phobos+NPatch]",
-    (true, true, false, false) => "VERA20K [Ares+Phobos]",
-    (true, false, true, false) => "VERA20K [Ares+NPatch]",
-    (true, false, false, false) => "VERA20K [Ares]",
-    (false, true, true, false) => "VERA20K [Phobos+NPatch]",
-    (false, true, false, false) => "VERA20K [Phobos]",
-    (false, false, true, false) => "VERA20K [NPatch]",
-    (false, false, false, false) => "VERA20K",
-    (true, true, true, true) => "VERA20K [Ares+Phobos+NPatch+NPBug]",
-    (true, true, false, true) => "VERA20K [Ares+Phobos+NPBug]",
-    (true, false, true, true) => "VERA20K [Ares+NPatch+NPBug]",
-    (false, true, true, true) => "VERA20K [Phobos+NPatch+NPBug]",
-    (true, false, false, true) => "VERA20K [Ares+NPBug]",
-    (false, true, false, true) => "VERA20K [Phobos+NPBug]",
-    (false, false, true, true) => "VERA20K [NPatch+NPBug]",
-    (false, false, false, true) => "VERA20K [NPBug]",
+    (true, true, true, false) => "VeraZip [Ares+Phobos+NPatch]",
+    (true, true, false, false) => "VeraZip [Ares+Phobos]",
+    (true, false, true, false) => "VeraZip [Ares+NPatch]",
+    (true, false, false, false) => "VeraZip [Ares]",
+    (false, true, true, false) => "VeraZip [Phobos+NPatch]",
+    (false, true, false, false) => "VeraZip [Phobos]",
+    (false, false, true, false) => "VeraZip [NPatch]",
+    (false, false, false, false) => "VeraZip",
+    (true, true, true, true) => "VeraZip [Ares+Phobos+NPatch+NPBug]",
+    (true, true, false, true) => "VeraZip [Ares+Phobos+NPBug]",
+    (true, false, true, true) => "VeraZip [Ares+NPatch+NPBug]",
+    (false, true, true, true) => "VeraZip [Phobos+NPatch+NPBug]",
+    (true, false, false, true) => "VeraZip [Ares+NPBug]",
+    (false, true, false, true) => "VeraZip [Phobos+NPBug]",
+    (false, false, true, true) => "VeraZip [NPatch+NPBug]",
+    (false, false, false, true) => "VeraZip [NPBug]",
 };
 
 /// Identity stamp shared by the status screen and the telemetry capture. Not a
 /// retail build string, and not the tactical view's version description —
 /// that one is Phobos's own text ([`phobos_version`]).
-pub(crate) const BUILD_STAMP: &str = concat!("VERA20K ", env!("CARGO_PKG_VERSION"));
+pub(crate) const BUILD_STAMP: &str = concat!("VeraZip ", env!("CARGO_PKG_VERSION"));
 
 pub(crate) use shell_random_map::RandomMapGenerationRetention;
 pub(crate) use state::{AppState, PlatformState, reset_scenario_exit_runtime};

@@ -197,7 +197,7 @@ internal object Importers {
         false
     }
 
-    private fun log(message: String) = android.util.Log.i("VERA20K", message)
+    private fun log(message: String) = android.util.Log.i("VeraZip", message)
 
     /**
      * `set_paths_key` from `src/util/config.rs`: replace the value under

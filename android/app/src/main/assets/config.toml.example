@@ -1,11 +1,11 @@
-# VERA20k configuration — copy to config.toml and adjust paths.
+# VeraZip configuration — copy to config.toml and adjust paths.
 # config.toml is gitignored because it contains machine-specific paths.
 
 [paths]
 # Point this to your Red Alert 2: Yuri's Revenge installation directory.
 # The engine reads .mix files directly from here (ra2.mix, language.mix, etc.)
 ra2_dir = "C:/Westwood/RA2"
-# Optional VERA.INI location (defaults to VERA20k's user data folder).
+# Optional VERA.INI location (defaults to VeraZip's user data folder).
 # Relative paths are resolved beside this config file, outside the game folder.
 # settings_dir = "."
 
