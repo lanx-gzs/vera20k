@@ -2,6 +2,7 @@ package org.vera20k
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.app.Dialog
 import android.app.NativeActivity
 import android.content.Context
 import android.content.Intent
@@ -9,13 +10,20 @@ import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.DocumentsContract
 import android.util.Log
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.View
 import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputConnectionWrapper
 import android.view.inputmethod.InputMethodManager
 import android.widget.CheckBox
 import android.widget.EditText
@@ -94,12 +102,18 @@ class VeraActivity : NativeActivity() {
     private var pickedSource: Uri? = null
 
     /** The bar in a panel sub-window, and the same bar beside the content view. */
-    private var panelBar: LinearLayout? = null
-    private var contentBar: LinearLayout? = null
-    private var overlayManager: WindowManager? = null
-    private var panelParams: WindowManager.LayoutParams? = null
-    private var panelAttached = false
+    /** The chips: one bar, attached to the decor view, plus a popup fallback. */
+    private var chipBar: LinearLayout? = null
+    private var chipPopup: android.widget.PopupWindow? = null
     private val chipViews = mutableListOf<Pair<String, TextView>>()
+
+    /** The view that owns the input connection, invisible by design. */
+    private var imeEdit: ImeEditText? = null
+
+    /** A dialog window, used only when the in-window `EditText` is refused. */
+    private var imeProxy: Dialog? = null
+    private var forcedKeyboard = false
+    private val ui = Handler(Looper.getMainLooper())
 
     /**
      * Asks the player how to import: a folder tree, or a ZIP archive.
@@ -548,120 +562,108 @@ class VeraActivity : NativeActivity() {
         false
     }
 
-    // --- keyboard overlay ---------------------------------------------------
+    // --- keyboard ------------------------------------------------------------
     //
-    // `NativeActivity` has no input connection, so winit's `set_ime_allowed` is
-    // a no-op here and no IME event ever arrives: the system keyboard cannot be
-    // asked for from the game window. This adds a button the player taps to
-    // bring up a real `EditText` in a dialog window (which does get a keyboard)
-    // and hands the finished text to Rust through [nativeTypeText]. The text
-    // lands in whichever chat edit currently takes keys, exactly as an OS
-    // commit would; it is not a general text-entry replacement.
+    // `NativeActivity` gives winit no input connection, so `set_ime_allowed`
+    // is a no-op and winit never emits an `Ime` event: the game window can
+    // never raise the system keyboard by itself. What does work is a real
+    // `EditText` inside this activity: it owns an `InputConnection`, the
+    // system treats it like any text field, and every commit arrives on it
+    // even when the game's surface holds the screen.
+    //
+    // The engine already knows when a text field takes input (it sets the
+    // same `ime.allowed` flag desktop winit uses). This activity polls that
+    // flag and raises or lowers the keyboard to match, so the player types
+    // into a save-name box or a chat line the way they type anywhere else —
+    // no button to find first. Commits, backspace and the done key are
+    // forwarded to the engine, which owns the actual edit and draws it.
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // No state checks: once the player is past the launcher the bar is part
-        // of the screen for the whole session, whatever scene the engine shows.
-        installOverlayBar()
+        installChips()
+        ui.post(imeLoop)
     }
 
     override fun onResume() {
         super.onResume()
-        attachOverlays()
+        installChips()
+        ui.removeCallbacks(imeLoop)
+        ui.post(imeLoop)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus) attachOverlays()
+        if (hasFocus) installChips()
     }
+
+    override fun onPause() {
+        ui.removeCallbacks(imeLoop)
+        super.onPause()
+    }
+
+    /** Ask for the keyboard whenever the engine has a field open; drop it after. */
+    private val imeLoop = object : Runnable {
+        override fun run() {
+            val open = runCatching { nativeTextEntryOpen() }.getOrDefault(false)
+            if (open || forcedKeyboard) raiseKeyboard() else lowerKeyboard()
+            ui.postDelayed(this, 250)
+        }
+    }
+
+    // --- chips ---------------------------------------------------------------
 
     /**
-     * Two copies of one bar, in the two places a view can sit above the engine's
-     * surface: a `TYPE_APPLICATION_PANEL` sub-window, and a sibling of the
-     * engine's own content view. Whichever the device honours is the one the
-     * player sees; both read the same engine flags, so their chips never
-     * disagree. Trying to detect when the bar "should" appear is what failed
-     * before — so it is simply installed and kept.
+     * The modifier chips live in the decor view, above the engine's surface, and
+     * are re-attached on every focus change: `setContentView` on the native
+     * thread can wipe a sibling added before the surface existed.
      */
-    private fun installOverlayBar() {
-        if (panelBar == null) panelBar = buildOverlayBar(panel = true)
-        if (contentBar == null) contentBar = buildOverlayBar(panel = false)
-        attachOverlays()
-        // The surface is built on the native thread after onCreate and replaces
-        // the content view; keep re-checking for the first ten seconds.
-        val decor = window?.decorView ?: return
-        var attempts = 0
-        val probe = object : Runnable {
-            override fun run() {
-                attachOverlays()
-                attempts++
-                if (attempts < 20) decor.postDelayed(this, 500)
+    private fun installChips() {
+        val decor = window?.decorView as? ViewGroup ?: return
+        val bar = chipBar ?: buildChipBar().also { chipBar = it }
+        if (bar.parent == null) {
+            try {
+                decor.addView(bar, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                ).apply {
+                    gravity = Gravity.TOP or Gravity.END
+                    topMargin = dp(10)
+                    rightMargin = dp(10)
+                })
+                bar.bringToFront()
+            } catch (error: Throwable) {
+                Log.w(TAG, "chip bar refused: ${error.message}")
+                showChipPopup(decor, bar)
             }
+        } else {
+            bar.bringToFront()
         }
-        decor.post(probe)
-    }
-
-    private fun attachOverlays() {
-        attachPanelBar()
-        attachContentBar()
         syncModifierChips()
     }
 
-    private fun attachPanelBar() {
-        if (panelAttached) return
-        val bar = panelBar ?: return
-        val manager = getSystemService(Context.WINDOW_SERVICE) as? WindowManager ?: return
-        val params = panelParams ?: WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_PANEL,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            android.graphics.PixelFormat.TRANSLUCENT,
-        ).also {
-            it.gravity = Gravity.TOP or Gravity.END
-            it.x = dp(8)
-            it.y = dp(8)
-            it.token = window?.decorView?.windowToken
-            it.setTitle("VeraZip 输入浮条")
-        }
-        try {
-            manager.addView(bar, params)
-            overlayManager = manager
-            panelParams = params
-            panelAttached = true
-        } catch (error: Throwable) {
-            Log.w(TAG, "panel overlay refused: ${error.message}")
-        }
-    }
-
     /**
-     * A sibling of the engine's content view lives in the same window and draws
-     * above the surface unless the surface claimed the top layer; it covers the
-     * ROMs where a panel sub-window is rejected.
+     * Some ROMs draw a `SurfaceView` over sibling views in the same window.
+     * A popup is its own window on top of the activity, so it is the fallback
+     * when the decor attach cannot be seen.
      */
-    private fun attachContentBar() {
-        val bar = contentBar ?: return
-        if (bar.parent != null) return
-        val decor = window?.decorView as? ViewGroup ?: return
-        val host = decor.findViewById<ViewGroup>(android.R.id.content) ?: decor
+    private fun showChipPopup(anchor: View, bar: LinearLayout) {
+        if (chipPopup != null) return
         try {
-            host.addView(bar, FrameLayout.LayoutParams(
+            val popup = android.widget.PopupWindow(
+                bar,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
                 FrameLayout.LayoutParams.WRAP_CONTENT,
-            ).apply {
-                gravity = Gravity.TOP or Gravity.END
-                topMargin = dp(8)
-                rightMargin = dp(8)
-            })
-            bar.bringToFront()
+                false,
+            )
+            popup.isOutsideTouchable = true
+            popup.showAtLocation(anchor, Gravity.TOP or Gravity.END, dp(10), dp(10))
+            chipPopup = popup
         } catch (error: Throwable) {
-            Log.w(TAG, "content overlay refused: ${error.message}")
+            Log.w(TAG, "chip popup refused: ${error.message}")
         }
     }
 
-    private fun buildOverlayBar(panel: Boolean): LinearLayout {
+    private fun buildChipBar(): LinearLayout {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -673,14 +675,15 @@ class VeraActivity : NativeActivity() {
             }
             alpha = 0.92f
         }
-
-        val input = makeChip(bar, panel, "⌨ 输入") { openTextEntry() }
-        bar.addView(input, LinearLayout.LayoutParams(
+        bar.addView(makeChip("⌨") {
+            forcedKeyboard = !forcedKeyboard
+            if (forcedKeyboard) raiseKeyboard(force = true) else lowerKeyboard()
+            syncModifierChips()
+        }, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
         ).apply { rightMargin = dp(4) })
-
         for (name in listOf("ctrl", "shift", "alt")) {
-            val chip = makeChip(bar, panel, label(name)) { toggleModifier(name) }
+            val chip = makeChip(label(name)) { toggleModifier(name) }
             chipViews += name to chip
             bar.addView(chip, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT,
@@ -695,14 +698,7 @@ class VeraActivity : NativeActivity() {
         else -> "Alt"
     }
 
-    private fun makeChip(bar: LinearLayout, panel: Boolean, title: String, tap: () -> Unit): TextView {
-        val slop = ViewConfiguration.get(this).scaledTouchSlop
-        var downX = 0f
-        var downY = 0f
-        var startX = 0
-        var startY = 0
-        var dragging = false
-
+    private fun makeChip(title: String, tap: () -> Unit): TextView {
         val chip = TextView(this).apply {
             text = title
             textSize = 13f
@@ -716,14 +712,19 @@ class VeraActivity : NativeActivity() {
             }
             setOnClickListener { tap() }
         }
-
+        val slop = ViewConfiguration.get(this).scaledTouchSlop
+        var downX = 0f
+        var downY = 0f
+        var baseX = 0f
+        var baseY = 0f
+        var dragging = false
         chip.setOnTouchListener { view, event ->
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
                     downX = event.rawX
                     downY = event.rawY
-                    startX = if (panel) panelParams?.x ?: 0 else bar.left
-                    startY = if (panel) panelParams?.y ?: 0 else bar.top
+                    baseX = view.translationX
+                    baseY = view.translationY
                     dragging = false
                     true
                 }
@@ -734,21 +735,9 @@ class VeraActivity : NativeActivity() {
                         dragging = true
                     }
                     if (dragging) {
-                        val metrics = resources.displayMetrics
-                        val maxX = (metrics.widthPixels - bar.width).coerceAtLeast(0)
-                        val maxY = (metrics.heightPixels - bar.height).coerceAtLeast(0)
-                        if (panel) {
-                            // Gravity TOP|END: x counts from the right edge.
-                            val params = panelParams
-                            if (params != null) {
-                                params.x = (startX - dx.toInt()).coerceIn(0, maxX)
-                                params.y = (startY + dy.toInt()).coerceIn(0, maxY)
-                                overlayManager?.updateViewLayout(bar, params)
-                            }
-                        } else {
-                            bar.translationX = (startX + dx).coerceIn(-(metrics.widthPixels - bar.width).toFloat(), 0f)
-                            bar.translationY = (startY + dy).coerceIn(0f, maxY.toFloat())
-                        }
+                        val bar = chipBar ?: return@setOnTouchListener true
+                        bar.translationX = baseX + dx
+                        bar.translationY = (baseY + dy).coerceAtLeast(0f)
                     }
                     true
                 }
@@ -780,7 +769,7 @@ class VeraActivity : NativeActivity() {
         syncModifierChips()
     }
 
-    /** Repaint every copy of the chips from the engine's own flag word. */
+    /** Repaint the chips from the engine's own flag word. */
     private fun syncModifierChips() {
         val mask = try {
             nativeModifierMask()
@@ -797,80 +786,190 @@ class VeraActivity : NativeActivity() {
             chip.setTextColor(if (lit) COL_DARK_TEXT else Color.WHITE)
             chip.background = GradientDrawable().apply {
                 cornerRadius = dp(12).toFloat()
-                if (lit) {
-                    setColor(COL_ACCENT)
-                    setStroke(dp(1), 0xFFF4C566.toInt())
-                } else {
-                    setColor(0x33FFFFFF)
-                    setStroke(dp(1), 0x44FFFFFF)
-                }
+                setColor(if (lit) COL_ACCENT else 0x33FFFFFF)
+                setStroke(dp(1), if (lit) 0xFFF4C566.toInt() else 0x44FFFFFF)
             }
         }
     }
 
+    // --- the input connection ------------------------------------------------
+
     /**
-     * The dialog that actually hosts the keyboard: a dialog window gets an
-     * input connection where the game window does not, so the `EditText` here
-     * raises the system keyboard normally, including CJK methods.
+     * The view that owns the keyboard. It carries no visible text: every
+     * commit is handed to the engine and swallowed here, so the engine's own
+     * edit stays the single source of truth and the caret is drawn by the
+     * game, not by this widget.
      */
-    private fun openTextEntry() {
-        // Always opens, whatever scene is on screen: gating on "a field is
-        // focused" is what left players unable to name a save at all.
-        val target = try {
-            nativeImeChatOpen()
-        } catch (_: Throwable) {
-            false
-        }
-        val input = EditText(this).apply {
-            hint = "输入要发送的文字"
-            textSize = 15f
-            setTextColor(Color.BLACK)
-            maxLines = 3
-            setPadding(dp(8), dp(6), dp(8), dp(6))
-        }
-        val dialog = AlertDialog.Builder(this)
-            .setTitle("输入到游戏聊天框")
-            .setMessage("发送后文字会出现在游戏里的聊天输入框中，回车发送。")
-            .setView(input)
-            .setPositiveButton("发送", null)
-            .setNegativeButton("取消", null)
-            .create()
-        dialog.setOnShowListener {
-            dialog.window?.setSoftInputMode(
-                WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or
-                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE,
-            )
-            input.requestFocus()
-            // The dialog's window is attached a moment after onCreate, and
-            // showSoftInput before that is ignored on some devices.
-            input.postDelayed({
-                val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-                manager?.showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
-            }, 120)
-            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val text = input.text.toString()
-                if (text.isNotEmpty()) {
-                    try {
-                        nativeTypeText(text)
-                    } catch (error: Throwable) {
-                        Log.w(TAG, "text overlay: ${error.message}")
-                    }
-                    if (!target) {
-                        Toast.makeText(
-                            this,
-                            "文字已经发出，但当前没有输入框接收：先在游戏里点一下要填的框",
-                            Toast.LENGTH_SHORT,
-                        ).show()
-                    }
+    private inner class ImeEditText(activity: Activity) : EditText(activity) {
+        override fun onCreateInputConnection(outAttrs: EditorInfo): InputConnection? {
+            val base = super.onCreateInputConnection(outAttrs) ?: return null
+            outAttrs.imeOptions = outAttrs.imeOptions or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            return object : InputConnectionWrapper(base, true) {
+                override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+                    val run = text?.toString().orEmpty()
+                    if (run.isNotEmpty()) forward { nativeTypeText(run) }
+                    return true
                 }
-                dialog.dismiss()
+
+                override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean =
+                    true
+
+                override fun finishComposingText(): Boolean = true
+
+                override fun deleteSurroundingText(beforeLength: Int, afterLength: Int): Boolean {
+                    repeat(beforeLength) { forward { nativeTextBackspace() } }
+                    return true
+                }
+
+                override fun deleteSurroundingTextInCodePoints(
+                    beforeLength: Int,
+                    afterLength: Int,
+                ): Boolean {
+                    repeat(beforeLength) { forward { nativeTextBackspace() } }
+                    return true
+                }
+
+                override fun sendKeyEvent(event: KeyEvent): Boolean {
+                    if (event.action == KeyEvent.ACTION_DOWN) {
+                        when (event.keyCode) {
+                            KeyEvent.KEYCODE_DEL -> forward { nativeTextBackspace() }
+                            KeyEvent.KEYCODE_ENTER, KeyEvent.KEYCODE_NUMPAD_ENTER ->
+                                forward { nativeTextEnter() }
+                        }
+                    }
+                    return true
+                }
+
+                override fun performEditorAction(actionCode: Int): Boolean {
+                    forward { nativeTextEnter() }
+                    return true
+                }
             }
         }
-        dialog.setOnDismissListener {
-            val manager = getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
-            manager?.hideSoftInputFromWindow(input.windowToken, 0)
+
+        /** JNI calls from the UI thread; a dead engine must not crash the activity. */
+        private inline fun forward(call: () -> Unit) {
+            try {
+                call()
+            } catch (error: Throwable) {
+                Log.w(TAG, "keyboard forward: ${error.message}")
+            }
         }
-        dialog.show()
+    }
+
+    private fun installImeEdit(): ImeEditText? {
+        imeEdit?.let { return it }
+        val decor = window?.decorView as? ViewGroup ?: return null
+        val edit = ImeEditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            imeOptions = EditorInfo.IME_ACTION_DONE or EditorInfo.IME_FLAG_NO_EXTRACT_UI
+            isSingleLine = true
+            setTextColor(Color.TRANSPARENT)
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(0, 0, 0, 0)
+        }
+        val host = FrameLayout(this)
+        host.addView(edit, FrameLayout.LayoutParams(1, 1))
+        try {
+            decor.addView(host, FrameLayout.LayoutParams(1, 1).apply {
+                gravity = Gravity.BOTTOM or Gravity.START
+            })
+        } catch (error: Throwable) {
+            Log.w(TAG, "ime host refused: ${error.message}")
+            return null
+        }
+        imeEdit = edit
+        return edit
+    }
+
+    private fun imm(): InputMethodManager? =
+        getSystemService(Context.INPUT_METHOD_SERVICE) as? InputMethodManager
+
+    private fun keyboardVisible(): Boolean {
+        val decor = window?.decorView ?: return false
+        if (imm()?.isActive == true) return true
+        val frame = android.graphics.Rect()
+        decor.getWindowVisibleDisplayFrame(frame)
+        val hidden = decor.height - frame.bottom
+        return hidden > dp(120)
+    }
+
+    /**
+     * Raise the keyboard. Try the in-window `EditText` first — it keeps the
+     * window focused, so the engine keeps running — and fall back to a dialog
+     * window if the device refuses to attach an input method to it.
+     */
+    private fun raiseKeyboard(force: Boolean = false) {
+        if (keyboardVisible()) return
+        val edit = installImeEdit()
+        if (edit != null) {
+            edit.requestFocus()
+            edit.post {
+                val shown = imm()?.showSoftInput(edit, InputMethodManager.SHOW_IMPLICIT) == true
+                if (!shown) imm()?.toggleSoftInput(InputMethodManager.SHOW_IMPLICIT, 0)
+                ui.postDelayed({
+                    if (!keyboardVisible()) {
+                        Log.i(TAG, "keyboard: in-window refused, falling back to the dialog")
+                        openProxyKeyboard()
+                    }
+                }, 450)
+            }
+            return
+        }
+        openProxyKeyboard()
+    }
+
+    /** A dialog window is the last resort: it always owns an input connection. */
+    private fun openProxyKeyboard() {
+        if (imeProxy?.isShowing == true) return
+        val edit = ImeEditText(this).apply {
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                android.text.InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            isSingleLine = true
+            setTextColor(Color.TRANSPARENT)
+            setBackgroundColor(Color.TRANSPARENT)
+        }
+        val dialog = Dialog(this, android.R.style.Theme_Translucent_NoTitleBar).apply {
+            setContentView(edit, ViewGroup.LayoutParams(1, 1))
+            setCancelable(false)
+        }
+        dialog.window?.apply {
+            setBackgroundDrawableResource(android.R.color.transparent)
+            setDimAmount(0f)
+            addFlags(WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL)
+            setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE or
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING,
+            )
+            setGravity(Gravity.BOTTOM)
+            setLayout(1, 1)
+        }
+        dialog.setOnShowListener {
+            edit.requestFocus()
+            edit.postDelayed({
+                imm()?.showSoftInput(edit, InputMethodManager.SHOW_IMPLICIT)
+            }, 100)
+        }
+        try {
+            dialog.show()
+            imeProxy = dialog
+            Log.i(TAG, "keyboard: dialog proxy shown")
+        } catch (error: Throwable) {
+            Log.w(TAG, "ime proxy refused: ${error.message}")
+            imeProxy = null
+        }
+    }
+
+    private fun lowerKeyboard() {
+        imeProxy?.takeIf { it.isShowing }?.dismiss()
+        imeProxy = null
+        imeEdit?.let {
+            it.text.clear()
+            it.clearFocus()
+            imm()?.hideSoftInputFromWindow(it.windowToken, 0)
+        }
     }
 
     /** Density-independent pixels to pixels. */
@@ -880,8 +979,14 @@ class VeraActivity : NativeActivity() {
     /** Implemented in `android/src/lib.rs`; the overlay's finished text. */
     private external fun nativeTypeText(text: String)
 
-    /** Implemented in `android/src/lib.rs`; whether a chat edit takes text now. */
-    private external fun nativeImeChatOpen(): Boolean
+    /** Implemented in `android/src/lib.rs`; whether any text field takes text now. */
+    private external fun nativeTextEntryOpen(): Boolean
+
+    /** Implemented in `android/src/lib.rs`; one backspace into the focused edit. */
+    private external fun nativeTextBackspace()
+
+    /** Implemented in `android/src/lib.rs`; the keyboard's done key. */
+    private external fun nativeTextEnter()
 
     /** Implemented in `android/src/lib.rs`; hold or release one modifier chip. */
     private external fun nativeSetModifier(name: String, down: Boolean): Boolean
@@ -890,17 +995,16 @@ class VeraActivity : NativeActivity() {
     private external fun nativeModifierMask(): Int
 
     override fun onDestroy() {
-        for (bar in listOfNotNull(panelBar, contentBar)) {
-            try {
-                (bar.parent as? ViewGroup)?.removeView(bar)
-            } catch (_: Throwable) {
-            }
-            try {
-                overlayManager?.removeView(bar)
-            } catch (_: Throwable) {
-            }
+        ui.removeCallbacks(imeLoop)
+        try {
+            chipPopup?.dismiss()
+        } catch (_: Throwable) {
         }
-        panelAttached = false
+        try {
+            imeProxy?.takeIf { it.isShowing }?.dismiss()
+        } catch (_: Throwable) {
+        }
+        chipBar?.let { bar -> (bar.parent as? ViewGroup)?.removeView(bar) }
         super.onDestroy()
     }
 }

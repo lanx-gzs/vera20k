@@ -105,6 +105,18 @@ pub fn inject_ime_commit(text: &str) {
     crate::app::input::ime::inject_commit(text);
 }
 
+/// Backspace from the Android keyboard.
+#[cfg(target_os = "android")]
+pub fn inject_ime_backspace() {
+    crate::app::input::ime::inject_backspace();
+}
+
+/// The Android keyboard's done key.
+#[cfg(target_os = "android")]
+pub fn inject_ime_enter() {
+    crate::app::input::ime::inject_enter();
+}
+
 /// Whether a chat edit takes text on the last frame, for the same overlay.
 #[cfg(target_os = "android")]
 pub fn ime_chat_open() -> bool {

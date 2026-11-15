@@ -41,6 +41,7 @@ use crate::app::AppState;
 use crate::ui::shell::geom::RectPx;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::Ime;
+use winit::keyboard::KeyCode;
 
 /// The composition colour `[0xAC4618]`, COLORREF `0x9F9F` that
 /// ShellDialog__SubclassChildByClass `0x0060F9A0` sets.
@@ -206,21 +207,46 @@ static CHAT_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool:
 /// `AppHandler::about_to_wait`), so every commit still happens on the thread
 /// that owns the state, in the same order an OS commit would.
 #[cfg(target_os = "android")]
-static INJECTED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+#[derive(Debug, Clone)]
+enum Injected {
+    Text(String),
+    Backspace,
+    Enter,
+}
 
 #[cfg(target_os = "android")]
-pub(crate) fn inject_commit(text: &str) {
-    if text.is_empty() {
-        return;
-    }
+static INJECTED: std::sync::Mutex<Vec<Injected>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(target_os = "android")]
+fn push(event: Injected) {
     let mut queue = INJECTED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // A burst of frames cannot hold more than a chat line's worth; dropping the
-    // excess keeps a stuck overlay from growing the queue without bound.
-    if queue.len() < 8 {
-        queue.push(text.to_owned());
+    // A burst of frames cannot hold more than a few keystrokes; dropping the
+    // excess keeps a stuck keyboard from growing the queue without bound.
+    if queue.len() < 32 {
+        queue.push(event);
     }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) fn inject_commit(text: &str) {
+    if !text.is_empty() {
+        push(Injected::Text(text.to_owned()));
+    }
+}
+
+/// Backspace from the Android input method: the `EditText` that hosts the
+/// keyboard swallows the key itself, so the delete has to be replayed here.
+#[cfg(target_os = "android")]
+pub(crate) fn inject_backspace() {
+    push(Injected::Backspace);
+}
+
+/// The input method's "done"/send key.
+#[cfg(target_os = "android")]
+pub(crate) fn inject_enter() {
+    push(Injected::Enter);
 }
 
 #[cfg(target_os = "android")]
@@ -231,8 +257,12 @@ pub(crate) fn drain_injected(state: &mut AppState) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::mem::take(&mut *queue)
     };
-    for text in pending {
-        event(state, Ime::Commit(text));
+    for injected in pending {
+        match injected {
+            Injected::Text(text) => event(state, Ime::Commit(text)),
+            Injected::Backspace => backspace(state),
+            Injected::Enter => enter(state),
+        }
     }
 }
 
@@ -249,6 +279,65 @@ pub(crate) fn chat_open() -> bool {
 /// description field, the saved-seed name field, the skirmish player name)
 /// ignores text unless its own editor holds focus, so trying them in order is
 /// safe and no screen can steal another's run.
+/// One backspace, routed to whichever edit holds focus.
+///
+/// The keyboard's own buffer is empty by design (commits are forwarded, not
+/// typed into it), so deleting has to happen in the engine: chat lines take an
+/// `EditKey::Delete`, every shell NewEdit takes `KeyCode::Backspace`.
+#[cfg(target_os = "android")]
+fn backspace(state: &mut AppState) {
+    if let Some(target) = target(state).map(|(target, _)| target) {
+        match target {
+            ImeTarget::InGameChat => crate::app::input::chat::edit_backspace(state),
+            ImeTarget::LanLobbyChat => {
+                crate::app::shell_lan::key_press(state, Some(KeyCode::Backspace), None)
+            }
+            ImeTarget::SetupChat => crate::app::input::multiplayer_setup::key_press(
+                state,
+                Some(KeyCode::Backspace),
+                None,
+            ),
+            ImeTarget::WolLobbyChat => {
+                crate::app::shell_wol::lobby::key_press(state, Some(KeyCode::Backspace), None)
+            }
+        }
+        return;
+    }
+    crate::app::App::saved_game_key(state, Some(KeyCode::Backspace), None);
+    crate::app::App::handle_saved_seed_browser_key(state, Some(KeyCode::Backspace), None);
+    if state.frontend.skirmish_shell_state.player_name_edit.focused {
+        state
+            .frontend
+            .skirmish_shell_state
+            .player_name_edit
+            .backspace();
+    }
+}
+
+/// The keyboard's "done" key: send a chat line, confirm a save dialog.
+#[cfg(target_os = "android")]
+fn enter(state: &mut AppState) {
+    if let Some(target) = target(state).map(|(target, _)| target) {
+        match target {
+            ImeTarget::InGameChat => crate::app::input::chat::edit_enter(state),
+            ImeTarget::LanLobbyChat => {
+                crate::app::shell_lan::key_press(state, Some(KeyCode::Enter), None)
+            }
+            ImeTarget::SetupChat => crate::app::input::multiplayer_setup::key_press(
+                state,
+                Some(KeyCode::Enter),
+                None,
+            ),
+            ImeTarget::WolLobbyChat => {
+                crate::app::shell_wol::lobby::key_press(state, Some(KeyCode::Enter), None)
+            }
+        }
+        return;
+    }
+    crate::app::App::saved_game_key(state, Some(KeyCode::Enter), None);
+    crate::app::App::handle_saved_seed_browser_key(state, Some(KeyCode::Enter), None);
+}
+
 fn commit(state: &mut AppState, text: &str) {
     if let Some(target) = target(state).map(|(target, _)| target) {
         match target {

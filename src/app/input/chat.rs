@@ -191,6 +191,17 @@ fn open_edit(state: &mut AppState, target: ChatTarget) -> bool {
     true
 }
 
+/// Android keyboard: the backspace an input method sends deletes one unit of
+/// the open chat line, exactly as a named Backspace does (`0x0055E420`).
+pub(crate) fn edit_backspace(state: &mut AppState) {
+    apply_input(state, EditKey::Delete);
+}
+
+/// Android keyboard: Enter is the send key while a chat line is open.
+pub(crate) fn edit_enter(state: &mut AppState) {
+    apply_input(state, EditKey::Enter);
+}
+
 fn apply_input(state: &mut AppState, key: EditKey) {
     let font = &state.renderer.bit_font;
     let presentation = &mut state.match_state.match_presentation;

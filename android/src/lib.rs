@@ -209,6 +209,37 @@ pub extern "system" fn Java_org_vera20k_VeraActivity_nativeImeChatOpen(
     if vera20k::ime_chat_open() { 1 } else { 0 }
 }
 
+/// Backspace from the Android keyboard. The `EditText` that hosts the
+/// keyboard never accumulates text (commits are forwarded straight to the
+/// engine), so a delete has to be replayed in the engine instead.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextBackspace(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) {
+    vera20k::inject_ime_backspace();
+}
+
+/// The keyboard's done/send key.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextEnter(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) {
+    vera20k::inject_ime_enter();
+}
+
+/// Whether any text field takes text now — a chat line or a save-name field.
+/// The activity polls this and raises the keyboard by itself, so no button has
+/// to be found and tapped before typing can start.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextEntryOpen(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) -> jni::sys::jboolean {
+    if vera20k::ime_chat_open() { 1 } else { 0 }
+}
+
 /// Toggle one on-screen modifier chip. Returns whether that chip is now held.
 ///
 /// Touch-screen players cannot hold Ctrl while tapping a target, and a
@@ -286,6 +317,21 @@ fn register_folder_picker_native() -> bool {
                 name: "nativeTypeText".into(),
                 sig: "(Ljava/lang/String;)V".into(),
                 fn_ptr: Java_org_vera20k_VeraActivity_nativeTypeText as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeTextBackspace".into(),
+                sig: "()V".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextBackspace as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeTextEnter".into(),
+                sig: "()V".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextEnter as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeTextEntryOpen".into(),
+                sig: "()Z".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextEntryOpen as *mut std::ffi::c_void,
             },
             jni::NativeMethod {
                 name: "nativeImeChatOpen".into(),
