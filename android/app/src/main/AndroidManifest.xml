@@ -60,6 +60,12 @@
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
 
         <activity
+            android:name="org.vera20k.TextEntryActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:windowSoftInputMode="stateVisible|adjustResize" />
+
+        <activity
             android:name="org.vera20k.MixActivity"
             android:exported="false"
             android:label="MIX 归档"
