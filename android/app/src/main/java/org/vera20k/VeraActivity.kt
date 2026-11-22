@@ -178,6 +178,7 @@ class VeraActivity : NativeActivity() {
         val bar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            isClickable = true
             setPadding(dp(10), dp(6), dp(10), dp(6))
             background = GradientDrawable().apply {
                 cornerRadius = dp(18).toFloat()
@@ -205,7 +206,7 @@ class VeraActivity : NativeActivity() {
             return
         }
         runCatching {
-            popup.showAtLocation(window.decorView, Gravity.TOP or Gravity.END, dp(12), dp(64))
+            popup.showAtLocation(window.decorView, Gravity.BOTTOM or Gravity.START, dp(12), dp(16))
         }.onFailure { Log.w("VeraZip", "chip strip: " + it.message) }
         syncChipKeys()
     }
@@ -218,10 +219,11 @@ class VeraActivity : NativeActivity() {
     private fun syncChipKeys() {
         val container = chipKeys ?: return
         val mask = runCatching { nativeModifierMask() }.getOrDefault(0)
+        // Bits must match `sticky_modifiers.rs`: CTRL=1, SHIFT=2, ALT=4.
         val wanted = listOf(
-            Triple("CTRL", 0x0004, "Ctrl"),
-            Triple("SHIFT", 0x0001, "Shift"),
-            Triple("ALT", 0x0002, "Alt"),
+            Triple("CTRL", 0x0001, "Ctrl"),
+            Triple("SHIFT", 0x0002, "Shift"),
+            Triple("ALT", 0x0004, "Alt"),
         )
         if (container.childCount == wanted.size &&
             container.tag == mask
@@ -231,10 +233,14 @@ class VeraActivity : NativeActivity() {
         container.tag = mask
         container.removeAllViews()
         for ((label, bit, name) in wanted) {
-            val down = mask and bit != 0
-            val chip = chip(label, down)
+            val chip = chip(label, mask and bit != 0)
             chip.setOnClickListener {
-                runCatching { nativeSetModifier(name, !down) }
+                // Re-read the live state on the tap instead of trusting the
+                // closure captured when the chip was built; a poll between two
+                // taps can otherwise flip the wrong modifier.
+                val live = runCatching { nativeModifierMask() }.getOrDefault(0)
+                val nowDown = live and bit != 0
+                runCatching { nativeSetModifier(name, !nowDown) }
                 syncChipKeys()
             }
             container.addView(chip, LinearLayout.LayoutParams(dp(52), dp(34)).apply {
