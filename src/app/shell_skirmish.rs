@@ -1311,6 +1311,25 @@ impl App {
         if !event.state.is_pressed() {
             return false;
         }
+        Self::choose_map_search_key_input(state, event.physical_key, event.text.as_deref())
+    }
+
+    /// The search-box Backspace arm for an injected Android key; a synthetic
+    /// `KeyEvent` cannot be built outside winit, so the shared body takes the
+    /// physical key and text straight.
+    pub(crate) fn choose_map_search_backspace(state: &mut AppState) -> bool {
+        Self::choose_map_search_key_input(
+            state,
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Backspace),
+            None,
+        )
+    }
+
+    fn choose_map_search_key_input(
+        state: &mut AppState,
+        physical: winit::keyboard::PhysicalKey,
+        input: Option<&str>,
+    ) -> bool {
         if Self::choose_map_search_ime_rect(state).is_none() {
             return false;
         }
@@ -1324,15 +1343,13 @@ impl App {
         else {
             return false;
         };
-        let mut text = modal.search.clone();
-        if event.physical_key
+        let mut search = modal.search.clone();
+        if physical
             == winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Backspace)
         {
-            text.pop();
+            search.pop();
         } else {
-            let typed: String = event
-                .text
-                .as_deref()
+            let typed: String = input
                 .unwrap_or_default()
                 .chars()
                 .filter(|ch| !ch.is_control())
@@ -1343,7 +1360,7 @@ impl App {
             return Self::choose_map_search_text(state, &typed);
         }
         modal.set_search(
-            text,
+            search,
             &frontend.skirmish_modes,
             frontend.scenario_catalog.records(),
             &layout,

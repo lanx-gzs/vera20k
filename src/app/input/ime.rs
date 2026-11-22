@@ -241,7 +241,7 @@ fn commit(state: &mut AppState, text: &str) {
 /// in the same order an OS commit would have arrived.
 #[cfg(target_os = "android")]
 mod android {
-    use super::{Ime, commit, target};
+    use super::{Ime, target};
     use crate::app::AppState;
     use crate::app::input::ime::ImeTarget;
     use winit::keyboard::KeyCode;
@@ -324,7 +324,7 @@ mod android {
                 crate::app::shell_wol::lobby::key_press(state, Some(KeyCode::Backspace), None)
             }
             Some(ImeTarget::ChooseMapSearch) => {
-                crate::app::App::choose_map_search_key(state, Some(KeyCode::Backspace))
+                crate::app::App::choose_map_search_backspace(state);
             }
             None => {
                 crate::app::App::handle_saved_seed_browser_key(
@@ -353,7 +353,8 @@ mod android {
                 crate::app::shell_wol::lobby::key_press(state, Some(KeyCode::Enter), None)
             }
             Some(ImeTarget::ChooseMapSearch) => {
-                crate::app::App::choose_map_search_key(state, Some(KeyCode::Enter))
+                // The search box confirms through its own button; an injected
+                // Enter here has no mapped action.
             }
             None => {
                 crate::app::App::handle_saved_seed_browser_key(state, Some(KeyCode::Enter), None);
