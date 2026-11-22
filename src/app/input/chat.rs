@@ -346,6 +346,7 @@ pub(crate) fn edit_backspace(state: &mut AppState) {
 /// Android keyboard: Enter is the send key while a chat line is open.
 pub(crate) fn edit_enter(state: &mut AppState) {
     apply_input(state, EditKey::Enter);
+}
 
 /// The beacon branch `0x0055E4F0..0x0055E5F8`: a `TXT_BEACON_MESSAGE` edit
 /// in the player's colour, hidden (`0x0055E5C1`), without overflow
