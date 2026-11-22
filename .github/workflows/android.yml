@@ -52,13 +52,17 @@ jobs:
             -o android/app/src/main/jniLibs build --profile fast \
             -p vera20k-android --no-default-features --locked
 
-      - name: Generate debug keystore
+      - name: Ensure committed debug keystore
         run: |
           mkdir -p .android
-          keytool -genkeypair -v -keystore .android/debug.keystore \
-            -alias androiddebugkey -storepass android -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          # The keystore is committed so every CI run signs with the same
+          # certificate; otherwise a fresh key per run blocks over-install.
+          if [ ! -f .android/debug.keystore ]; then
+            keytool -genkeypair -v -keystore .android/debug.keystore \
+              -alias androiddebugkey -storepass android -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
 
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon

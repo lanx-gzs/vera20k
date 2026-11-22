@@ -45,6 +45,16 @@ pub(crate) fn mask() -> u8 {
 /// OR the sticky flags into the modifiers the input layer is about to read.
 pub(crate) fn apply(modifiers: &mut ModifiersState) {
     let locked = LOCKED.load(Ordering::Relaxed);
+    // Android has no physical modifier keys: shift/control/alt in this state
+    // only ever come from the chips, so own those bits outright. Clearing the
+    // chip must clear the snapshot too; OR-ing alone leaves the old bit set
+    // after the chip goes dark.
+    #[cfg(target_os = "android")]
+    {
+        *modifiers &= !(ModifiersState::SHIFT
+            | ModifiersState::CONTROL
+            | ModifiersState::ALT);
+    }
     if locked & CTRL != 0 {
         *modifiers |= ModifiersState::CONTROL;
     }

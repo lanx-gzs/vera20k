@@ -192,7 +192,9 @@ tools/vendor-eval/
 # generated, none committed.
 /android/.gradle/
 /android/.kotlin/
-/android/.android/
+/android/.android/debug.keystore.lock
+# The debug keystore itself is committed on purpose: the certificate must be
+# identical across CI runs so a new APK can overwrite the installed one.
 /android/local.properties
 /android/**/build/
 /android/app/src/main/jniLibs/
