@@ -41,11 +41,11 @@ pub(in crate::sim::world) use ordinary_publication::tests::{
     ready_engineer, ready_repair_fixture, repair_frame,
 };
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_pavement_publication_tests.rs"]
 mod pavement_tests;
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 #[path = "bridge_publication_tests.rs"]
 mod tests;
 
@@ -70,10 +70,9 @@ impl BodyResult {
 pub(super) fn run_state_machine(
     sim: &mut Simulation,
     rules: &RuleSet,
-    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     input: CellCoord,
     family: Family,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> BodyResult {
     let terrain = sim
         .resolved_terrain
@@ -84,9 +83,8 @@ pub(super) fn run_state_machine(
         let mut host = LivePublication {
             sim,
             rules,
-            registry,
             collapsed: false,
-            frame_effects,
+            frame_effects: frame_effects.reborrow(),
         };
         let returned = publication::advance_bridgehead(&mut host, input, family);
         return BodyResult {
@@ -118,9 +116,8 @@ pub(super) fn run_state_machine(
     let mut host = LivePublication {
         sim,
         rules,
-        registry,
         collapsed: false,
-        frame_effects,
+        frame_effects: frame_effects.reborrow(),
     };
     let returned = publication::advance_body_at_anchor(&mut host, input, anchor, family);
     BodyResult {
@@ -135,17 +132,15 @@ pub(super) fn run_state_machine(
 pub(super) fn update_adjacent_bridges(
     sim: &mut Simulation,
     rules: &RuleSet,
-    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     input: CellCoord,
     family: Family,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let mut host = LivePublication {
         sim,
         rules,
-        registry,
         collapsed: false,
-        frame_effects,
+        frame_effects: frame_effects.reborrow(),
     };
     rim_publication::update(&mut host, input, family);
     host.collapsed
@@ -154,7 +149,6 @@ pub(super) fn update_adjacent_bridges(
 struct LivePublication<'a> {
     sim: &'a mut Simulation,
     rules: &'a RuleSet,
-    registry: Option<&'a crate::rules::overlay_types::OverlayTypeRegistry>,
     collapsed: bool,
     frame_effects: FrameEffects<'a>,
 }
@@ -261,8 +255,8 @@ impl BridgePublicationHost for LivePublication<'_> {
             self.rules,
             x as u16,
             y as u16,
-            self.registry,
-            self.frame_effects,
+            Some(self.rules.overlay_registry()),
+            &mut self.frame_effects,
         );
     }
     fn radar(&mut self, cell: Cell) {

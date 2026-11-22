@@ -17,7 +17,9 @@ use crate::app::diagnostics::tactical_capture::profile::{
     CHECKPOINT_RADAR_ONLINE_V2, SealedJsonFile, TacticalCaptureContract, TacticalCaptureProfile,
     validate_new_output_directory,
 };
-use crate::app::frontend::startup_options::{RetailStartupOptions, consume_retail_switches};
+use crate::app::frontend::startup_options::{
+    RetailStartupOptions, StartupExit, consume_retail_switches,
+};
 use crate::skirmish_launch::SkirmishLaunchSession;
 
 use crate::app::diagnostics::tactical_capture::session::MapCaptureProfile;
@@ -110,9 +112,38 @@ where
     })())
 }
 
+/// `vera20k --version` (docs/spawn.md, "Version"): print the build's version
+/// as one JSON line and exit, without a game folder. Headless, like `--probe`.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn try_version<I>(args: I) -> Option<Result<i32>>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    if args.next().as_deref() != Some(OsStr::new("--version")) {
+        return None;
+    }
+    Some((|| {
+        ensure!(args.next().is_none(), "usage: vera20k --version");
+        print_version()
+    })())
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn print_version() -> Result<i32> {
+    let report = crate::app::spawn_probe::version_report();
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(0)
+}
+
 /// `vera20k --probe [--ra2-dir <dir>] [--map <path>]` (docs/spawn.md): print
 /// one JSON object describing what a spawn launch on this installation is
-/// checked against, then exit. Headless: no logger, window or audio.
+/// checked against, then exit. Headless: no logger, window or audio. `--mod
+/// <folder>` and `--no-mod` choose the mod as they do for that launch, and
+/// `--ares <Auto|On|Off>` the Ares setting spawn.ini's `[Settings] Ares=` will.
+/// `vera20k --probe --version` prints what `--version` does: a launcher asks
+/// that way because a build from before `--version` refuses the probe
+/// argument instead of starting the game.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub fn try_probe<I>(args: I) -> Option<Result<i32>>
 where
@@ -122,9 +153,34 @@ where
     if args.next().as_deref() != Some(OsStr::new("--probe")) {
         return None;
     }
+    let args: Vec<OsString> = args.collect();
+    if args.iter().any(|arg| arg == OsStr::new("--version")) {
+        return Some((|| {
+            ensure!(args.len() == 1, "usage: vera20k --probe --version");
+            print_version()
+        })());
+    }
     Some((|| {
-        let (ra2_dir, map) = parse_probe_args(args)?;
-        let report = crate::app::spawn_probe::run_desktop(ra2_dir.as_deref(), map.as_deref())?;
+        let (mod_switch, mut args) = crate::app::mods::take_switch(args)?;
+        let ares = match args.iter().position(|arg| arg == OsStr::new("--ares")) {
+            Some(at) => {
+                let setting = args
+                    .get(at + 1)
+                    .and_then(|value| value.to_str())
+                    .and_then(crate::util::ares_launch::AresSetting::parse)
+                    .context("\"--ares\" needs Auto, On or Off")?;
+                args.drain(at..=at + 1);
+                Some(setting)
+            }
+            None => None,
+        };
+        let (ra2_dir, map) = parse_probe_args(args.into_iter())?;
+        let report = crate::app::spawn_probe::run_desktop(
+            ra2_dir.as_deref(),
+            map.as_deref(),
+            mod_switch.as_ref(),
+            ares,
+        )?;
         println!("{}", serde_json::to_string(&report)?);
         Ok(0)
     })())
@@ -154,6 +210,79 @@ fn parse_probe_args(
     Ok((ra2_dir, map))
 }
 
+/// `vera20k --generate-map (--code <VR1-…> | --sed <file>) --output <path>`
+/// (docs/spawn.md, "Random maps"): write the random map a share code or
+/// `.SED` file describes to `output` and print one JSON line reporting it.
+/// Headless, like `--probe`; `--mod <folder>` and `--no-mod` choose the mod.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub fn try_generate_map<I>(args: I) -> Option<Result<i32>>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut args = args.into_iter();
+    if args.next().as_deref() != Some(OsStr::new("--generate-map")) {
+        return None;
+    }
+    Some((|| {
+        let (mod_switch, args) = crate::app::mods::take_switch(args.collect())?;
+        let (input, output) = parse_generate_map_args(args.into_iter())?;
+        let input = match input {
+            GenerateMapInput::Code(code) => code,
+            GenerateMapInput::Sed(path) => {
+                let bytes =
+                    std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+                String::from_utf8(bytes)
+                    .with_context(|| format!("{} is not UTF-8 text", path.display()))?
+            }
+        };
+        let report =
+            crate::app::random_map_file::run_desktop(&input, &output, mod_switch.as_ref())?;
+        println!("{}", serde_json::to_string(&report)?);
+        Ok(0)
+    })())
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[derive(Debug, PartialEq, Eq)]
+enum GenerateMapInput {
+    Code(String),
+    Sed(PathBuf),
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn parse_generate_map_args(
+    args: impl Iterator<Item = OsString>,
+) -> Result<(GenerateMapInput, PathBuf)> {
+    const USAGE: &str = "usage: vera20k --generate-map (--code <VR1-…> | --sed <file>) \
+                         --output <map-file> [--no-mod]";
+    let mut args = args;
+    let (mut input, mut output) = (None, None);
+    while let Some(flag) = args.next() {
+        let value = args
+            .next()
+            .with_context(|| format!("{flag:?} needs a value; {USAGE}"))?;
+        let given = if flag == OsStr::new("--code") {
+            let code = value
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("the share code is not Unicode text; {USAGE}"))?;
+            input.replace(GenerateMapInput::Code(code)).is_some()
+        } else if flag == OsStr::new("--sed") {
+            input
+                .replace(GenerateMapInput::Sed(PathBuf::from(value)))
+                .is_some()
+        } else if flag == OsStr::new("--output") {
+            output.replace(PathBuf::from(value)).is_some()
+        } else {
+            bail!("unexpected argument {flag:?}; {USAGE}");
+        };
+        ensure!(!given, "give one --code or --sed and one --output; {USAGE}");
+    }
+    Ok((
+        input.with_context(|| format!("give --code or --sed; {USAGE}"))?,
+        output.with_context(|| format!("give --output; {USAGE}"))?,
+    ))
+}
+
 #[derive(Debug)]
 pub enum AppLaunchMode {
     /// Ordinary launch, carrying whatever the retail switch table decided.
@@ -162,9 +291,10 @@ pub enum AppLaunchMode {
     Spawn(RetailStartupOptions),
     /// Watch a strictly reconstructed recording through the normal renderer.
     Replay(ReplayLaunchRequest),
-    /// A help switch: print usage and terminate before any window is created,
-    /// exactly as native's switch parser makes `WinMain` bail.
-    Usage,
+    /// A help switch or an invalid `-X` tail: print its text and terminate
+    /// before any window is created, exactly as native's switch parser makes
+    /// `WinMain` bail.
+    Exit(StartupExit),
     ShellCapture(ShellCaptureRequest),
     TacticalCapture(TacticalCaptureRequest),
     /// A hidden run that draws one map's picture for the setup screens.
@@ -419,8 +549,8 @@ where
     }
     // This is the only process-argument owner for retail startup decisions.
     let (retail_options, args) = consume_retail_switches(args);
-    if retail_options.usage_requested {
-        return Ok(AppLaunchMode::Usage);
+    if let Some(exit) = retail_options.exit {
+        return Ok(AppLaunchMode::Exit(exit));
     }
     let spawn_count = args
         .iter()
@@ -547,12 +677,34 @@ fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn version_dispatch_is_strict_and_only_first() {
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(try_version(args(&["-WIN", "--version"])).is_none());
+        assert!(try_version(args(&["--probe", "--version"])).is_none());
+        assert!(
+            try_version(args(&["--version", "--extra"]))
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            try_probe(args(&["--probe", "--version", "--no-mod"]))
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            try_probe(args(&["--probe", "--map", "m.ini", "--version"]))
+                .unwrap()
+                .is_err()
+        );
+    }
 
     #[test]
     fn probe_dispatch_is_strict_and_only_first() {
@@ -581,6 +733,32 @@ mod tests {
     }
 
     #[test]
+    fn generate_map_takes_one_input_and_an_output() {
+        let args = |list: &[&str]| list.iter().map(OsString::from).collect::<Vec<_>>();
+        assert!(try_generate_map(args(&["--probe"])).is_none());
+        for bad in [
+            &["--code", "VR1-A"][..],
+            &["--output", "m.yrm"],
+            &["--code", "VR1-A", "--sed", "s.sed", "--output", "m.yrm"],
+            &["--code", "VR1-A", "--output"],
+            &["--code", "VR1-A", "--output", "m.yrm", "--map", "x"],
+        ] {
+            assert!(
+                parse_generate_map_args(args(bad).into_iter()).is_err(),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            parse_generate_map_args(args(&["--output", "m.yrm", "--sed", "s.sed"]).into_iter())
+                .unwrap(),
+            (
+                GenerateMapInput::Sed(PathBuf::from("s.sed")),
+                PathBuf::from("m.yrm")
+            )
+        );
+    }
+
+    #[test]
     fn standalone_replay_dispatch_is_strict_and_does_not_enter_interactive_startup() {
         assert!(try_replay_verify([OsString::from("-WIN")]).is_none());
         assert!(
@@ -601,7 +779,7 @@ mod tests {
         let root = test_directory("replay-cd-values");
         let path = root.join("record-cd.json");
         let log = crate::sim::replay::ReplayLog::new(crate::sim::replay::ReplayHeader {
-            version: 2,
+            version: crate::sim::replay::REPLAY_VERSION,
             tick_hz: 45,
             seed: 7,
             map_name: "XMP03T4.MAP".into(),

@@ -1,13 +1,13 @@
-//! VERA's per-map Skirmish setup; gamemd's `0x102` has no counterpart. Save
-//! Setup keeps the selected map's player rows and options, and Load Setup
-//! puts them back, so a map can be played again without setting every row.
-//! The app keeps one setup per map file.
+//! VERA's last Skirmish setup; gamemd's `0x102` has no counterpart. Leaving
+//! the page keeps the selected map's player rows and options, and the next
+//! visit opens on that map and puts them back, so it can be played again
+//! without setting every row. The app keeps the one page last left.
 //!
-//! Loading goes through the page's own combo rules: each saved choice is
-//! picked as a click on its list would pick it, so a row gets only what the
-//! page offers it. A colour or start an earlier row took, a start past the
-//! map's or a team the mode does not list leaves the row as the load opened
-//! it. Both reach every row the map seats, shown or not.
+//! Putting a setup back goes through the page's own combo rules: each saved
+//! choice is picked as a click on its list would pick it, so a row gets only
+//! what the page offers it. A colour or start an earlier row took, a start
+//! past the map's or a team the mode does not list leaves the row as the
+//! page opened it. Both reach every row the map seats, shown or not.
 
 use std::ops::Range;
 
@@ -19,7 +19,7 @@ use super::combos::{apply_combo_selection, combo_open};
 use super::player_name::selected_player_rows;
 use super::{
     SkirmishAiRowType, SkirmishComboId, SkirmishComboItem, SkirmishCountryChoice,
-    SkirmishShellState, combo_items, game_speed_visual_position, selected_combo_item,
+    SkirmishShellState, combo_items, selected_combo_item,
 };
 
 /// One row's Side, Color, Start and Team picks.
@@ -55,6 +55,8 @@ pub struct SkirmishSavedSetup {
     pub build_off_ally: bool,
     pub crates: bool,
     pub mcv_redeploy: bool,
+    /// VERA's Game Options.
+    pub session: crate::skirmish_launch::SessionOptions,
 }
 
 impl SkirmishSavedSetup {
@@ -77,6 +79,7 @@ impl SkirmishSavedSetup {
             build_off_ally: state.build_off_ally,
             crates: state.crates,
             mcv_redeploy: state.mcv_redeploy,
+            session: state.session,
         }
     }
 
@@ -116,11 +119,12 @@ impl SkirmishSavedSetup {
             let range = bounds.range(id);
             (range.min..=range.max).contains(&value)
         };
-        let speed = game_speed_visual_position(self.game_speed);
+        let speed =
+            crate::ui::shell::game_speed::SpeedContext::Offline.visual_position(self.game_speed);
         if fits(SkirmishTrackbarId::GameSpeed0x529, speed) {
             state.game_speed = self.game_speed;
         }
-        if fits(SkirmishTrackbarId::Credits0x511, self.credits) {
+        if bounds.accepts_credits(self.credits) {
             state.starting_credits = self.credits;
         }
         if fits(SkirmishTrackbarId::UnitCount0x50c, self.unit_count) {
@@ -131,6 +135,13 @@ impl SkirmishSavedSetup {
         state.build_off_ally = self.build_off_ally;
         state.crates = self.crates;
         state.mcv_redeploy = self.mcv_redeploy;
+        state.session = crate::skirmish_launch::SessionOptions {
+            tech_level: crate::ui::skirmish_shell::game_options::admitted_tech_level(
+                self.session.tech_level,
+            )
+            .unwrap_or(state.session.tech_level),
+            ..self.session
+        };
     }
 }
 

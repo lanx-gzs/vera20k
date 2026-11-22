@@ -18,6 +18,17 @@
 //! save header is read that way without decoding the body behind it.
 //! [`layout`] describes what a type reads, so saves can name their layout.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use std::fmt;
 
 use serde::de::{self, DeserializeSeed, Deserializer as _, IntoDeserializer, Visitor};
@@ -605,7 +616,7 @@ impl<'de> de::VariantAccess<'de> for &mut Deserializer<'de> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use std::collections::BTreeMap;
 

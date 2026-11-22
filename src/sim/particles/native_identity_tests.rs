@@ -1,5 +1,7 @@
 //! Original constructor/Logic continuation, bounded to the flat Spark controls
 //! in `procedural_drawing_oracle/electric_bolt` and the retained save envelope.
+// Ares simulates this Spark system itself (hooks 0x62DF05, 0x62FD60), so the
+// stock control holds in a stock game only.
 
 use super::{Particle, ParticleSystem};
 use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
@@ -180,7 +182,7 @@ fn original_spark_birth_and_first_live_visit_preserve_ids_rng_and_particle_state
         // EBolt Init's Main draw precedes the system constructor. Adopt that
         // executed boundary; this test covers the actual system/particle path.
         let rng = &case["birth"]["rng_after"];
-        sim.main_rng = SimRng::from_native_state_hex_for_test(rng["main"].as_str().unwrap()).into();
+        sim.main_rng = SimRng::from_native_state_hex_for_test(rng["main"].as_str().unwrap());
         sim.scenario_rng =
             SimRng::from_native_state_hex_for_test(rng["scenario"].as_str().unwrap());
         sim.mapgen_rng = SimRng::from_native_state_hex_for_test(rng["mapgen"].as_str().unwrap());

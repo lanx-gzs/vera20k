@@ -203,23 +203,19 @@ fn bound_saved_world(
         theater.extension,
         &map.header.theater,
     );
-    let overlay_registry = rules.overlay_registry().clone();
+    let overlay_registry = rules.overlay_registry();
     let mut simulation = super::super::tests::load_fixture_simulation(false);
     let terrain = {
-        let main_rng = simulation.main_rng().draws();
+        let (mut fill_rng, main_rng) = simulation.terrain_load_draws();
         let mut main_draw = || main_rng.next_u32();
         let mut selector = cache.begin_load(&mut main_draw);
-        let mut fill_draw = |min, max| {
-            simulation
-                .scenario_rng_mut_for_test()
-                .next_range_u32_inclusive(min, max)
-        };
+        let mut fill_draw = |min, max| fill_rng.next_range_u32_inclusive(min, max);
         ResolvedTerrainGrid::build_with_variant_selector(
             &map,
             Some(&theater),
             Some(assets),
             Some(&rules.terrain_rules),
-            Some(&overlay_registry),
+            Some(overlay_registry),
             Some(&rules.terrain_object_types),
             true,
             rules.general.cliff_back_impassability,
@@ -227,14 +223,10 @@ fn bound_saved_world(
             &mut selector,
         )
     };
-    let roots = crate::map::resolved_terrain::scheduler_anim_roots(
-        &rules,
-        &overlay_registry,
-        terrain.tile_animations(),
-    );
+    let roots =
+        crate::map::resolved_terrain::scheduler_anim_roots(&rules, terrain.tile_animations());
     init_helpers::bind_rules_asset_closure(
         &mut rules,
-        &overlay_registry,
         &roots,
         &[],
         assets,
@@ -321,8 +313,8 @@ fn bound_saved_world(
             resources: SimResources {
                 rules,
                 terrain_template: Some(terrain),
-                overlay_registry,
-            },
+            }
+            .into(),
         },
         metadata,
         clear_file,
@@ -438,6 +430,7 @@ fn snapshot_bytes_with_lighting(
         Some(&view),
         Some(&resources),
     )
+    .unwrap()
 }
 
 fn lookup(assets: &AssetManager, name: &str) -> Option<(String, i32, Vec<u8>)> {
@@ -695,7 +688,11 @@ fn incoming_save(theater: &str, extra_rules: &str) -> Option<IncomingSave> {
         .rules
         .terrain_rules
         .row(crate::rules::terrain_rules::LandType::Rough);
-    let template = incoming.resources.terrain_template.as_mut().unwrap();
+    let template = std::sync::Arc::get_mut(&mut incoming.resources)
+        .expect("unshared resources")
+        .terrain_template
+        .as_mut()
+        .unwrap();
     let cell = template.cell_mut_for_test(8, 8).unwrap();
     cell.land_type = 7;
     cell.base_land_type = 7;
@@ -705,11 +702,19 @@ fn incoming_save(theater: &str, extra_rules: &str) -> Option<IncomingSave> {
         .simulation
         .install_resolved_terrain_for_new_map(template.clone());
     assert_eq!(
-        incoming.resources.overlay_registry.id_for_name("CRATE"),
+        incoming
+            .resources
+            .rules
+            .overlay_registry()
+            .id_for_name("CRATE"),
         Some(179)
     );
     assert_eq!(
-        incoming.resources.overlay_registry.id_for_name("WCRATE"),
+        incoming
+            .resources
+            .rules
+            .overlay_registry()
+            .id_for_name("WCRATE"),
         Some(242)
     );
     let overlays = incoming
@@ -734,7 +739,7 @@ fn incoming_save(theater: &str, extra_rules: &str) -> Option<IncomingSave> {
     crate::sim::overlay_grid::recalc_overlay_passability(
         overlays,
         &mut terrain,
-        &incoming.resources.overlay_registry,
+        incoming.resources.rules.overlay_registry(),
         8,
         8,
     );
@@ -1185,6 +1190,60 @@ fn retail_saved_resources_prepare_cold() {
 }
 
 #[test]
+fn cold_custom_player_load_keeps_the_saved_scenario_rng_at_menu_handoff() {
+    use crate::app::match_bootstrap::OrdinaryMatchSeedClock;
+    use crate::app::persistence::commands::resume_menu_saved_game_rng;
+    use crate::rules::rule_policy::AllowWinTagsPolicy;
+
+    let Some(mut save) = incoming_save("TEMPERATE", "") else {
+        return;
+    };
+    let sim = &mut save.incoming.simulation;
+    let mode = sim.session().game_mode();
+    let policy = mode
+        .stock_rule_policy(None)
+        .with_allow_win_tags(AllowWinTagsPolicy::Ignore);
+    sim.install_session_admission(mode, None, policy);
+    sim.scenario_rng_mut_for_test().next_u32();
+    let saved_seed = sim.session().seed();
+    let saved_rng = sim.rng_state();
+    let bytes = snapshot_bytes(
+        &save.incoming,
+        &save.owner,
+        &save.map,
+        None,
+        save.rules_hash,
+    );
+
+    let frontend = frontend_main();
+    let owner = retail_rules_owner(&save.assets);
+    let view = SavedGamePreparationView {
+        repository: &save.repository,
+        current_simulation: None,
+        frontend_main: &frontend,
+        rules_owner: &owner,
+        tile_cache: &TileVariantSelectorCache::default(),
+        lighting: &crate::app::presentation::lighting::MatchLighting::default(),
+        load_clock: &|| LOAD_CLOCK_MS,
+    };
+    let loaded = save
+        .assets
+        .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
+        .unwrap();
+    let (mut sim, _) = loaded
+        .world
+        .into_committed(SharedCellDummy::fresh(), &frontend);
+    assert_eq!(sim.session().rule_policy(), policy);
+    assert_eq!(sim.rng_state().scenario, saved_rng.scenario);
+    let committed_rng = sim.rng_state();
+
+    resume_menu_saved_game_rng(&mut sim, &mut OrdinaryMatchSeedClock);
+
+    assert_eq!(sim.session().seed(), saved_seed);
+    assert_eq!(sim.rng_state(), committed_rng);
+}
+
+#[test]
 fn saved_infantry_sequence_bank_survives_image_without_sequence() {
     let Some(mut save) = incoming_save("TEMPERATE", "[SLAV]\nImage=MONEY\n") else {
         return;
@@ -1242,12 +1301,27 @@ fn unread_cell_anim_loads_its_own_retail_shape_without_replaying_construction() 
     use crate::sim::native_identity::NativeUniqueIdCursor;
     use crate::util::fixed_math::SIM_ZERO;
 
-    let Some(mut save) = incoming_save("TEMPERATE", "[GEM01]\nCellAnim=SEAL\n") else {
+    let Some(mut save) = incoming_save(
+        "TEMPERATE",
+        "[Tiberiums]\n0=Riparius\n[Riparius]\nImage=2\n[GEM01]\nCellAnim=SEAL\n",
+    ) else {
         return;
     };
     // A same-named Infantry type/ART section does not perform an Anim read.
     let rules = &save.incoming.resources.rules;
     let overlay = rules.overlay_registry();
+    // ReadINI721C49 retains the stock Image1 slope count when Image2 binds
+    // GEM01. Save7220D0/Load721E80 must preserve that history, rather than
+    // reconstructing a fresh Image2 descriptor from the last map text.
+    let image = rules.tiberium_types.types()[0].image();
+    assert_eq!(
+        (
+            image.base_overlay(),
+            image.primary_count(),
+            image.slope_count()
+        ),
+        (Some(27), 12, 8)
+    );
     assert_eq!(
         overlay
             .flags(overlay.id_for_name("GEM01").unwrap())
@@ -1295,6 +1369,10 @@ fn unread_cell_anim_loads_its_own_retail_shape_without_replaying_construction() 
         .assets
         .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
         .unwrap();
+    assert_eq!(
+        prepared.resources.rules.tiberium_types.types()[0].image(),
+        image
+    );
     // AnimTypeLoad428855 supplies image residency without ReadINI427D00
     // or LoadImageAndResolveFrameBounds427B50: all ctor bounds stay zero.
     let config = prepared
@@ -1325,7 +1403,7 @@ fn unread_cell_anim_loads_its_own_retail_shape_without_replaying_construction() 
     save.owner.install_saved_scenario_rules(processed_rules);
     let loaded = SimRuntime {
         simulation,
-        resources,
+        resources: resources.into(),
     };
     let loaded_hash = loaded.resources.rules.simulation_config_hash();
     let bytes = snapshot_bytes(&loaded, &save.owner, &map, None, loaded_hash);
@@ -1343,6 +1421,10 @@ fn unread_cell_anim_loads_its_own_retail_shape_without_replaying_construction() 
         .prepare_saved_load(|assets| PreparedSavedGame::prepare_resources(&bytes, &view, assets))
         .unwrap();
     assert_eq!(again.resources.rules.simulation_config_hash(), loaded_hash);
+    assert_eq!(
+        again.resources.rules.tiberium_types.types()[0].image(),
+        image
+    );
     assert_eq!(again.world.simulation.native_identity_cursor(), cursor);
     assert_eq!(again.world.simulation.anim(id).unwrap().runtime(), &runtime);
     let PreparedSavedResources {
@@ -1354,7 +1436,7 @@ fn unread_cell_anim_loads_its_own_retail_shape_without_replaying_construction() 
             &[],
             Some(&resources.rules),
             None,
-            Some(&resources.overlay_registry),
+            Some(resources.rules.overlay_registry()),
             33,
         );
     }
@@ -1380,13 +1462,15 @@ fn unknown_terrain_type_load_validates_then_commits_and_resaves_its_same_owner()
     // headless retail regression covers the complete fresh Scenario prefix.
     *save.incoming.simulation.native_unique_ids_mut_for_test() =
         Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
-    let overlays = save.incoming.resources.overlay_registry.clone();
+    let overlays = save.incoming.resources.rules.retain_overlay_registry();
     let rng = save.incoming.simulation.rng_state();
     construct_terrain_objects_with_rules(
         &mut save.incoming.simulation,
         save.map.terrain_objects(),
         &mut TerrainConstructionRules::Authored {
-            rules: &mut save.incoming.resources.rules,
+            rules: &mut std::sync::Arc::get_mut(&mut save.incoming.resources)
+                .expect("unshared resources")
+                .rules,
             owner: &mut save.owner,
         },
         false,
@@ -1507,7 +1591,7 @@ fn unknown_terrain_type_load_validates_then_commits_and_resaves_its_same_owner()
     save.owner.install_saved_scenario_rules(processed_rules);
     let runtime = SimRuntime {
         simulation,
-        resources,
+        resources: resources.into(),
     };
     let loaded_hash = runtime.resources.rules.simulation_config_hash();
     let bytes = snapshot_bytes(&runtime, &save.owner, &map, None, loaded_hash);
@@ -1568,13 +1652,15 @@ fn arctic_type_load_validates_before_mutation_and_resaves_the_same_owner() {
     let wall = save
         .incoming
         .resources
-        .overlay_registry
+        .rules
+        .overlay_registry()
         .id_for_name("GAWALL")
         .unwrap();
     assert_eq!(
         save.incoming
             .resources
-            .overlay_registry
+            .rules
+            .overlay_registry()
             .flags(wall)
             .unwrap()
             .damage_levels,
@@ -1639,7 +1725,8 @@ fn arctic_type_load_validates_before_mutation_and_resaves_the_same_owner() {
     assert_eq!(
         prepared
             .resources
-            .overlay_registry
+            .rules
+            .overlay_registry()
             .flags(wall)
             .unwrap()
             .damage_levels,
@@ -1647,7 +1734,7 @@ fn arctic_type_load_validates_before_mutation_and_resaves_the_same_owner() {
     );
     let (filename, _) = crate::rules::effect_asset_catalog::load_overlay_shape(
         &save.assets,
-        &prepared.resources.overlay_registry,
+        prepared.resources.rules.overlay_registry(),
         "GAWALL",
         "SNO",
         "SNOW",
@@ -1670,7 +1757,7 @@ fn arctic_type_load_validates_before_mutation_and_resaves_the_same_owner() {
     save.owner.install_saved_scenario_rules(processed_rules);
     let runtime = SimRuntime {
         simulation,
-        resources,
+        resources: resources.into(),
     };
     let bytes = snapshot_bytes(
         &runtime,
@@ -1705,7 +1792,7 @@ fn arctic_type_load_validates_before_mutation_and_resaves_the_same_owner() {
     );
     let (filename, _) = crate::rules::effect_asset_catalog::load_overlay_shape(
         &save.assets,
-        &again.resources.overlay_registry,
+        again.resources.rules.overlay_registry(),
         "GAWALL",
         "SNO",
         "SNOW",
@@ -1758,7 +1845,7 @@ fn retail_saved_resources_prepare_cross_map_and_roll_back_late_failure() {
         .simulation
         .initialize_random_number_system(0xA123_4567);
     for _ in 0..7 {
-        outgoing.simulation.main_rng().next_u32();
+        outgoing.simulation.main_rng_mut_for_test().next_u32();
     }
     for _ in 0..11 {
         outgoing.simulation.mapgen_rng_mut_for_test().next_u32();

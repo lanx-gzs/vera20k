@@ -7,7 +7,7 @@
 //! the slots see and applies their effects (the country refresh, a changed
 //! scenario, the `C0` text).
 
-use super::{NetworkSetupProtocol, NetworkSetupRequest};
+use super::NetworkSetupRequest;
 use crate::app::AppState;
 use crate::app::frontend::skirmish_session::cooperative::{
     CooperativeCampaignText, CooperativeSlotContext, SavedCampaignJoin, SavedCampaignLeave,
@@ -15,15 +15,7 @@ use crate::app::frontend::skirmish_session::cooperative::{
 use crate::skirmish_launch::SkirmishLaunchMode;
 use crate::skirmish_modes::MpModeClass;
 
-/// VERA: what BC6's Continue in a WOL room leaves for the room's return:
-/// the round's Cooperative mode and the scenario `+0xA0` selected, the
-/// mission BC6 would have loaded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CooperativeResume {
-    pub(crate) mode_id: i32,
-    pub(crate) scenario: usize,
-}
-
+use crate::app::match_runtime::session::CooperativeResume;
 /// What the slots read from the session: the scenario file names in catalog
 /// order (`[0xA8B8CC]`), the nodes' names local first (`0xA8DA78`), the
 /// current scenario (`[0xA8B254]`) and whether Choose Map is on top.
@@ -234,9 +226,7 @@ pub(crate) fn resume(state: &mut AppState, resume: CooperativeResume) -> anyhow:
         parts.progress.publish(parts.registry, setup)
     };
     publish(state, published)?;
-    if let Some(protocol) = state.frontend.network_setup_protocol.as_mut() {
-        protocol.await_cooperative_rematch_seat();
-    }
+    state.match_state.session.await_cooperative_rematch_seat();
     Ok(())
 }
 
@@ -440,12 +430,7 @@ pub(super) fn guest_joined(state: &mut AppState) -> anyhow::Result<()> {
         inputs.with(|_, nodes| parts.progress.join(parts.registry, parts.rng, nodes, setup))
     };
     publish(state, published)?;
-    if state
-        .frontend
-        .network_setup_protocol
-        .as_mut()
-        .is_some_and(NetworkSetupProtocol::take_cooperative_rematch_seat)
-    {
+    if state.match_state.session.take_cooperative_rematch_seat() {
         return Ok(());
     }
     let save = state.frontend.multiplayer_shell_runtime.cooperative_save();
@@ -468,7 +453,7 @@ pub(super) fn guest_joined(state: &mut AppState) -> anyhow::Result<()> {
                 "TXT_SAVE_CAMP_AVAILABLE",
                 "TXT_SAVE_CAMP_AVAILABLE",
             );
-            crate::app::shell_lan::append_chat(
+            crate::app::shell_lan::append_room_chat(
                 state,
                 crate::ui::lan_shell::LanChatLine {
                     text: text.encode_utf16().collect(),
@@ -501,7 +486,7 @@ fn peer_mode_cooperative(state: &AppState) -> bool {
         .choose_map_modal
         .as_ref()
     {
-        Some(modal) => modal.selected_mode_id,
+        Some(modal) => modal.selected_mode.id,
         None => match state.match_state.session.network_setup() {
             Some(launch) => launch.mode.id,
             None => return false,
@@ -568,24 +553,11 @@ pub(super) fn admit_join_country(
     state: &AppState,
     slot: &mut crate::skirmish_launch::SkirmishLocalSlot,
 ) {
-    if !current(state) {
-        return;
-    }
-    let runtime = &state.frontend.multiplayer_shell_runtime;
-    let requested = if slot.country_random {
-        -2
-    } else {
-        i32::from(slot.country.raw_index())
-    };
-    if runtime.cooperative_admits(requested) {
-        return;
-    }
-    match runtime.cooperative_default_country() {
-        Some(country) => {
-            slot.country = country;
-            slot.country_random = false;
-        }
-        None => slot.country_random = true,
+    if current(state) {
+        state
+            .frontend
+            .multiplayer_shell_runtime
+            .cooperative_admit_country(slot);
     }
 }
 

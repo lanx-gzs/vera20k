@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- The lobby and LAN discovery are HTTPS/UDP; ACCESS_WIFI_STATE is for the
-         WifiManager locks multicast discovery needs (P8). -->
+    <!-- The lobby, LAN discovery and the advisory download all use the network;
+         ACCESS_WIFI_STATE is for the WifiManager locks multicast discovery
+         needs. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -59,6 +60,8 @@
             android:label="图片查看器"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|density|uiMode|fontScale|locale|layoutDirection" />
 
+        <!-- The keyboard host: an ordinary activity, so the system gives it a
+             real input connection the game's NativeActivity window cannot have. -->
         <activity
             android:name="org.vera20k.TextEntryActivity"
             android:exported="false"
@@ -106,7 +109,6 @@
             <meta-data
                 android:name="android.app.lib_name"
                 android:value="vera20k_android" />
-
         </activity>
     </application>
 

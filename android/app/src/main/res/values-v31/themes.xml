@@ -2,11 +2,15 @@
 <resources>
     <!-- Android 12+ draws its own splash window before the app's first frame,
          and it ignores `windowBackground` for it: the art has to be named as the
-         splash icon, over the same colour, with no icon animation. -->
+         splash icon, over the same colour, with no icon animation. The icon is
+         the launcher icon, so the splash agrees with the entry the player
+         tapped: each alias overrides it with its own theme. -->
     <style name="Theme.VeraZip" parent="android:Theme.Black.NoTitleBar.Fullscreen">
         <item name="android:windowBackground">@drawable/splash_background</item>
         <item name="android:windowSplashScreenBackground">@color/splash_background</item>
         <item name="android:windowSplashScreenAnimatedIcon">@mipmap/ic_launcher_round</item>
         <item name="android:windowSplashScreenAnimationDuration">0</item>
     </style>
+
+
 </resources>

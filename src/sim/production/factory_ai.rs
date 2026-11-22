@@ -41,7 +41,8 @@
 //! - A placed object plays the building type's `CreateUnitSound=`
 //!   (`+0xE74`, read at `0x004607C8..0x004607F8`) at the building
 //!   (`0x00450198`); among retail types only the Cloning Vats set it, which
-//!   have no `Factory=`.
+//!   have no `Factory=`. `HouseClass::Place_Production` plays the same key
+//!   for a player's delivery (`0x004FB50D`), also unported.
 //! - The try-later branch also copies an uninitialised stack word into the
 //!   timer's middle field (`+0x554`, `0x004501F1`), which no reader uses.
 //! - Mobile products leave through [`exit_produced_object`], the same
@@ -73,7 +74,7 @@ pub(crate) fn factory_ai(
     rules: &RuleSet,
     building: u64,
     overlay_registry: Option<&OverlayTypeRegistry>,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     let Some(owner) = sim.substrate.entities.get(building).map(|b| b.owner()) else {
         return;
@@ -123,21 +124,22 @@ fn exit_finished_object(
     building: u64,
     owner: InternedId,
     overlay_registry: Option<&OverlayTypeRegistry>,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
-    let Some(object) = sim
+    let Some(product) = sim
         .production
         .factories()
         .building_factory(building)
         .filter(|factory| factory.progress() >= PRODUCTION_STEPS)
-        .and_then(|factory| factory.object().cloned())
+        .and_then(|factory| factory.object())
+        .map(|object| object.entity_id)
     else {
         return;
     };
     if !placement_wait_over(sim, building) {
         return;
     }
-    let Some(product) = object.entity_id else {
+    let Some(product) = product else {
         return;
     };
     let Some(product_type) = sim
@@ -166,10 +168,7 @@ fn exit_finished_object(
             // Phobos `BuildingClass_KickOutUnit_BuildingType_Phobos 0x44531F`
             // clears the building slot after the placed structure exits.
             // Unit, Infantry and Aircraft clear in Exit_Object's prelude.
-            #[cfg(feature = "phobos")]
-            if product_type.category == ObjectCategory::Building
-                && rules.parallel_ai_queues().allows_parallel()
-            {
+            if product_type.category == ObjectCategory::Building && rules.parallel_ai_queues_act() {
                 let slot = crate::sim::ai_base_building::AiFactorySlot::for_product(
                     product_type.category,
                     product_type.naval,
@@ -194,14 +193,14 @@ fn exit_finished_object(
             // CompletedProduction lets the placed object go; the delete
             // finds none to abandon.
             sim.production
-                .factories_mut()
+                .edit_factories()
                 .remove_building_factory(building);
         }
         BuildingExit::TryLater => {
             let frame = sim.session.binary_frame() as i32;
             let delay = rules.general.placement_delay_frames();
             if let Some(entity) = sim.substrate.entities.get_mut(building) {
-                entity.ai_placement_timer.restart(frame, delay);
+                entity.building.ai_placement_timer.restart(frame, delay);
             }
         }
         BuildingExit::Failed => {
@@ -234,7 +233,7 @@ fn abandon_stopped_factory(
     rules: &RuleSet,
     building: u64,
     owner: InternedId,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     if !placement_wait_over(sim, building) {
         return;
@@ -263,7 +262,7 @@ fn start_factory(
     building: u64,
     owner: InternedId,
     factory_rtti: i32,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     // The producing building's `Naval=` decides which vehicle choice
     // `Suggest_New_Object` reads (NPSE `0xC2F130`), so resolve it first.
@@ -275,7 +274,6 @@ fn start_factory(
         .is_some_and(|ty| ty.naval);
     // Phobos `BuildingClass_Update_Factory_Phobos 0x4502F4` runs before the
     // money gate, so its claimed slot survives a start that stops here.
-    #[cfg(feature = "phobos")]
     if !parallel_start_allowed(sim, rules, building, owner, factory_rtti, factory_naval) {
         return;
     }
@@ -320,16 +318,8 @@ fn start_factory(
     let cost = sim.cost_of(owner, object, rules);
     // The FactoryClass constructor joins the factory vector
     // (`0x004C9974..0x004C9989`) before StartProduction constructs the object.
-    let insertion_seq = sim.production.next_enqueue_order();
-    sim.production.spend_enqueue_order();
-    sim.production.factories_mut().create_building_factory(
-        building,
-        owner,
-        category,
-        type_id,
-        insertion_seq,
-        cost,
-    );
+    sim.production
+        .create_building_factory(building, owner, category, type_id, cost);
     if start_active_production(
         sim,
         rules,
@@ -342,7 +332,7 @@ fn start_factory(
     {
         // `0x004503A7 -> 0x004502DC`: deleted, nothing held to abandon.
         sim.production
-            .factories_mut()
+            .edit_factories()
             .remove_building_factory(building);
     }
 }
@@ -353,7 +343,6 @@ fn start_factory(
 /// type in current production forbids parallel queues. The type check reads
 /// the same native `Producing*TypeIndex` choice fields that
 /// [`ai_base_building::suggest_new_object`] consumes.
-#[cfg(feature = "phobos")]
 fn parallel_start_allowed(
     sim: &mut Simulation,
     rules: &RuleSet,
@@ -364,10 +353,10 @@ fn parallel_start_allowed(
 ) -> bool {
     use crate::sim::ai_base_building::AiFactorySlot;
     use crate::sim::ai_unit_choice::UnitChoiceKind;
-    let switches = rules.parallel_ai_queues();
-    if !switches.allows_parallel() {
+    if !rules.parallel_ai_queues_act() {
         return true;
     }
+    let switches = rules.parallel_ai_queues();
     let Some(slot) = AiFactorySlot::for_producer(factory_rtti, naval) else {
         return true;
     };
@@ -413,7 +402,6 @@ fn parallel_start_allowed(
     !choice.is_some_and(|object| object.forbid_parallel_ai_queues)
 }
 
-#[cfg(feature = "phobos")]
 fn choice_product<'r>(
     sim: &Simulation,
     rules: &'r RuleSet,
@@ -430,7 +418,7 @@ fn placement_wait_over(sim: &Simulation, building: u64) -> bool {
     sim.substrate
         .entities
         .get(building)
-        .is_some_and(|entity| entity.ai_placement_timer.expired(frame))
+        .is_some_and(|entity| entity.building.ai_placement_timer.expired(frame))
 }
 
 /// NP `BuildingClass::Factory_AI` count comparison: NPSE #359
@@ -523,7 +511,7 @@ pub(crate) fn detach_all(
     sim: &mut Simulation,
     rules: &RuleSet,
     building: u64,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     let Some(factory) = sim.production.factories().building_factory(building) else {
         return;
@@ -538,6 +526,6 @@ pub(crate) fn detach_all(
     );
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_production))]
 #[path = "factory_ai_tests.rs"]
 mod tests;

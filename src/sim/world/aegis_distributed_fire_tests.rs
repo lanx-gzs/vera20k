@@ -22,8 +22,8 @@ fn eligible_air_target(sim: &Simulation, rules: &RuleSet, aegis: u64) -> Option<
         sim.zone_grid.as_ref(),
         LineOfFireInputs {
             overlay_grid: sim.overlay_grid.as_ref(),
-            overlay_registry: None,
             alliances: Some(&sim.house_alliances),
+            ..Default::default()
         },
         Some(sim),
         None,
@@ -132,10 +132,9 @@ impl GuardScene {
             .advance_app_frame(
                 &commands,
                 &self.rules,
-                None,
                 33,
                 TickLane::Ordinary,
-                FrameEffects::default(),
+                &mut FrameEffects::default(),
             )
             .expect("ordinary Aegis frame");
         assert!(output.tick.frame_committed);
@@ -181,13 +180,17 @@ fn distributed_guard_normal_and_elite_cycle_live_targets_and_reset_only_burst() 
                 !source.passive_scan.acquired(),
                 "class NULL assignment clears passive acquisition"
             );
+            // Ares TechnoClass_SetTarget_Burst (1005D320, hook 0x6FCF53)
+            // keeps the index instead.
+            if !scene.rules.ares() {
+                assert_eq!(
+                    source.seldom.weapon_burst.index(),
+                    0,
+                    "changed NULL target resets elite Burst2 too"
+                );
+            }
             assert_eq!(
-                source.weapon_burst.index(),
-                0,
-                "changed NULL target resets elite Burst2 too"
-            );
-            assert_eq!(
-                source.weapon_burst.radial_index(),
+                source.seldom.weapon_burst.radial_index(),
                 index + 1,
                 "radial launch state is independent"
             );
@@ -247,8 +250,7 @@ fn distributed_explicit_attack_retains_target_and_elite_burst() {
                 scene.aegis,
                 Some(target),
                 &scene.rules,
-                None,
-                FrameEffects::default(),
+                &mut FrameEffects::default(),
             )
             .unwrap();
         for index in 0..2 {
@@ -258,10 +260,10 @@ fn distributed_explicit_attack_retains_target_and_elite_burst() {
             assert_eq!(source.attack_target.target(), Some(target));
             assert!(source.distributed_fire_history().is_empty());
             assert_eq!(
-                source.weapon_burst.index(),
+                source.seldom.weapon_burst.index(),
                 if elite { (index + 1) % 2 } else { 0 }
             );
-            assert_eq!(source.weapon_burst.radial_index(), index + 1);
+            assert_eq!(source.seldom.weapon_burst.radial_index(), index + 1);
         }
     }
 }
@@ -303,7 +305,7 @@ fn distributed_list_only_expiry_uses_common_broadcast_and_first_removal() {
     // Refreshing the existing derived expiry index occurs inside this owner.
     scene
         .sim
-        .detach_all_pointer_expired(target, &scene.rules, None, FrameEffects::default());
+        .detach_all_pointer_expired(target, &scene.rules, &mut FrameEffects::default());
     let source = scene.sim.substrate.entities.get(scene.aegis).unwrap();
     assert_eq!(
         source
@@ -316,7 +318,7 @@ fn distributed_list_only_expiry_uses_common_broadcast_and_first_removal() {
     assert_eq!(source.distributed_fire_history(), [Some(shot.target)]);
     scene
         .sim
-        .notify_pointer_expired(target, super::UninitContext::new(&scene.rules, None));
+        .notify_pointer_expired(target, super::UninitContext::new(&scene.rules));
     let source = scene.sim.substrate.entities.get(scene.aegis).unwrap();
     assert_eq!(
         source.distributed_fire_candidates(),
@@ -333,7 +335,7 @@ fn distributed_list_only_expiry_uses_common_broadcast_and_first_removal() {
     assert_eq!(scene.sim.mapgen_rng.state(), mapgen);
     scene
         .sim
-        .detach_all_pointer_expired(target, &scene.rules, None, FrameEffects::default());
+        .detach_all_pointer_expired(target, &scene.rules, &mut FrameEffects::default());
     assert_eq!(
         scene
             .sim
@@ -443,8 +445,7 @@ fn distributed_normal_load_clears_all_classes_before_strong_reference_validation
         actors[0],
         Some(TargetKind::Entity(actors[1])),
         &rules,
-        None,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     )
     .unwrap();
     let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "distributed", 0);
@@ -647,7 +648,7 @@ fn distributed_failed_fireat_remembers_argument_but_unit_attack_bypasses_tail() 
             },
             &rules,
             None,
-            FrameEffects::default(),
+            &mut FrameEffects::default(),
         );
         assert_eq!(
             sim.projectiles.len(),
@@ -700,8 +701,7 @@ fn distributed_building_attack_takes_the_common_history_tail() {
         pillbox,
         Some(TargetKind::Entity(target)),
         &rules,
-        None,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     )
     .unwrap();
     sim.commit_fire_visit(
@@ -712,7 +712,7 @@ fn distributed_building_attack_takes_the_common_history_tail() {
         },
         &rules,
         None,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     );
     assert_eq!(sim.projectiles.len(), 1);
     let source = sim.substrate.entities.get(pillbox).unwrap();

@@ -141,7 +141,7 @@ impl ZoneBatchHost for LivePublication<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 mod tests {
     use super::*;
     include!("bridge_batch_native_tests.rs");
@@ -212,14 +212,17 @@ mod tests {
             off_104: 8,
             off_108: 8,
         });
-        sim.zone_grid = Some(ZoneGrid::build_with_native_bridge_geometry(
-            &path,
-            sim.resolved_terrain.as_ref().unwrap(),
-            bridges.endpoint_records(),
-            16,
-            16,
-            Some((8, 8)),
-        ));
+        sim.zone_grid = Some(
+            ZoneGrid::build_with_native_bridge_geometry(
+                &path,
+                sim.resolved_terrain.as_ref().unwrap(),
+                bridges.endpoint_records(),
+                16,
+                16,
+                Some((8, 8)),
+            )
+            .into(),
+        );
         sim.bridge_state = Some(bridges);
         sim.path_grid = Some(Arc::new(path.clone()));
         let before = edge_state(&sim);
@@ -227,7 +230,6 @@ mod tests {
             frame_effects: crate::sim::world::FrameEffects::default(),
             sim: &mut sim,
             rules: &rules,
-            registry: None,
             collapsed: false,
         };
         assert!(!host.validate_bridge_zones((5, 5)).unwrap());
@@ -241,7 +243,6 @@ mod tests {
             frame_effects: crate::sim::world::FrameEffects::default(),
             sim: &mut sim,
             rules: &rules,
-            registry: None,
             collapsed: false,
         };
         assert!(!host.validate_bridge_zones((5, 5)).unwrap());
@@ -257,7 +258,6 @@ mod tests {
             frame_effects: crate::sim::world::FrameEffects::default(),
             sim: &mut sim,
             rules: &rules,
-            registry: None,
             collapsed: false,
         };
         host.rebuild_bridge_connectivity().unwrap();

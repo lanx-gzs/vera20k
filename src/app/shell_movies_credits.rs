@@ -5,12 +5,12 @@
 
 use crate::sim::trigger_runtime::ThemeRequest;
 use crate::ui::shell::list::ListMetrics;
-use std::sync::Arc;
 use crate::util::time::Instant;
+use std::sync::Arc;
 
 use super::{App, AppState};
 use crate::app::frontend::credits_roll::{
-    CreditsInput, CreditsReturn, CreditsRoll, CreditsRollSession,
+    CreditsInput, CreditsReturn, CreditsRoll, CreditsRollSession, CreditsViewport,
 };
 use crate::app::frontend::fullscreen_movie::{FullscreenMovie, MovieReturn, movie_stem};
 use crate::app::shell_route::ShellRoute;
@@ -252,15 +252,15 @@ impl App {
             .options_profile
             .movie_progress
             .note_played(stem);
-        // 0x005BED61..0x005BED6A: outside a campaign (GameMode != 0) Play_Movie
+        // 0x005BED61..0x005BED6A: outside a campaign world Play_Movie
         // returns right after that note, with no video, audio hold or suspend,
         // so a skirmish or multiplayer map's movie action only moves on.
         if running_scenario
             && state
                 .match_state
                 .sim_runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.simulation.session().game_mode_nonzero())
+                .runtime()
+                .is_some_and(|runtime| !runtime.simulation.session().uses_campaign_world())
         {
             return;
         }
@@ -308,26 +308,25 @@ impl App {
             .options_profile
             .voice_volume
             .clamp(0.0, 1.0);
-        // 0x006C99D0: the movie's subtitlemd.txt cues, when it has any.
+        // 0x006C99D0: the movie's cues, when it has any.
         let header = &surface.file().header;
-        let subtitles = state
-            .process_assets
-            .manager()
-            .and_then(|assets| assets.get_ref(crate::app::movie_subtitles::SUBTITLE_FILE))
-            .and_then(|file| crate::app::movie_subtitles::movie_subtitles(file, stem))
-            .and_then(|cues| {
-                crate::app::movie_subtitles::SubtitleTrack::new(
-                    cues,
-                    header.fps_num,
-                    header.fps_den,
-                )
-            });
+        let subtitles =
+            crate::app::movie_subtitles::cues_for_movie(state.process_assets.manager(), stem)
+                .and_then(|cues| {
+                    crate::app::movie_subtitles::SubtitleTrack::new(
+                        cues,
+                        header.fps_num,
+                        header.fps_den,
+                    )
+                });
         let movie = FullscreenMovie::new(
             surface,
-            state.audio.music_player.as_ref().map(|music| music.mixer()),
+            // BinkMovie_Open 0x0043279F selects the shared sound device.
+            state.audio.movie_mixer(),
             voice_volume,
             subtitles,
             return_to,
+            crate::app::frontend::fullscreen_movie::playback_active(state),
         );
         state.frontend.fullscreen_movie = Some(movie);
         if running_scenario {
@@ -349,15 +348,18 @@ impl App {
         Self::return_from_fullscreen_movie(state, return_to);
     }
 
-    /// Per-frame Play_Movie service: pause while inactive, step video and
-    /// soundtrack, and finish once the last frame or an abort is reached.
+    /// Per-frame Play_Movie service: step video and soundtrack, then finish
+    /// once the last frame or an abort is reached.
     pub(super) fn advance_fullscreen_movie(state: &mut AppState) -> anyhow::Result<()> {
-        let active = state.platform.window_active;
         let Some(movie) = state.frontend.fullscreen_movie.as_mut() else {
             return Ok(());
         };
-        movie.set_active(active);
-        let ended = match movie.step(&state.renderer.gpu) {
+        let voice_volume = state
+            .persistence
+            .options_profile
+            .voice_volume
+            .clamp(0.0, 1.0);
+        let ended = match movie.step(&state.renderer.gpu, voice_volume) {
             Ok(ended) => ended,
             Err(err) => {
                 log::warn!("Bink Error during playback: {err:#}");
@@ -452,9 +454,13 @@ impl App {
             return;
         };
         let lookup = |key: &str| Self::csf_label(state, key, &format!("MISSING:'{key}'"));
+        let viewport = CreditsViewport::new(
+            state.renderer.gpu.config.width,
+            state.renderer.gpu.config.height,
+        );
         let lines = crate::ui::movies_credits_shell::parse_credits(
             &bytes,
-            state.renderer.gpu.config.height as i32,
+            viewport.surface_height,
             &lookup,
         );
         let now_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();

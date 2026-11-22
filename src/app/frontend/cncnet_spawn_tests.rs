@@ -96,14 +96,16 @@ fn cncnet_campaign_keeps_logical_identity_for_loose_and_archived_missions() {
     );
     assert_eq!(metadata.load_message_key(), "MISSION:AL1");
 
-    let next = startup.next_mission(
-        "ALL02uMd.map".into(),
-        2,
-        1,
-        3,
-        crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
-        &mut OrdinaryMatchSeedClock,
-    );
+    let next = startup
+        .next_mission(
+            "ALL02uMd.map".into(),
+            2,
+            1,
+            3,
+            crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
+            &mut OrdinaryMatchSeedClock,
+        )
+        .unwrap();
     assert_eq!(next.scenario(), "ALL02UMD.MAP");
     let loaded =
         load_map_by_name_or_path_with_assets(retail.path(), next.selected_map_file(), &assets)
@@ -112,14 +114,16 @@ fn cncnet_campaign_keeps_logical_identity_for_loose_and_archived_missions() {
         matches!(loaded.source, LoadedMapSource::Loose { path, .. } if path == client.path().join("ALL02uMd.map"))
     );
 
-    let archived = next.next_mission(
-        "all03md.map".into(),
-        3,
-        1,
-        3,
-        crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
-        &mut OrdinaryMatchSeedClock,
-    );
+    let archived = next
+        .next_mission(
+            "all03md.map".into(),
+            3,
+            1,
+            3,
+            crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
+            &mut OrdinaryMatchSeedClock,
+        )
+        .unwrap();
     let loaded =
         load_map_by_name_or_path_with_assets(retail.path(), archived.selected_map_file(), &assets)
             .unwrap();
@@ -196,7 +200,7 @@ fn client_skirmish_preserves_roster_options_and_native_indices() {
     assert_eq!(session.local_slot().team, LaunchTeam::Team(0));
     assert_eq!(session.opponents[1].team, LaunchTeam::None);
     assert_eq!(session.required_start_count(), 3);
-    assert_eq!(session.pre_fill_house_roster.created_house_count(), 5);
+    assert_eq!(session.pre_fill_house_roster().created_house_count(), 5);
     assert!(session.house_roster_is_consistent());
     assert_eq!(session.options.starting_credits, 5000);
     assert!(!session.options.super_weapons);
@@ -232,16 +236,18 @@ fn client_campaign_uses_human_difficulty_and_not_catalog_index() {
 }
 
 /// `[MPColors] Color=` carries the client's colour index: YR's eight
-/// priorities, or a `[Colors]` entry when a Phobos build admits
-/// SkirmishUnlimitedColors.
+/// priorities and VERA's extra lobby colours 9..30, or a `[Colors]` entry
+/// when a Phobos build admits SkirmishUnlimitedColors. Priority 8 is the
+/// observer's.
 #[test]
 fn spawn_colour_index_width_follows_the_phobos_capability() {
     assert!(SpawnRequest::parse(SKIRMISH).is_ok());
-    let beyond_eight = SKIRMISH.replacen("Color=2", "Color=9", 1);
-    assert_eq!(
-        SpawnRequest::parse(&beyond_eight).is_ok(),
-        crate::rules::PHOBOS_ENABLED
-    );
+    let color = |value: u32| {
+        SpawnRequest::parse(&SKIRMISH.replacen("Color=2", &format!("Color={value}"), 1))
+    };
+    assert!(color(9).is_ok() && color(30).is_ok());
+    assert_eq!(color(8).is_ok(), crate::rules::PHOBOS_ENABLED);
+    assert_eq!(color(31).is_ok(), crate::rules::PHOBOS_ENABLED);
 }
 
 #[test]
@@ -288,20 +294,25 @@ fn rejects_network_sessions_unsupported_extensions_and_invalid_assignments() {
 }
 
 #[test]
-fn cncnet_country_indices_respect_the_compiled_capability_and_identity_width() {
+fn cncnet_country_indices_respect_the_game_capability_and_identity_width() {
     for index in [10, 11, i32::from(u16::MAX)] {
         let text = SKIRMISH.replacen("Side=0", &format!("Side={index}"), 1);
-        let result = SpawnRequest::parse(&text);
-        if crate::rules::ARES_ENABLED {
-            let SpawnGame::Skirmish(session) = result.unwrap().game else {
-                panic!("Battle Country identity");
-            };
-            assert_eq!(i32::from(session.local_slot().country.raw_index()), index);
-            assert!(!session.local_slot().country_random);
-        } else {
-            assert!(result.is_err(), "stock adapter rejects Country {index}");
-        }
+        let request = SpawnRequest::parse(&text).unwrap();
+        assert!(
+            request.check_country_limits(false).is_err(),
+            "a stock game refuses Country {index}"
+        );
+        request.check_country_limits(true).unwrap();
+        let SpawnGame::Skirmish(session) = request.game else {
+            panic!("Battle Country identity");
+        };
+        assert_eq!(i32::from(session.local_slot().country.raw_index()), index);
+        assert!(!session.local_slot().country_random);
     }
+    // An AI's `[HouseCountries]` entry has the same limit.
+    let ai = SpawnRequest::parse(&SKIRMISH.replacen("Multi2=8", "Multi2=10", 1)).unwrap();
+    assert!(ai.check_country_limits(false).is_err());
+    ai.check_country_limits(true).unwrap();
     for value in ["-1", "65536", "4294967306", "$10000", "broken"] {
         for text in [
             SKIRMISH.replacen("Side=0", &format!("Side={value}"), 1),
@@ -310,14 +321,13 @@ fn cncnet_country_indices_respect_the_compiled_capability_and_identity_width() {
             assert!(SpawnRequest::parse(&text).is_err(), "Country {value}");
         }
     }
-    assert_eq!(
-        SpawnRequest::parse("[Settings]\nIsSinglePlayer=Yes\nSide=10\n").is_ok(),
-        crate::rules::ARES_ENABLED,
-        "campaign Side has its own byte-wide adapter identity in Ares builds"
-    );
+    // Campaign Side has its own byte-wide adapter identity in a game read
+    // the Ares way.
+    let campaign = SpawnRequest::parse("[Settings]\nIsSinglePlayer=Yes\nSide=10\n").unwrap();
+    assert!(campaign.check_country_limits(false).is_err());
+    campaign.check_country_limits(true).unwrap();
 }
 
-#[cfg(feature = "ares")]
 #[test]
 fn cncnet_ares_country_indices_reach_house_side_and_mcv_selection() {
     use crate::rules::ruleset::RuleSet;
@@ -328,6 +338,7 @@ fn cncnet_ares_country_indices_reach_house_side_and_mcv_selection() {
     };
     use crate::sim::world::Simulation;
 
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let mut ini = String::from("[Countries]\n");
     for index in 0..12 {
         ini.push_str(&format!("{index}=C{index:02}\n"));
@@ -480,6 +491,7 @@ fn relay_section_at(source: u8, sources_mask: u32, tick_hz: u16) -> String {
         tick_hz,
         expires: 86400,
         pacing: Default::default(),
+        ordered_alone: false,
     }
     .sign(&key)
     .unwrap();
@@ -569,6 +581,102 @@ fn two_player_relay_file_admits_the_grant_in_canonical_source_order() {
         panic!("relay transport")
     };
     assert_eq!(relay.service_url, "http://127.0.0.1:8080");
+}
+
+/// A `[Relay]` section holding a watch ticket of match 1111… with the
+/// match's own certificate (docs/spawn.md "Watching").
+fn watch_relay_section(sources_mask: u32) -> String {
+    use crate::net::udp::{OrderingCertificate, RelayWatchTicket, test_support::SecretKey};
+    use base64::Engine;
+    let encode = |bytes: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let key = SecretKey::new([9; 32]);
+    let ticket = RelayWatchTicket {
+        room: [0x11; 16],
+        expires: 300,
+        nonce: [3; 16],
+        watcher: [0x44; 16],
+        delay_seconds: 0,
+    }
+    .sign(&key)
+    .unwrap();
+    let certificate = OrderingCertificate {
+        room: [0x11; 16],
+        sources_mask,
+        tick_hz: 45,
+        expires: 86400,
+        pacing: Default::default(),
+        ordered_alone: false,
+    }
+    .sign(&key)
+    .unwrap();
+    format!(
+        "[Relay]\nAddress=203.0.113.5:5000\nMatchId=11111111-1111-1111-1111-111111111111\n\
+         PlayerId=44444444-4444-4444-4444-444444444444\nTicket={}\nPacketKey={}\nPayloadKey={}\n\
+         OrderingCertificate={}\nServiceUrl=https://match.example.com/\nToken=watch-secret\n",
+        encode(&ticket),
+        encode(&[5; 32]),
+        encode(&[7; 32]),
+        encode(&certificate)
+    )
+}
+
+/// A watcher's spawn.ini is the lowest source's own file with a watch
+/// ticket (docs/spawn.md "Watching"): it parses to that player's session,
+/// AI included, and a watcher's relay spawn, whose bearer only renews.
+#[test]
+fn a_watchers_file_is_the_first_players_with_a_watch_ticket() {
+    let ai = "[HouseHandicaps]\nMulti3=1\n[HouseCountries]\nMulti3=3\n[HouseColors]\nMulti3=6\n";
+    let two_and_ai = network_spawn(2, 0, &format!("{ai}{}", watch_relay_section(0b11))).replacen(
+        "[Settings]\n",
+        "[Settings]\nAIPlayers=1\n",
+        1,
+    );
+    // One person against AI, which the relay orders alone (docs/spawn.md).
+    let one_and_ai = network_spawn(
+        1,
+        0,
+        &format!(
+            "{}{}",
+            ai.replace("Multi3", "Multi2"),
+            watch_relay_section(0b1)
+        ),
+    )
+    .replacen("[Settings]\n", "[Settings]\nAIPlayers=1\n", 1);
+    for (text, humans, ai) in [
+        (one_and_ai, 1, 1),
+        (two_and_ai.clone(), 2, 1),
+        (network_spawn(2, 0, &watch_relay_section(0b11)), 2, 0),
+    ] {
+        let network = parse_network(&text);
+        assert_eq!(network.session.local_player_index, 0);
+        assert_eq!(network.session.humans.len(), humans);
+        assert_eq!(network.session.opponents.len(), ai);
+        let SpawnTransport::Relay(relay) = network.transport else {
+            panic!("relay transport")
+        };
+        assert!(relay.watch);
+        assert_eq!(relay.token, "watch-secret");
+        assert_eq!(relay.resume, None);
+        assert_eq!(relay.grant.payload_key, [7; 32]);
+        assert!(relay.grant.federation.is_none());
+    }
+    // A player's file is no watcher's.
+    let SpawnTransport::Relay(player) =
+        parse_network(&network_spawn(2, 0, &relay_section(0, 0b11))).transport
+    else {
+        panic!("relay transport")
+    };
+    assert!(!player.watch);
+    // A watcher joins one relay as no returning player, of its own match,
+    // whose certificate names every human.
+    for broken in [
+        format!("{two_and_ai}Federation=AAAA\n"),
+        format!("{two_and_ai}ResumePings=0,0\nResumeCursor=4\n"),
+        two_and_ai.replacen("MatchId=11111111", "MatchId=33333333", 1),
+        network_spawn(2, 0, &watch_relay_section(0b111)),
+    ] {
+        assert!(SpawnRequest::parse(&broken).is_err(), "{broken}");
+    }
 }
 
 #[test]
@@ -818,43 +926,133 @@ fn single_player_spawn_keeps_its_offline_admission() {
     for append in [relay_section(0, 1), "[Other12]\nName=Remote\n".into()] {
         assert!(SpawnRequest::parse(&format!("{SKIRMISH}\n{append}")).is_err());
     }
-    // A network room's thirty waypoints bound a single-player start too.
+    // A start past the eight retail waypoints is admitted.
     let far = SKIRMISH.replacen("Multi2=0\n[Multi1", "Multi2=8\n[Multi1", 1);
     assert!(SpawnRequest::parse(&far).is_ok());
 }
 
-/// One human against `ai` AI houses in `mode`, as a lobby writes it without a relay.
-fn one_human(mode: i32, ai: usize) -> String {
+/// `[HouseHandicaps]`, `[HouseCountries]` and `[HouseColors]` of `ai` AI
+/// houses after `humans` human houses.
+fn ai_houses(humans: usize, ai: usize) -> String {
     let rows = |value: fn(usize) -> usize| -> String {
-        (2..=ai + 1)
+        (humans + 1..=humans + ai)
             .map(|house| format!("Multi{house}={}\n", value(house)))
             .collect()
     };
     format!(
-        "[Settings]\nName=Solo\nScenario=spawnmap.ini\nPlayerCount=1\nGameMode={mode}\n\
-         Side=0\nColor=0\nAIPlayers={ai}\nSpecialHouseIsAlly=No\n\
-         [HouseHandicaps]\n{}[HouseCountries]\n{}[HouseColors]\n{}",
+        "[HouseHandicaps]\n{}[HouseCountries]\n{}[HouseColors]\n{}",
         rows(|_| 1),
         rows(|house| house % 9),
         rows(|house| house % 8),
     )
 }
 
+/// One human against `ai` AI houses in `mode`, as a lobby writes it without a relay.
+fn one_human(mode: i32, ai: usize) -> String {
+    format!(
+        "[Settings]\nName=Solo\nScenario=spawnmap.ini\nPlayerCount=1\nGameMode={mode}\n\
+         Side=0\nColor=0\nAIPlayers={ai}\nSpecialHouseIsAlly=No\n{}",
+        ai_houses(1, ai)
+    )
+}
+
+/// Source 0's file of a relay game of `humans` humans and `ai` AI houses.
+fn relayed(humans: usize, ai: usize) -> String {
+    let relay = relay_section(0, (1 << humans) - 1);
+    let text = network_spawn(humans, 0, &relay).replacen(
+        "[Settings]\n",
+        &format!("[Settings]\nAIPlayers={ai}\n"),
+        1,
+    );
+    format!("{text}\n{}", ai_houses(humans, ai))
+}
+
 /// A lobby plays every one-human game without a relay, so one human takes what
-/// a network room admits: thirty houses, and modes Skirmish does not list.
+/// offline Skirmish seats: 120 houses, with starts and teams to match, and
+/// modes Skirmish does not list. A relay keeps the network room's thirty.
 #[test]
-fn one_human_spawn_admits_thirty_houses_and_unlisted_modes() {
-    let SpawnGame::Skirmish(full) = SpawnRequest::parse(&one_human(1, 29)).unwrap().game else {
+fn one_human_spawn_admits_offline_skirmish_houses_and_unlisted_modes() {
+    let last = SKIRMISH_MAX_SLOT_COUNT;
+    let text = format!(
+        "{}[SpawnLocations]\nMulti{last}=119\n[HouseTeams]\nMulti1=119\nMulti{last}=119\n",
+        one_human(1, last - 1)
+    );
+    let SpawnGame::Skirmish(full) = SpawnRequest::parse(&text).unwrap().game else {
         panic!("one human stays a skirmish")
     };
-    assert_eq!(full.opponents.len(), 29);
+    assert_eq!(full.opponents.len(), 119);
+    let far = full.opponents.last().unwrap();
+    assert_eq!(far.raw_slot_index, 119);
+    assert_eq!(far.start_position, LaunchStartPosition::Position(119));
+    assert_eq!(far.team, LaunchTeam::Team(119));
+    assert_eq!(full.local_slot().team, LaunchTeam::Team(119));
     assert!(full.house_roster_is_consistent());
-    assert!(SpawnRequest::parse(&one_human(1, 30)).is_err());
-    let SpawnGame::Skirmish(coop) = SpawnRequest::parse(&one_human(3, 2)).unwrap().game else {
+    assert!(SpawnRequest::parse(&one_human(1, last)).is_err());
+    for (humans, ai) in [(1, 29), (2, 28)] {
+        let request = SpawnRequest::parse(&relayed(humans, ai)).unwrap();
+        assert!(matches!(request.game, SpawnGame::Network(_)));
+    }
+    for (humans, ai) in [(1, 30), (2, 29)] {
+        assert!(
+            SpawnRequest::parse(&relayed(humans, ai)).is_err(),
+            "{humans} relay humans and {ai} AI"
+        );
+    }
+    let start = |waypoint: usize| format!("{}[SpawnLocations]\nMulti2={waypoint}\n", relayed(1, 1));
+    assert!(SpawnRequest::parse(&start(29)).is_ok());
+    assert!(SpawnRequest::parse(&start(30)).is_err());
+    let SpawnGame::Skirmish(coop) = SpawnRequest::parse(&one_human(3, 2))
+        .and_then(|request| request.admit_loaded_modes(&[]))
+        .unwrap()
+        .game
+    else {
         panic!("one human stays a skirmish")
     };
     assert_eq!(coop.mode.override_file, "MPCoopMD.ini");
     assert_eq!(coop.opponents.len(), 2);
+}
+
+/// Spawner.cpp's `MPGameModeClass::Get(GameMode)`, else `Get(1)`, over the
+/// roster the game loaded: a mod's own row starts offline, and an id the
+/// roster lacks takes row 1 or is refused when that is missing too.
+#[test]
+fn offline_game_mode_takes_the_loaded_rows_with_the_spawner_fallback() {
+    let modded = crate::skirmish_modes::parse_mpmodes_ini(&IniFile::from_str(
+        "[Battle]\n24=NOSTR:Brute Doomsday,STT:ModeBattle,bfBrute.ini,standard,true\n",
+    ));
+    let admitted = |mode: i32, modes: &[crate::skirmish_modes::SkirmishGameMode]| {
+        let mut request = SpawnRequest::parse(&one_human(mode, 1))?;
+        // `read` resolved the client map beside the launch file.
+        let SpawnGame::Skirmish(session) = &mut request.game else {
+            panic!("one human stays a skirmish")
+        };
+        session.selected_map_file = Some("/client/spawnmap.ini".into());
+        request
+            .admit_loaded_modes(modes)
+            .map(|request| match request.game {
+                SpawnGame::Skirmish(session) => {
+                    assert_eq!(
+                        session.selected_map_file.as_deref(),
+                        Some("/client/spawnmap.ini")
+                    );
+                    session.mode
+                }
+                _ => panic!("one human stays a skirmish"),
+            })
+    };
+    let brute = admitted(24, &modded).unwrap();
+    assert_eq!(
+        (brute.id, brute.override_file.as_str()),
+        (24, "bfBrute.ini")
+    );
+    assert!(admitted(1, &modded).is_err(), "no row 1 to fall back on");
+    let stock = crate::skirmish_modes::stock_skirmish_modes();
+    assert_eq!(
+        admitted(24, &stock).unwrap().override_file,
+        "MPBattleMD.ini"
+    );
+    // Network launches keep the stock rows.
+    assert!(SpawnRequest::parse(&in_mode(24, network_spawn(2, 0, ""))).is_err());
 }
 
 #[test]
@@ -890,6 +1088,23 @@ fn relay_gateway_is_an_optional_websocket_origin() {
         let named = text.replacen("[Relay]\n", &format!("[Relay]\nGatewayUrl={broken}\n"), 1);
         assert!(SpawnRequest::parse(&named).is_err(), "{broken}");
     }
+}
+
+#[test]
+fn ninety_tick_relay_launch_keeps_the_hosts_speed_and_starting_credits() {
+    let text = network_spawn(2, 1, &relay_section_at(1, 0b11, 90)).replacen(
+        "[Settings]\n",
+        "[Settings]\nGameSpeed=8\nCredits=100000\n",
+        1,
+    );
+    let request = SpawnRequest::parse(&text).unwrap();
+    assert_eq!(request.game_speed, 8);
+    let network = parse_network(&text);
+    assert_eq!(network.session.options.game_speed, 8);
+    assert_eq!(network.session.options.starting_credits, 100000);
+    assert!(SpawnRequest::parse(&text.replace("GameSpeed=8", "GameSpeed=1")).is_err());
+    assert!(SpawnRequest::parse(&text.replace("GameSpeed=8", "GameSpeed=7")).is_err());
+    assert!(SpawnRequest::parse(&SKIRMISH.replace("GameSpeed=1", "GameSpeed=8")).is_ok());
 }
 
 #[test]
@@ -937,14 +1152,20 @@ fn network_spectators_watch_without_ai_start_or_team() {
             .collect::<Vec<_>>(),
         observers
     );
-    for broken in [
-        network_spawn(
+    // A spectator may watch AI play beside the players.
+    let with_ai = parse_network(
+        &network_spawn(
             3,
             0,
             "[IsSpectator]\nMulti3=Yes\n[HouseHandicaps]\nMulti4=1\n\
              [HouseCountries]\nMulti4=3\n[HouseColors]\nMulti4=6\n",
         )
         .replacen("[Settings]\n", "[Settings]\nAIPlayers=1\n", 1),
+    )
+    .session;
+    assert!(with_ai.humans[2].is_observer());
+    assert_eq!(with_ai.opponents.len(), 1);
+    for broken in [
         network_spawn(2, 0, "[IsSpectator]\nMulti2=Yes\n"),
         network_spawn(
             3,

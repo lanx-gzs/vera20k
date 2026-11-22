@@ -121,6 +121,7 @@ fn retail_crush_releases_captives_before_destroyed_tag_changes_house() {
             .entities
             .get(captive)
             .unwrap()
+            .seldom
             .mind_control
             .controller()
             == Some(controller)
@@ -130,7 +131,7 @@ fn retail_crush_releases_captives_before_destroyed_tag_changes_house() {
     }
     let captured = sim.substrate.entities.get(captive).unwrap();
     assert_eq!(
-        captured.mind_control.controller(),
+        captured.seldom.mind_control.controller(),
         Some(controller),
         "ordinary weapon captures; controller={:?}, captive={:?}",
         sim.substrate.entities.get(controller).map(|entity| (
@@ -247,7 +248,7 @@ fn retail_crush_releases_captives_before_destroyed_tag_changes_house() {
                 "the controlled animation was released"
             );
             let released = sim.substrate.entities.get(captive).unwrap();
-            assert_eq!(released.mind_control.controller(), None);
+            assert_eq!(released.seldom.mind_control.controller(), None);
             assert_eq!(
                 released.owner(),
                 controller_owner,
@@ -313,7 +314,7 @@ fn a_battle_fortress_crushing_a_tank_plays_its_death_explosion() {
         PerCellReason::Arrival,
         &rules,
         None,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     )
     .unwrap();
     assert!(
@@ -346,4 +347,55 @@ fn a_battle_fortress_crushing_a_tank_plays_its_death_explosion() {
         .rocking
         .unwrap();
     assert_eq!(rocking.native_bits()[3], 0xbd4c_cccd);
+}
+
+/// Ares UnitClass_CrushCell_CrushDamage (hook 0x7418AA): crushing a type
+/// with `CrushDamage=` damages the crusher with its `CrushDamage.Warhead`;
+/// an explicit `none` warhead deals nothing.
+#[test]
+fn ares_crush_damage_hurts_the_crusher() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let crush = |warhead: &str| {
+        let rules = crate::rules::ruleset::RuleSet::from_ini(
+            &crate::rules::ini_parser::IniFile::from_str(&format!(
+                "[VehicleTypes]\n0=TANK\n[InfantryTypes]\n0=SPIKE\n[Warheads]\n0=SPIKEWH\n\
+                 [TANK]\nStrength=300\nArmor=heavy\nCrusher=yes\nSpeed=4\n\
+                 [SPIKE]\nStrength=50\nArmor=none\nCrushable=yes\nCrushDamage=40\n\
+                 CrushDamage.Warhead={warhead}\n\
+                 [SPIKEWH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n"
+            )),
+        )
+        .unwrap();
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x7418AA);
+        let tank = sim
+            .spawn_object("TANK", "Russians", 10, 10, 0, &rules)
+            .unwrap();
+        let spike = sim
+            .spawn_object("SPIKE", "Americans", 12, 10, 0, &rules)
+            .unwrap();
+        let mut position = sim.substrate.entities.get(tank).unwrap().position;
+        let centre = position_world_coord(&position);
+        position.put_world_xy([centre.x + 16, centre.y]);
+        sim.substrate.entities.get_mut(spike).unwrap().position = position;
+        sim.substrate.occupancy = OccupancyGrid::rebuild(&sim.substrate.entities);
+        sim.per_cell_process(
+            tank,
+            PerCellReason::Arrival,
+            &rules,
+            None,
+            &mut FrameEffects::default(),
+        )
+        .unwrap();
+        let crushed = sim
+            .substrate
+            .entities
+            .get(spike)
+            .is_none_or(|spike| !spike.lifecycle.object_alive());
+        (
+            crushed,
+            sim.substrate.entities.get(tank).unwrap().health.current(),
+        )
+    };
+    assert_eq!(crush("SPIKEWH"), (true, 260));
+    assert_eq!(crush("none"), (true, 300));
 }

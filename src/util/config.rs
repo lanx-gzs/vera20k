@@ -9,6 +9,17 @@
 //! ## Dependency rules
 //! - config.rs is part of util/ â€” no dependencies on game modules.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -68,6 +79,10 @@ pub struct PathsConfig {
     settings_dir: PathBuf,
     /// Previous profile location, read only during the first VERA.INI import.
     legacy_settings_dir: PathBuf,
+    /// VERA: the folder in [`PathsConfig::mods_dir`] of the mod to play with,
+    /// from `[paths] mod`. The text as written: `app::mods` decides whether
+    /// it names a usable folder, so a wrong name never stops the config load.
+    mod_name: Option<String>,
 }
 
 impl PathsConfig {
@@ -87,6 +102,22 @@ impl PathsConfig {
         self.settings_dir.join("Maps")
     }
 
+    /// VERA's folder of mods, one subfolder each (docs/modding.md).
+    pub fn mods_dir(&self) -> PathBuf {
+        // The browser build keeps mods apart from the saved profile: its page
+        // imports the one a launch plays (web.rs `import_mod_file`) and
+        // never stores it back.
+        if cfg!(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")) {
+            return PathBuf::from(WEB_MODS_DIR);
+        }
+        self.settings_dir.join("Mods")
+    }
+
+    /// The mod folder's name this launch asks for; `None` is the original game.
+    pub fn mod_name(&self) -> Option<&str> {
+        self.mod_name.as_deref().filter(|name| !name.is_empty())
+    }
+
     /// VERA's own pictures of maps for the setup screens' previews, by each
     /// map's SHA-256 (`app::map_picture`).
     pub fn map_pictures_dir(&self) -> PathBuf {
@@ -104,6 +135,9 @@ impl PathsConfig {
         Ok(())
     }
 }
+
+/// The browser build's Mods folder in its in-memory file system.
+pub const WEB_MODS_DIR: &str = "/mods";
 
 /// Shared by packaged and direct launches. No writable setting defaults to
 /// the retail installation, even when VERA's executable is installed there.
@@ -174,9 +208,8 @@ fn resolved_directory(path: &Path) -> PathBuf {
 ///
 /// Every field has a sensible default so `[graphics]` can be omitted entirely.
 /// Full screen, zoom and the original 4:3 shape are player choices on the
-/// Options page, saved in VERA.INI, not here. The window always presents in
-/// step with the display (`render/gpu.rs`), so an old config's `vsync` line
-/// is ignored.
+/// Options page, saved in VERA.INI, not here. So is VSync
+/// (`[VERA] VSync=`), so an old config's `vsync` line is ignored.
 #[derive(Debug)]
 pub struct GraphicsConfig {
     /// Enable cosmetic per-frame effects: water/ore sparkles. Also intended to
@@ -187,6 +220,10 @@ pub struct GraphicsConfig {
     /// VERA presentation option: show terrain through translucent fog while
     /// concealing unseen enemy objects. Off by default for the retail look.
     pub translucent_fog: bool,
+    /// VERA presentation option: draw buildings on terrain level 15 and up at
+    /// their tile row (`locomotor_visual::building_terrain_correction`). Off
+    /// by default: the original game draws them 1-2 px lower.
+    pub high_terrain_building_lift: bool,
 }
 
 impl Default for GraphicsConfig {
@@ -194,6 +231,7 @@ impl Default for GraphicsConfig {
         Self {
             extra_animations: true,
             translucent_fog: false,
+            high_terrain_building_lift: false,
         }
     }
 }
@@ -353,6 +391,7 @@ impl GameConfig {
     fn parse(contents: &str) -> Result<Self> {
         let mut ra2_dir = None;
         let mut settings_dir = None;
+        let mut mod_name = None;
         let mut graphics = GraphicsConfig::default();
         let mut gameplay = GameplayConfig::default();
         let mut profile = ProfileConfig::default();
@@ -387,11 +426,15 @@ impl GameConfig {
                 ("paths", "settings_dir") => {
                     parse_string(value).map(|path| settings_dir = Some(PathBuf::from(path)))
                 }
+                ("paths", "mod") => parse_string(value).map(|name| mod_name = Some(name)),
                 ("graphics", "extra_animations") => {
                     parse_bool(value).map(|on| graphics.extra_animations = on)
                 }
                 ("graphics", "translucent_fog") => {
                     parse_bool(value).map(|on| graphics.translucent_fog = on)
+                }
+                ("graphics", "high_terrain_building_lift") => {
+                    parse_bool(value).map(|on| graphics.high_terrain_building_lift = on)
                 }
                 ("gameplay", "input_delay_ticks") => {
                     parse_u32(value).map(|ticks| gameplay.input_delay_ticks = ticks)
@@ -409,6 +452,17 @@ impl GameConfig {
                 ("ini", "ai") => parse_string(value).map(|name| ini.ai = Some(name)),
                 ("ini", "sound") => parse_string(value).map(|name| ini.sound = Some(name)),
                 ("ini", "eva") => parse_string(value).map(|name| ini.eva = Some(name)),
+                ("ini", "theater_suffix") => {
+                    parse_string(value).map(|suffix| ini.theater_suffix = Some(suffix))
+                }
+                ("ini", "theme") => parse_string(value).map(|name| ini.theme = Some(name)),
+                ("ini", "battle") => parse_string(value).map(|name| ini.battle = Some(name)),
+                ("ini", "mission") => parse_string(value).map(|name| ini.mission = Some(name)),
+                ("ini", "mapsel") => parse_string(value).map(|name| ini.mapsel = Some(name)),
+                ("ini", "modes") => parse_string(value).map(|name| ini.modes = Some(name)),
+                ("ini", "map_catalog") => {
+                    parse_string(value).map(|name| ini.map_catalog = Some(name))
+                }
                 _ => Ok(()),
             };
             read.with_context(|| format!("line {line_number}: [{section}] {key}"))?;
@@ -421,6 +475,7 @@ impl GameConfig {
                 legacy_settings_dir: settings_dir.clone().unwrap_or_else(|| ra2_dir.clone()),
                 ra2_dir,
                 settings_dir: settings_dir.map_or_else(default_settings_dir, Ok)?,
+                mod_name,
             },
             graphics,
             gameplay,
@@ -435,6 +490,7 @@ impl GameConfig {
                 legacy_settings_dir: ra2_dir.clone(),
                 ra2_dir,
                 settings_dir: default_settings_dir()?,
+                mod_name: None,
             },
             graphics: GraphicsConfig::default(),
             gameplay: GameplayConfig::default(),
@@ -650,7 +706,7 @@ fn retail_asset_root_from_executable(executable: &Path) -> Result<PathBuf> {
         })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 
@@ -661,13 +717,8 @@ mod tests {
             GameConfig::parse(base).unwrap().ini.profile,
             crate::util::ini_roots::IniProfile::Yr
         );
-        for (name, expected) in [
-            ("mo", crate::util::ini_roots::IniProfile::Mo),
-            ("auto", crate::util::ini_roots::IniProfile::Auto),
-        ] {
-            let config = GameConfig::parse(&format!("{base}[ini]\nprofile='{name}'\n")).unwrap();
-            assert_eq!(config.ini.profile, expected);
-        }
+        let auto = GameConfig::parse(&format!("{base}[ini]\nprofile='auto'\n")).unwrap();
+        assert_eq!(auto.ini.profile, crate::util::ini_roots::IniProfile::Auto);
         let custom = GameConfig::parse(&format!(
             "{base}[ini]\nprofile='custom'\nrules='r.ini'\nart='a.ini'\nai='i.ini'\n"
         ))
@@ -677,12 +728,6 @@ mod tests {
         assert_eq!(
             (custom_roots.sound(), custom_roots.eva()),
             ("soundmd.ini", "evamd.ini")
-        );
-        let mo = GameConfig::parse(&format!("{base}[ini]\nprofile='mo'\n")).unwrap();
-        let mo_roots = mo.ini.resolve(|_| true).unwrap();
-        assert_eq!(
-            (mo_roots.sound(), mo_roots.eva()),
-            ("soundmo.ini", "evamo.ini")
         );
         // Optional presentation roots for any profile; they keep the shared
         // names when omitted.
@@ -695,20 +740,46 @@ mod tests {
             (audio_roots.sound(), audio_roots.eva()),
             ("my-sound.ini", "my-eva.ini")
         );
+        let theater = GameConfig::parse(&format!("{base}[ini]\ntheater_suffix='x2'\n")).unwrap();
+        let theater_roots = theater.ini.resolve(|_| true).unwrap();
+        assert_eq!(theater_roots.theater_ini("snow"), "snowx2.ini");
         for bad in [
             "profile='other'",
             "profile='custom'\nrules='r.ini'",
-            "profile='mo'\nai='aimd.ini'",
-            "profile=mo",
+            "profile='yr'\nai='aimd.ini'",
+            "profile=yr",
             "profile='custom'\nrules='../r.ini'\nart='a.ini'\nai='i.ini'",
             "sound='../my-sound.ini'",
             "eva='a.map'",
+            "theater_suffix='../custom'",
         ] {
             assert!(
                 GameConfig::parse(&format!("{base}[ini]\n{bad}\n")).is_err(),
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn ini_roots_config_passes_generic_catalogs_to_the_root_owner() {
+        let config = GameConfig::parse(
+            "[paths]\nra2_dir='retail'\n[ini]\n\
+             theme='music.ini'\nbattle='campaigns.ini'\nmission='missions.ini'\n\
+             mapsel='stages.ini'\nmodes='modes.ini'\nmap_catalog='maps.pkt'\n",
+        )
+        .unwrap();
+        let roots = config.ini.resolve(|_| panic!("YR must not probe")).unwrap();
+        assert_eq!(
+            [
+                roots.theme(),
+                roots.battle(),
+                roots.mission(),
+                roots.mapsel()
+            ],
+            ["music.ini", "campaigns.ini", "missions.ini", "stages.ini"]
+        );
+        assert_eq!(roots.modes(), "modes.ini");
+        assert_eq!(roots.map_catalog(), "maps.pkt");
     }
 
     struct ConfigFixture(PathBuf);
@@ -916,6 +987,7 @@ extra_animations = false
         let config = GameConfig::parse(toml_str).expect("old configs keep loading");
         assert!(!config.graphics.extra_animations);
         assert!(!config.graphics.translucent_fog);
+        assert!(!config.graphics.high_terrain_building_lift);
     }
 
     #[test]
@@ -924,6 +996,28 @@ extra_animations = false
             GameConfig::parse("[paths]\nra2_dir = 'retail'\n[graphics]\ntranslucent_fog = true\n")
                 .unwrap();
         assert!(config.graphics.translucent_fog);
+    }
+
+    #[test]
+    fn high_terrain_building_lift_is_an_explicit_graphics_option() {
+        let config = GameConfig::parse(
+            "[paths]\nra2_dir = 'retail'\n[graphics]\nhigh_terrain_building_lift = true\n",
+        )
+        .unwrap();
+        assert!(config.graphics.high_terrain_building_lift);
+    }
+
+    #[test]
+    fn the_mod_is_the_paths_key_and_blank_or_absent_is_the_original_game() {
+        let named = |line: &str| {
+            let text = format!("[paths]\nra2_dir = 'retail'\nsettings_dir = 'vera'\n{line}");
+            GameConfig::parse(&text).unwrap().paths
+        };
+        let paths = named("mod = \"Winter War\"\n");
+        assert_eq!(paths.mod_name(), Some("Winter War"));
+        assert_eq!(paths.mods_dir(), Path::new("vera").join("Mods"));
+        assert_eq!(named("mod = ''\n").mod_name(), None);
+        assert_eq!(named("").mod_name(), None);
     }
 
     #[test]

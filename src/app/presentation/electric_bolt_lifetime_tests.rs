@@ -42,6 +42,7 @@ fn lifetime_bolt() -> (ElectricBoltBirth, SurfaceLineViewport, ElectricBoltPalet
         z_adjust: int(&source["z_adjust"]),
         phase: int(&source["phase"]),
         alternate_color: source["alternate"].as_bool().unwrap(),
+        colors: [None; 3],
         owner: None,
     };
     let mut camera = point(&row["input"]["camera"]);
@@ -178,6 +179,7 @@ fn native_tactical_visits_own_lifetime_reverse_order_and_clear() {
                 z_adjust: int(&birth["z_adjust"]),
                 phase: int(&birth["phase"]),
                 alternate_color: birth["alternate"].as_bool().unwrap(),
+                colors: [None; 3],
                 owner: None,
             });
             // These explicit native manager fixtures include retained zero
@@ -309,6 +311,9 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
         ));
         let cursor = sim.native_identity_cursor().unwrap();
         let before = sim.rng_state();
+        // Composites draw the app's process Main cell, not the simulation's.
+        let process_main = crate::sim::rng::MainRng::new(1);
+        let process_before = process_main.logical_state();
         let mut bolts = ElectricBolts::default();
         bolts.create(ElectricBoltBirth {
             frame: sim.session().binary_frame() as i32,
@@ -317,6 +322,7 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
             z_adjust: int(&birth["z_adjust"]),
             phase: int(&birth["phase"]),
             alternate_color: birth["alternate"].as_bool().unwrap(),
+            colors: [None; 3],
             owner: None,
         });
         for visit in row["visits"]
@@ -326,12 +332,8 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
             .take(composite_count)
         {
             assert!(!visit["segments"].as_array().unwrap().is_empty());
-            let lines = bolts.composite(
-                viewport,
-                Some(palette),
-                &mut sim.presentation_main_draws(),
-                |_| true,
-            );
+            let lines =
+                bolts.composite(viewport, Some(palette), &mut process_main.draws(), |_| true);
             assert!(!lines.is_empty(), "accepted composite must consume Main");
             let native_delta = (int(&visit["native_id_after"]) as u32)
                 .wrapping_sub(int(&visit["native_id_before"]) as u32);
@@ -351,7 +353,11 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
         );
         assert_eq!(after.mapgen, before.mapgen, "{composite_count} composites");
         assert_eq!(sim.native_identity_cursor(), Some(cursor));
-        assert_eq!(after.main == before.main, composite_count == 0);
+        assert_eq!(after.main, before.main, "{composite_count} composites");
+        assert_eq!(
+            process_main.logical_state() == process_before,
+            composite_count == 0
+        );
 
         // Actual FireAt6FE55D -> CreateBullet46B050 -> Abstract410230 owns
         // this preincrement. This is a real retail shell, not an ID probe.
@@ -364,16 +370,23 @@ fn accepted_bolt_composites_preserve_the_next_actual_bullet_identity() {
             },
             rules,
             None,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         assert_eq!(sim.projectiles().len(), 1, "retail MTNK emitted its shell");
         let (_, bullet) = sim.projectiles().iter().next().unwrap();
         assert_eq!(bullet.source_id(), source);
         assert_eq!(bullet.native_unique_id(), cursor.wrapping_add(1) as i32);
-        outcomes.push((after.main, bullet.native_unique_id(), bullet.id()));
+        outcomes.push((
+            process_main.logical_state(),
+            bullet.native_unique_id(),
+            bullet.id(),
+        ));
     }
     for outcome in &outcomes[1..] {
-        assert_ne!(outcome.0, outcomes[0].0, "composites advanced shared Main");
+        assert_ne!(
+            outcome.0, outcomes[0].0,
+            "composites advanced the app's Main"
+        );
         assert_eq!((outcome.1, outcome.2), (outcomes[0].1, outcomes[0].2));
     }
     assert_ne!(outcomes[1].0, outcomes[2].0);
@@ -398,6 +411,7 @@ fn a_unit_owns_one_bolt_whose_source_follows_it() {
         z_adjust: 0,
         phase: 0,
         alternate_color: false,
+        colors: [None; 3],
         owner: Some(owner),
     };
     let mut bolts = ElectricBolts::default();

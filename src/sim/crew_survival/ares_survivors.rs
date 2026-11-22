@@ -27,7 +27,7 @@ impl Simulation {
         mut point: DriveCoord,
         radius: i32,
         selected: bool,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> bool {
         let direction = self.scenario_rng.next_range_u32_inclusive(0, 7) as usize;
         let (dx, dy) = crate::util::direction::DIRECTION_DELTAS[direction];
@@ -70,7 +70,7 @@ impl Simulation {
         mut point: DriveCoord,
         spot: u8,
         selected: bool,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> bool {
         let Some(terrain) = self.resolved_terrain.as_ref() else {
             return false;
@@ -94,14 +94,14 @@ impl Simulation {
             return false;
         };
         entity.on_bridge.store(on_bridge);
-        let prior_carrier = entity.passenger_role.carrier_link();
+        let prior_carrier = entity.passenger_role().carrier_link();
         let infantry = entity.category() == EntityCategory::Infantry;
         let airborne = point.z.wrapping_sub(floor) > 0xd0;
         let placed = if airborne {
-            let context = UninitContext::new(rules, registry).with_effects(effects);
+            let context = UninitContext::new(rules).with_effects(effects);
             self.techno_limbo_with_context(id, context);
             crate::sim::aircraft::drop_payload::spawn_parachuted(
-                self, rules, registry, id, point, spot, effects,
+                self, rules, id, point, spot, effects,
             )
             .is_ok()
         } else {
@@ -111,7 +111,7 @@ impl Simulation {
             // before class Unlimbo and restore it on refusal. Native clears+11C
             // immediately after success100447E7, before any callbacks below.
             if let Some(entity) = self.substrate.entities.get_mut(id) {
-                entity.passenger_role.clear_carrier_relation();
+                entity.passenger_role_mut().clear_carrier_relation();
             }
             let (sub_x, sub_y) = (
                 SimFixed::from_num(point.x & 255),
@@ -136,19 +136,19 @@ impl Simulation {
                     on_bridge,
                 }
             };
-            self.unlimbo_crew(rules, id, unlimbo, Some(facing), registry, effects)
+            self.unlimbo_crew(rules, id, unlimbo, Some(facing), effects)
         };
         if !placed {
             if let Some(link) = prior_carrier
                 && let Some(entity) = self.substrate.entities.get_mut(id)
             {
-                entity.passenger_role.set_carrier_link(link);
+                entity.passenger_role_mut().set_carrier_link(link);
             }
             return false;
         }
         if let Some(entity) = self.substrate.entities.get_mut(id) {
-            entity.passenger_role.clear_carrier_relation();
-            entity.passenger_role.clear_transporter();
+            entity.passenger_role_mut().clear_carrier_relation();
+            entity.passenger_role_mut().clear_transporter();
         }
         Self::foot_neighbors_store_retained_cell(&mut self.substrate, id, retained);
         if airborne {
@@ -191,14 +191,10 @@ impl Simulation {
             }
         }
         if let Some(entity) = self.substrate.entities.get_mut(id) {
-            entity.building_entry.clear_occupy_seeks();
+            entity.seldom.building_entry.clear_occupy_seeks();
         }
         if selected {
-            self.techno_select(
-                id,
-                true,
-                UninitContext::new(rules, registry).with_effects(effects),
-            );
+            self.techno_select(id, UninitContext::new(rules).with_effects(effects));
         }
         true
     }
@@ -210,14 +206,13 @@ impl Simulation {
         id: u64,
         dying: DyingTransport,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         self.record_the_kill(
             id,
             KillSource::Techno(dying.attacker),
             KillCallback::Terminal,
-            UninitContext::new(rules, registry).with_effects(effects),
+            UninitContext::new(rules).with_effects(effects),
         );
         self.discard_constructed_limbo(id, rules, effects);
     }
@@ -230,7 +225,7 @@ impl Simulation {
         registry: Option<&OverlayTypeRegistry>,
         unit_id: u64,
         dying: DyingTransport,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(unit) = self.substrate.entities.get(unit_id) else {
             return;
@@ -251,15 +246,17 @@ impl Simulation {
             .entities
             .get_mut(unit_id)
             .is_some_and(|unit| {
-                unit.vehicle_driver
+                unit.seldom
+                    .ares
+                    .vehicle_driver
                     .begin_survivor_release(dying.ignore_defenses)
             });
         if release_crew {
             let mut count = crew_rules.pilot_count(i32::from(crewed));
             let captor = self.substrate.entities.get(unit_id).map(|unit| {
                 (
-                    unit.capture_infantry_type_index.get(),
-                    unit.vehicle_driver.captured(),
+                    unit.seldom.capture_infantry_type_index.get(),
+                    unit.seldom.ares.vehicle_driver.captured(),
                 )
             });
             if let Some((index, saved)) = captor.filter(|(index, _)| *index >= 0) {
@@ -268,6 +265,7 @@ impl Simulation {
                     .entities
                     .get_mut(unit_id)
                     .unwrap()
+                    .seldom
                     .capture_infantry_type_index
                     .record(-1);
                 if let Some(kind) =
@@ -305,7 +303,7 @@ impl Simulation {
                                 .substrate
                                 .entities
                                 .get(unit_id)
-                                .and_then(|unit| unit.mind_control.controller())
+                                .and_then(|unit| unit.seldom.mind_control.controller())
                             {
                                 self.with_object_placement_scope(|sim| {
                                     sim.free_unit(controller, unit_id, rules, registry, effects);
@@ -314,9 +312,9 @@ impl Simulation {
                                 self.substrate
                                     .queue_crew_mission(id, super::MissionType::Guard);
                             }
-                            if let Some(sound_id) = kind.leave_transport_sound.clone() {
+                            if let Some(sound_id) = kind.leave_transport_sound.as_deref() {
                                 self.sound_events.emit(SimSoundEvent::VocAtCoord {
-                                    sound_id,
+                                    sound_id: rules.sound_name(sound_id),
                                     coordinate: origin,
                                     flags: 0,
                                 });
@@ -329,7 +327,7 @@ impl Simulation {
                                 count.wrapping_sub(killed)
                             };
                         } else {
-                            self.discard_ares_pilot(id, dying, rules, registry, effects);
+                            self.discard_ares_pilot(id, dying, rules, effects);
                         }
                     }
                 }
@@ -401,7 +399,7 @@ impl Simulation {
                         ) {
                             self.trigger_runtime.transfer_object_tag(unit_id, id);
                         } else {
-                            self.discard_ares_pilot(id, dying, rules, registry, effects);
+                            self.discard_ares_pilot(id, dying, rules, effects);
                         }
                     }
                 }
@@ -422,21 +420,26 @@ impl Simulation {
             .substrate
             .entities
             .get(unit_id)
-            .is_some_and(|unit| unit.passenger_role.passenger_count() != 0)
+            .is_some_and(|unit| unit.passenger_role().passenger_count() != 0)
         {
             let result = depart_cargo_head(
                 self,
                 rules,
-                registry,
                 unit_id,
                 DepartureRoute::DeathEscape,
-                |sim, id| {
+                |sim, id, effects| {
                     let admitted = !dying.ignore_defenses
                         && if chance > 0 {
                             sim.scenario_rng.next_range_u32_inclusive(1, 100) as i32 <= chance
                         } else if chance < 0 && unit_fallback {
-                            cell.is_some_and(|cell| matches!(sim.foot_can_enter(id, cell,
-                            crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR, rules, registry), Ok(0 | 2)))
+                            cell.is_some_and(|cell| {
+                                matches!(sim.foot_can_enter(
+                            id,
+                            cell,
+                            crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
+                            rules,
+                        ), Ok(0 | 2))
+                            })
                         } else {
                             false
                         };
@@ -454,7 +457,7 @@ impl Simulation {
                         sim.record_kill_and_uninit(
                             id,
                             dying.attacker,
-                            UninitContext::new(rules, registry).with_effects(effects),
+                            UninitContext::new(rules).with_effects(effects),
                         );
                     }
                     Ok(())

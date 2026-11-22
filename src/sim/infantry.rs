@@ -300,12 +300,28 @@ impl crate::sim::world::Simulation {
         id: u64,
         rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<bool, String> {
         let Some(actor) = self.substrate.entities.get(id) else {
             return Ok(false);
         };
         if actor.category() != crate::map::entities::EntityCategory::Infantry {
+            return Ok(false);
+        }
+        let ares = rules.ares_form();
+        // Ares InfantryClass_UpdatePanic1004CC80 (hook5200B3): a
+        // Deactivated infantryman only counts its fear down, even Fearless,
+        // and takes none of the stance, refill or Scatter work.
+        if ares && actor.deactivated.is_offline() {
+            if let Some(infantry) = self
+                .substrate
+                .entities
+                .get_mut(id)
+                .and_then(|actor| actor.infantry.as_mut())
+                && infantry.fear_level > 0
+            {
+                infantry.fear_level -= 1;
+            }
             return Ok(false);
         }
         let infantry = actor
@@ -333,30 +349,30 @@ impl crate::sim::world::Simulation {
             // armed actor. Copy the current type's signed Ammo; no reload
             // timer, RNG draw or detach belongs to this arm. Installed Ares
             // InfantryClass_UpdatePanic_DontReload (5200D7) resumes at 52010B.
-            #[cfg(not(feature = "ares"))]
-            let refill = self.substrate.entities.get(id).and_then(|actor| {
-                if actor.infantry.as_ref()?.fear_level != 0 || actor.ammo()?.current() != 0 {
-                    return None;
+            if !ares {
+                let refill = self.substrate.entities.get(id).and_then(|actor| {
+                    if actor.infantry.as_ref()?.fear_level != 0 || actor.ammo()?.current() != 0 {
+                        return None;
+                    }
+                    let object = self.object_type(actor.type_ref(), rules)?;
+                    crate::sim::combat::combat_weapon::is_armed(
+                        actor,
+                        object,
+                        &self.substrate.entities,
+                        rules,
+                        &self.interner,
+                    )
+                    .then_some(object.ammo)
+                });
+                if let Some(type_ammo) = refill {
+                    self.substrate
+                        .entities
+                        .get_mut(id)
+                        .expect("retained fear receiver")
+                        .ammo_mut()
+                        .expect("empty Techno ammo was read above")
+                        .refill_empty_from_type(type_ammo);
                 }
-                let object = self.object_type(actor.type_ref(), rules)?;
-                crate::sim::combat::combat_weapon::is_armed(
-                    actor,
-                    object,
-                    &self.substrate.entities,
-                    rules,
-                    &self.interner,
-                )
-                .then_some(object.ammo)
-            });
-            #[cfg(not(feature = "ares"))]
-            if let Some(type_ammo) = refill {
-                self.substrate
-                    .entities
-                    .get_mut(id)
-                    .expect("retained fear receiver")
-                    .ammo_mut()
-                    .expect("empty Techno ammo was read above")
-                    .refill_empty_from_type(type_ammo);
             }
             let actor = self
                 .substrate
@@ -383,14 +399,31 @@ impl crate::sim::world::Simulation {
                         .houses
                         .get(&actor.owner())
                         .ok_or("Infantry fear requires its native House")?
-                        .is_controlled_by_human(self.session.game_mode_nonzero());
+                        .is_controlled_by_human(self.session.rule_policy());
                     //52018E..1BA: only a human owner tests these separate
                     // inputs. A movement order is not IsMoving+10.
                     let under_way = human
                         && (actor.navigation.nav_com().is_some()
                             || crate::sim::movement::motion_query::is_moving(actor)
                                 .ok_or("Infantry fear requires active IsMoving state")?);
-                    if !under_way && !fraidycat {
+                    // Ares 3.0 InfantryClass_UpdatePanic_ProneWater 100256F0
+                    // (hook 0x005201CC): no prone Down on a Beach or Water
+                    // cell (GetCell's LandType); the tail at 0x005201DC runs.
+                    let wet = if ares {
+                        use crate::rules::terrain_rules::LandType;
+                        self.resolved_terrain
+                            .as_ref()
+                            .and_then(|terrain| {
+                                terrain.cell(actor.position.rx(), actor.position.ry())
+                            })
+                            .is_some_and(|cell| {
+                                cell.land_type == LandType::Beach.as_index()
+                                    || cell.land_type == LandType::Water.as_index()
+                            })
+                    } else {
+                        false
+                    };
+                    if !under_way && !fraidycat && !wet {
                         //5201CE..1D6: Crawls and accepted/refused prone/clock
                         // writes belong solely to Infantry51D6F0.
                         let _accepted = self.infantry_do_action(id, 5, false, rules, effects)?;
@@ -535,6 +568,7 @@ enum IdleTurn {
 
 /// Single Infantry51CDB0 decision body. The world receiver applies its class
 /// action immediately, before a mission caller can spend its cadence draw.
+/// `ares` is the game's `RuleSet::ares_form`.
 fn select_idle_action(
     entity: &mut GameEntity,
     object: &ObjectType,
@@ -542,6 +576,7 @@ fn select_idle_action(
     frequency: f64,
     rng: &mut crate::sim::rng::SimRng,
     frame: u32,
+    ares: bool,
 ) -> Result<IdleTurn, String> {
     use crate::sim::movement::infantry_action::{DO_IDLE1, DO_IDLE2};
     if !idle_action_ready(entity, frame)? {
@@ -560,8 +595,20 @@ fn select_idle_action(
     if object.fraidycat && !controlled_by_human && infantry.fear_level > IDLE_PANIC_FEAR {
         return Ok(IdleTurn::NullSourceScatter);
     }
-    let biased_type = object.id.eq_ignore_ascii_case(IDLE_BIASED_TYPE);
     let mut roll = rng.next_range_u32_inclusive(0, IDLE_ROLL_MAX);
+    // Ares 3.0 InfantryClass_Idle (10049740, hook 0x51CE9A) tests `IsCow`
+    // in place of the ID, and under EMP takes no bias and leaves the roll
+    // register (EDI) holding the frame it loaded at 0x0051CE10.
+    let biased_type = if ares {
+        if entity.emp_remaining() > 0 {
+            roll = frame;
+            false
+        } else {
+            object.techno_combat().roles().is_cow()
+        }
+    } else {
+        object.id.eq_ignore_ascii_case(IDLE_BIASED_TYPE)
+    };
     if biased_type && rng.next_range_u32_inclusive(0, IDLE_ROLL_MAX) < IDLE_BIAS_THRESHOLD {
         roll = 8;
     }
@@ -591,7 +638,7 @@ impl crate::sim::world::Simulation {
         id: u64,
         rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<bool, String> {
         let Some(actor) = self.substrate.entities.get(id) else {
             return Ok(false);
@@ -616,6 +663,7 @@ impl crate::sim::world::Simulation {
             rules.general.idle_action_frequency,
             &mut self.scenario_rng,
             self.session.binary_frame(),
+            rules.ares_form(),
         )?;
         match turn {
             IdleTurn::Refused => return Ok(false),
@@ -654,12 +702,12 @@ impl crate::sim::world::Simulation {
         &mut self,
         id: u64,
         rules: &crate::rules::ruleset::RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(actor) = self.substrate.entities.get(id) else {
             return;
         };
-        if actor.selection.is_selected() || !self.house_is_human_player(actor.owner()) {
+        if actor.seldom.selection.is_selected() || !self.house_is_human_player(actor.owner()) {
             return;
         }
         let Some(comment) = self
@@ -672,7 +720,7 @@ impl crate::sim::world::Simulation {
             return;
         }
         let event = crate::sim::world::SimSoundEvent::voc_at_location(
-            comment.clone(),
+            rules.sound_name(comment),
             actor,
             self.resolved_terrain.as_ref(),
         );
@@ -701,7 +749,7 @@ pub(crate) fn tick_idle_actions(
         let Some(entity) = entities.get_mut(id) else {
             continue;
         };
-        if (entity.lifecycle.in_limbo() && !entity.passenger_role.in_open_transport())
+        if (entity.lifecycle.in_limbo() && !entity.passenger_role().in_open_transport())
             || !entity.is_active()
             || entity.ai_frozen()
         {
@@ -711,9 +759,9 @@ pub(crate) fn tick_idle_actions(
         let Some(obj) = rules.object(type_name) else {
             continue;
         };
-        let controlled_by_human = houses
-            .get(&entity.owner())
-            .is_some_and(|house| house.is_controlled_by_human(false));
+        let controlled_by_human = houses.get(&entity.owner()).is_some_and(|house| {
+            house.is_controlled_by_human(crate::rules::rule_policy::RulePolicy::stock_campaign())
+        });
         if let IdleTurn::Fidget(action) = select_idle_action(
             entity,
             obj,
@@ -721,6 +769,7 @@ pub(crate) fn tick_idle_actions(
             rules.general.idle_action_frequency,
             rng,
             frame,
+            rules.ares_form(),
         )
         .expect("native idle fixture requires represented Infantry state")
         {
@@ -760,11 +809,11 @@ pub fn apply_prone_speed(speed: SimFixed, crawls: bool, multiplier: Option<f64>)
     SimFixed::from_num(adjusted)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 #[path = "infantry_damage_fear_tests.rs"]
 mod damage_fear_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
@@ -945,7 +994,7 @@ mod tests {
             ),
         );
         sim.scenario_rng = SimRng::new(31);
-        sim.main_rng = SimRng::new(31).into();
+        sim.main_rng = SimRng::new(31);
         sim.mapgen_rng = SimRng::new(31);
         let owner = sim.interner.intern("FearOwner");
         let mut house = HouseState::new(
@@ -1069,8 +1118,13 @@ mod tests {
             .unwrap();
         let (mut sim, rules) = fear_fixture(row);
         assert!(
-            !sim.infantry_fear_turn(1, &rules, None, crate::sim::world::FrameEffects::default())
-                .unwrap()
+            !sim.infantry_fear_turn(
+                1,
+                &rules,
+                None,
+                &mut crate::sim::world::FrameEffects::default()
+            )
+            .unwrap()
         );
         assert_native_fear_state(&sim, row);
     }
@@ -1101,8 +1155,13 @@ mod tests {
                 );
             }
             let (changed, draws) = trace_draws(|| {
-                sim.infantry_fear_turn(1, &rules, None, crate::sim::world::FrameEffects::default())
-                    .unwrap()
+                sim.infantry_fear_turn(
+                    1,
+                    &rules,
+                    None,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap()
             });
             assert!(!changed);
             assert!(
@@ -1116,6 +1175,36 @@ mod tests {
         assert_eq!(compared, 42);
     }
 
+    /// Ares 100256F0 (hook 0x5201CC): the native `down_threshold51` control
+    /// goes prone on clear ground, but not standing on a Beach cell.
+    #[test]
+    fn ares_panicking_infantry_does_not_go_prone_on_a_beach() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::rules::terrain_rules::LandType;
+        let native = fear_corpus();
+        let row = native["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["input"]["name"] == "down_threshold51")
+            .unwrap();
+        for (land, prone) in [(LandType::Clear, true), (LandType::Beach, false)] {
+            let (mut sim, rules) = fear_fixture(row);
+            let mut terrain = crate::map::resolved_terrain::test_retail_clear_grid(4, 4);
+            terrain.cell_mut_for_test(0, 0).unwrap().land_type = land.as_index();
+            sim.install_resolved_terrain_for_new_map(terrain);
+            sim.infantry_fear_turn(
+                1,
+                &rules,
+                None,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
+            let infantry = sim.entities().get(1).unwrap().infantry.as_ref().unwrap();
+            assert_eq!(infantry.is_prone, prone, "{land:?}");
+        }
+    }
+
     #[test]
     fn native_fear_down_uses_actual_walk_motion_not_movement_order() {
         let native = fear_corpus();
@@ -1127,8 +1216,13 @@ mod tests {
             .unwrap();
         let (mut sim, rules) = fear_fixture(row);
         assert!(
-            !sim.infantry_fear_turn(1, &rules, None, crate::sim::world::FrameEffects::default())
-                .unwrap()
+            !sim.infantry_fear_turn(
+                1,
+                &rules,
+                None,
+                &mut crate::sim::world::FrameEffects::default()
+            )
+            .unwrap()
         );
         assert_native_fear_state(&sim, row);
     }
@@ -1209,7 +1303,7 @@ mod tests {
                     1,
                     &rules,
                     None,
-                    crate::sim::world::FrameEffects::default()
+                    &mut crate::sim::world::FrameEffects::default()
                 )
                 .unwrap()
             );
@@ -1257,12 +1351,8 @@ mod tests {
         assert_eq!(e.infantry.unwrap().fear_level, 0);
     }
 
-    fn idle_corpus() -> serde_json::Value {
-        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
-            "tools/spatial_oracle/anytown_damage/foot_missions.json",
-        ))
-        .unwrap();
-        native
+    fn idle_corpus() -> &'static serde_json::Value {
+        crate::test_fixture::json("tools/spatial_oracle/anytown_damage/foot_missions.json")
     }
 
     fn native_rng_state(rng: &crate::sim::rng::SimRng) -> serde_json::Value {
@@ -1324,7 +1414,7 @@ mod tests {
                     civilian,
                     &rules,
                     None,
-                    crate::sim::world::FrameEffects::default(),
+                    &mut crate::sim::world::FrameEffects::default(),
                 )
                 .unwrap()
             });
@@ -1394,9 +1484,9 @@ mod tests {
                 crate::sim::mission::MissionTimer::armed(frame, 0);
             sim.scenario_rng = SimRng::new(scenario_seed);
             sim.sound_events.clear_for_test();
-            let before = sim.main_rng.snapshot_for_test();
+            let before = sim.main_rng.clone();
             assert!(
-                sim.infantry_idle_action(man, &rules, None, Default::default())
+                sim.infantry_idle_action(man, &rules, None, &mut Default::default())
                     .unwrap()
             );
             let comments: Vec<String> = sim
@@ -1404,7 +1494,7 @@ mod tests {
                 .iter()
                 .filter_map(|event| match event {
                     crate::sim::world::SimSoundEvent::VocAt { sound_id, .. } => {
-                        Some(sound_id.clone())
+                        Some(sound_id.name_in(&rules).to_string())
                     }
                     _ => None,
                 })
@@ -1561,7 +1651,7 @@ mod tests {
                     1,
                     &rules,
                     None,
-                    crate::sim::world::FrameEffects::default(),
+                    &mut crate::sim::world::FrameEffects::default(),
                 )
                 .unwrap()
             });

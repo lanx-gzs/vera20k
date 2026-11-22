@@ -206,6 +206,47 @@ impl SearchFootEntry for SuppliedEntry {
 }
 
 #[test]
+fn missing_astar_endpoint_refuses_the_route_before_querying_neighbors() {
+    // Original AStar_main_loop 0x00429AE3/0x00429AEB: either null map slot
+    // returns no path. The Unit's Can_Enter_Cell never runs.
+    let terrain = crate::map::resolved_terrain::test_flat_ground_grid(32);
+    let grid = PathGrid::new(32, 32);
+    let entry = SuppliedEntry {
+        answer: Ok(0),
+        queries: Default::default(),
+    };
+    let options = AStarOptions {
+        resolved_terrain: Some(&terrain),
+        ..AStarOptions::new(&entry)
+    };
+    for (start, goal) in [((9, 32), (9, 31)), ((31, 9), (32, 9))] {
+        assert_eq!(
+            astar_search(&grid, start, MovementLayer::Ground, goal, &options),
+            Err(PathSearchFailure::CellSearchExhausted)
+        );
+    }
+    assert!(entry.queries.borrow().is_empty());
+}
+
+#[test]
+fn astar_searches_the_real_cells_of_aliased_endpoints() {
+    // Original 0x00429AA1 uses signed coordinates with a 512-cell stride.
+    // The native run (512,9) -> (513,9) returned start (0,10), then East.
+    let terrain = crate::map::resolved_terrain::test_flat_ground_grid(32);
+    let grid = PathGrid::new(32, 32);
+    let entry = WalkableEntry::new(&grid);
+    let options = AStarOptions {
+        resolved_terrain: Some(&terrain),
+        ..AStarOptions::new(&entry)
+    };
+    let path = astar_search(&grid, (512, 9), MovementLayer::Ground, (513, 9), &options).unwrap();
+    assert_eq!(
+        path.iter().map(|s| (s.rx, s.ry)).collect::<Vec<_>>(),
+        [(0, 10), (1, 10)]
+    );
+}
+
+#[test]
 fn canonical_entry_reaches_blocked_goal_before_static_grid_refusal() {
     // Production wiring check: the supplied class comes from concrete native
     // Infantry-entry controls. This two-cell Rust route is not a native route
@@ -536,8 +577,15 @@ fn accepted_descriptor_height_survives_selected_list_transition() {
 #[test]
 fn a_wall_class_from_the_live_entry_prices_the_crossing() {
     // Column x=3 is a wall line on a 7x17 board, open only at its foot.
-    struct WallLine(u8);
+    struct WallLine(u8, bool);
     impl SearchFootEntry for WallLine {
+        fn train_pose(&self) -> Option<TrainSearchPose> {
+            self.1.then_some(TrainSearchPose {
+                facing_octant: 2,
+                level: 0,
+            })
+        }
+
         fn classify(&self, query: SearchEntryQuery) -> Result<u8, String> {
             Ok(match query.candidate {
                 SearchEntryCandidate::CopiedCoord((3, y)) if y < 16 => self.0,
@@ -547,16 +595,13 @@ fn a_wall_class_from_the_live_entry_prices_the_crossing() {
     }
     let grid = PathGrid::new(7, 17);
     let crosses = |class: u8, mover_is_train: bool| {
-        let entry = WallLine(class);
+        let entry = WallLine(class, mover_is_train);
         let route = astar_search(
             &grid,
             (0, 0),
             MovementLayer::Ground,
             (6, 0),
-            &AStarOptions {
-                mover_is_train,
-                ..AStarOptions::new(&entry)
-            },
+            &AStarOptions::new(&entry),
         )
         .unwrap();
         assert_eq!(route.last().map(|step| (step.rx, step.ry)), Some((6, 0)));

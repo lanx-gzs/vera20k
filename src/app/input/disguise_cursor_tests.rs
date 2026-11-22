@@ -1,7 +1,6 @@
 use super::*;
 use crate::app::input::cursor::{capability_cursor_for_hover, cursor_id_for_feedback};
 use crate::app::input::entity_pick::{PickSource, PresentedWorld, hover_target_at_point};
-use crate::app::presentation::interpolation::RenderInterpolation;
 use crate::app::types::{CursorId, HoverTargetKind};
 use crate::rules::ini_parser::IniFile;
 use crate::rules::overlay_types::OverlayTypeRegistry;
@@ -29,6 +28,7 @@ fn scene(patch: &str) -> Option<(RuleSet, OverlayTypeRegistry, Simulation, u64, 
         sim.entities()
             .get(mirage)
             .unwrap()
+            .seldom
             .disguise
             .as_ref()
             .unwrap()
@@ -41,9 +41,9 @@ fn scene(patch: &str) -> Option<(RuleSet, OverlayTypeRegistry, Simulation, u64, 
         let owner = sim.interner().get(name).unwrap();
         sim.fog_mut_for_test().reveal_all_for_owner(owner);
     }
-    sim.entities_mut_for_test()
-        .get_mut(actor)
+    sim.entity_mut_for_test(actor)
         .unwrap()
+        .seldom
         .selection
         .set_selected_for_test(true);
     Some((rules, overlays, sim, actor, mirage))
@@ -83,11 +83,9 @@ fn cursor(
     actor: u64,
     target: u64,
 ) -> Option<CursorId> {
-    let interpolation = RenderInterpolation::new(false);
     let source = PresentedWorld {
         sim,
         rules: Some(rules),
-        interpolation: &interpolation,
         translucent_viewer: None,
     };
     let (x, y) = source.screen_position(sim.entities().get(target).unwrap());
@@ -104,6 +102,7 @@ fn cursor(
         OrderModifier::Normal,
         false,
         false,
+        &mut Default::default(),
     ))
 }
 
@@ -152,12 +151,13 @@ fn attack_cursor_disguise_rule_and_firing_blink_reach_click_admission() {
         },
         &rules,
         Some(&overlays),
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     );
     let timer = sim
         .entities()
         .get(mirage)
         .unwrap()
+        .seldom
         .disguise
         .as_ref()
         .unwrap()
@@ -203,9 +203,9 @@ fn attack_cursor_disguise_keeps_permanent_and_terrain_weapon_exceptions() {
     assert!(rules.object("MGTK").unwrap().perma_disguise);
     let kind = sim.entities().get(actor).unwrap().type_ref();
     let frame = sim.session().binary_frame();
-    sim.entities_mut_for_test()
-        .get_mut(mirage)
+    sim.entity_mut_for_test(mirage)
         .unwrap()
+        .seldom
         .disguise
         .as_mut()
         .unwrap()

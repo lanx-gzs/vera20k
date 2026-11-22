@@ -132,7 +132,7 @@ impl Simulation {
         id: u64,
         bypass_admission: bool,
         rules: &RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(actor) = self.substrate.entities.get(id) else {
             return;
@@ -161,7 +161,7 @@ impl Simulation {
         id: u64,
         variant: i32,
         rules: &RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         if !self
             .substrate
@@ -186,7 +186,7 @@ impl Simulation {
         requested: i32,
         force: bool,
         rules: &RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<bool, String> {
         let actor = self
             .substrate
@@ -238,7 +238,7 @@ impl Simulation {
         force: bool,
         facts: &DoActionType,
         rules: &RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<bool, String> {
         //51D701: -1 returns before the type record or water-state reads.
         if requested == -1 {
@@ -288,7 +288,7 @@ impl Simulation {
         //The original requested sequence was checked above; do not recheck
         //Carry's count after remapping. The slave owner retains the only cargo.
         let mut requested = if requested == DO_WALK
-            && actor.slave.owner().is_some()
+            && actor.seldom.slave.owner().is_some()
             && self.slave_is_full(id, rules)
         {
             DO_CARRY
@@ -337,7 +337,7 @@ impl Simulation {
                 // the app's audio gate and playback own audible output.
                 self.sound_events
                     .emit(crate::sim::world::SimSoundEvent::voc_at_location(
-                        sound_id.clone(),
+                        rules.sound_name(sound_id),
                         actor,
                         self.resolved_terrain.as_ref(),
                     ));
@@ -427,7 +427,8 @@ impl Simulation {
         // re-enters Stop_Driver, whose own Do_Action finds the action it
         // just wrote. The Can_Enter_Cell it runs reads no overlay here.
         if actor.health.current() == 0
-            && let Err(cause) = self.infantry_stop_driver(id, rules, None, effects)
+            && let Err(cause) =
+                self.infantry_stop_driver(id, rules, Some(rules.overlay_registry()), effects)
         {
             log::debug!("infantry {id} Do_Action Stop_Driver: {cause}");
         }
@@ -456,7 +457,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<DamageCommitReceipt, String> {
         let Some(actor) = self.substrate.entities.get(id) else {
             return Ok(DamageCommitReceipt::default());
@@ -496,6 +497,12 @@ impl Simulation {
         {
             self.team_script_vm.mark_member_team_leaving_map(id);
         }
+        // Not ported: 51BE59..51BEBE removes a teamless infantryman on Guard
+        // whose Location fails MapClass::CoordinatesLegal 568350 (vt+0x3A0,
+        // then UnInit, returning before the thief capture). UNREACHABLE: the
+        // test is the map Size diamond that every cell lies in, as for the
+        // Unit's Guard map exit (movement/per_cell.rs), and an infantryman
+        // running AI always stands or flies over a map cell.
         // InfantryClass::AI51BEC0 calls TryThiefVehicleCapture5202F0 before
         // the second Ready/Commence. Success returns before Fear/Fire/Doing.
         let capture = self.infantry_try_thief_capture(id, rules, registry, effects)?;
@@ -551,7 +558,7 @@ impl Simulation {
         &mut self,
         id: u64,
         rules: &RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> bool {
         let Some(actor) = self.substrate.entities.get(id) else {
             return false;
@@ -591,7 +598,7 @@ impl Simulation {
                     // UnInit owns Limbo and eventual Foot sound release.
                     self.uninit_with_context(
                         id,
-                        crate::sim::world::UninitContext::with_rules(rules).with_effects(effects),
+                        crate::sim::world::UninitContext::new(rules).with_effects(effects),
                     );
                     true
                 }
@@ -630,7 +637,7 @@ impl Simulation {
                     self.leave_dead_body(id, rules);
                     self.uninit_with_context(
                         id,
-                        crate::sim::world::UninitContext::with_rules(rules).with_effects(effects),
+                        crate::sim::world::UninitContext::new(rules).with_effects(effects),
                     );
                     true
                 }
@@ -720,7 +727,7 @@ impl Simulation {
         for sound in sounds.filter(|sound| sound.frame == frame) {
             self.sound_events
                 .emit(crate::sim::world::SimSoundEvent::voc_at_location(
-                    sound.sound_id.clone(),
+                    rules.sound_name(&sound.sound_id),
                     actor,
                     self.resolved_terrain.as_ref(),
                 ));
@@ -737,8 +744,7 @@ impl Simulation {
         &mut self,
         id: u64,
         rules: &RuleSet,
-        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(actor) = self.substrate.entities.get(id) else {
             return;
@@ -772,7 +778,6 @@ impl Simulation {
                 0
             },
             rules,
-            registry,
             effects,
         );
         if let Err(cause) = self.infantry_do_action(id, DO_AIR_DEATH_FINISH, true, rules, effects) {
@@ -803,7 +808,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<(), String> {
         let Some(actor) = self.substrate.entities.get(id) else {
             return Ok(());
@@ -838,7 +843,6 @@ impl Simulation {
                     previous_cell: None,
                 },
                 rules,
-                registry,
             )?;
             if answer == super::infantry_entry::InfantryEntryClass::Impassable7 {
                 return Ok(());
@@ -850,7 +854,7 @@ impl Simulation {
             .get(id)
             .ok_or("the recovery's infantryman disappeared")?;
         if super::motion_query::is_moving(actor) != Some(false)
-            || actor.tether.partner().is_some()
+            || actor.seldom.tether.partner().is_some()
             || !actor.in_playfield()
             || self.foot_can_reach_navigation_cell(id, destination, rules)?
         {
@@ -914,7 +918,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let stopped_move = self.substrate.entities.get(id).is_some_and(|actor| {
             actor.category() == EntityCategory::Infantry
@@ -1034,7 +1038,7 @@ impl Simulation {
             requested,
             false,
             rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         ) {
             log::debug!("infantry {id} target change action: {cause}");
         }
@@ -1049,7 +1053,7 @@ impl Simulation {
         &mut self,
         id: u64,
         rules: &RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(actor) = self.substrate.entities.get(id) else {
             return;
@@ -1094,7 +1098,7 @@ impl Simulation {
         id: u64,
         action: i32,
         rules: &RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(actor) = self.substrate.entities.get(id) else {
             return;
@@ -1147,13 +1151,13 @@ impl crate::sim::world::ObjectSubstrate {
     /// Health 0; a death whose `Do_Action` was refused (a sequence with no
     /// frames, `0x0051D70F`) left the previous action, and is raised here.
     pub(crate) fn infantry_health_reset(&mut self, id: u64) {
-        let Some(actor) = self.entities.get_mut(id) else {
-            return;
-        };
-        let Some(doing) = actor.mission_leaf.as_infantry().map(|leaf| leaf.doing()) else {
-            return;
-        };
-        if actor.health.current() <= 0 && !in_death_sequence(doing) {
+        if let Some(actor) = self.entities.get_mut_if(id, |actor| {
+            actor.health.current() <= 0
+                && actor
+                    .mission_leaf
+                    .as_infantry()
+                    .is_some_and(|leaf| !in_death_sequence(leaf.doing()))
+        }) {
             actor.health.set(1);
         }
     }
@@ -1191,14 +1195,14 @@ impl DoActionType {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "infantry_action_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "infantry_water_action_tests.rs"]
 mod water_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "infantry_unreachable_navcom_tests.rs"]
 mod unreachable_navcom_tests;

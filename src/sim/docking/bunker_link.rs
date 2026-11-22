@@ -139,7 +139,7 @@ pub fn install_bunker_link(sim: &mut Simulation, building_id: u64, unit_id: u64,
         .substrate
         .entities
         .get_mut(building_id)
-        .and_then(|b| b.bunker_runtime.as_mut())
+        .and_then(|b| b.building.bunker_runtime.as_mut())
     {
         rt.occupy();
     }
@@ -166,7 +166,7 @@ pub fn install_bunker_link(sim: &mut Simulation, building_id: u64, unit_id: u64,
 pub(crate) fn break_bunker_link(
     sim: &mut Simulation,
     building_id: u64,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) -> Option<u64> {
     let unit_id = sim.substrate.entities.get(building_id)?.bunker.occupant()?;
     // BREAK over the bus (clears any bus-level radio contact both ways).
@@ -224,7 +224,7 @@ pub(crate) fn unit_unload_empties_bunker(
     sim: &mut Simulation,
     unit_id: u64,
     rules: &RuleSet,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) -> bool {
     let Some(unit) = sim
         .substrate
@@ -245,8 +245,9 @@ pub(crate) fn unit_unload_empties_bunker(
 }
 
 /// Normal release4595C0, reached by linked Unit Mission_Unload73D66D
-/// ([`unit_unload_empties_bunker`]), its one native caller. VERA's
-/// `Command::EjectBunker` also calls it, but no player input sends that (#3675).
+/// ([`unit_unload_empties_bunker`]), its one native caller. The VERA-only
+/// bunker-eject record also reaches this owner, through that same Unload
+/// mission rather than at command time (#3675).
 /// Unlike sell/death, it clears the unit link before Power_On/Force, then
 /// assigns a nearby destination ([`bunker_exit_cell`]) and queues Move before
 /// clearing the building. The wall-animation projection remains a bounded
@@ -255,7 +256,7 @@ pub(crate) fn release_normal(
     sim: &mut Simulation,
     building_id: u64,
     rules: &RuleSet,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     emit_bunker_wall_anim(sim, building_id, false, rules);
     emit_bunker_wall_sound(
@@ -285,12 +286,16 @@ pub(crate) fn release_normal(
     #[cfg(test)]
     release_tests::record(sim, building_id, unit_id, "unit-link");
     power_and_force_release(sim, building_id, unit_id, rules, effects);
+    //4597FA: the class setter (vt+0x480) with its queue flag set, so the Foot
+    //setter's tail runs too.
     if let Some(cell) = bunker_exit_cell(sim, building_id, unit_id, rules) {
-        let terrain = sim.resolved_terrain.as_ref();
-        let frame = sim.session.binary_frame();
-        if let Some(unit) = sim.substrate.entities.get_mut(unit_id) {
-            crate::sim::movement::set_destination_internal_cell(unit, cell, terrain, frame);
-        }
+        sim.set_unit_destination(
+            unit_id,
+            crate::sim::components::NavTargetRef::cell(cell.0, cell.1),
+            rules,
+            true,
+            effects,
+        );
     }
     #[cfg(test)]
     release_tests::record(sim, building_id, unit_id, "destination");
@@ -325,7 +330,7 @@ pub(crate) fn release_sell_destroy(
     sim: &mut Simulation,
     building_id: u64,
     rules: &RuleSet,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     let Some(unit_id) = sim
         .substrate
@@ -369,7 +374,7 @@ fn power_and_force_release(
     building_id: u64,
     unit_id: u64,
     rules: &RuleSet,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     let Some(unit) = sim.substrate.entities.get_mut(unit_id) else {
         return;
@@ -395,7 +400,7 @@ fn power_and_force_release(
         0x47,
         head,
         rules,
-        effects.overlay_registry(),
+        Some(rules.overlay_registry()),
         effects,
     );
     #[cfg(test)]
@@ -415,13 +420,13 @@ fn break_first_contact(
     sim: &mut Simulation,
     building_id: u64,
     rules: &RuleSet,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     let contact = sim
         .substrate
         .entities
         .get(building_id)
-        .and_then(|building| building.radio_contacts.slot(0));
+        .and_then(|building| building.seldom.radio_contacts.slot(0));
     if let Some(contact) = contact {
         transmit(
             sim,
@@ -458,7 +463,7 @@ pub(crate) fn clear_bunker(
     sim: &mut Simulation,
     building_id: u64,
     rules: &RuleSet,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) {
     let occupant = sim
         .substrate
@@ -507,7 +512,7 @@ pub fn break_links_on_despawn(substrate: &mut ObjectSubstrate, id: u64) {
         && let Some(b) = substrate.entities.get_mut(building_id)
     {
         b.bunker.occupant = None;
-        if let Some(rt) = b.bunker_runtime.as_mut() {
+        if let Some(rt) = b.building.bunker_runtime.as_mut() {
             *rt = BunkerRuntime::idle();
         }
     }
@@ -518,7 +523,7 @@ pub fn break_links_on_despawn(substrate: &mut ObjectSubstrate, id: u64) {
 /// (`0x0045959C`) and UpdateBunker's no-object arm (`0x00458E85`).
 pub(super) fn reset_bunker_idle(substrate: &mut ObjectSubstrate, building_id: u64) {
     if let Some(b) = substrate.entities.get_mut(building_id)
-        && let Some(rt) = b.bunker_runtime.as_mut()
+        && let Some(rt) = b.building.bunker_runtime.as_mut()
     {
         *rt = BunkerRuntime::idle();
     }
@@ -604,7 +609,7 @@ fn at_or_below_condition_yellow(current: i32, strength: i32, condition_yellow: f
     )
 }
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
@@ -655,7 +660,7 @@ mod tests {
             5,
             false,
         );
-        ge.bunker_runtime = Some(BunkerRuntime::idle());
+        ge.building.bunker_runtime = Some(BunkerRuntime::idle());
         sim.substrate.entities.insert(ge);
     }
 
@@ -821,6 +826,7 @@ mod tests {
             .entities
             .get_mut(1)
             .unwrap()
+            .seldom
             .selection
             .set_selected_for_test(true);
         sim.substrate
@@ -833,20 +839,20 @@ mod tests {
         let bunker = sim.substrate.entities.get(2).unwrap();
         assert_eq!(bunker.bunker.occupant(), Some(1));
         assert_eq!(
-            bunker.bunker_runtime.unwrap().state(),
+            bunker.building.bunker_runtime.unwrap().state(),
             BunkerState::Occupied
         );
 
         let unit = sim.substrate.entities.get(1).unwrap();
         assert_eq!(unit.bunker.link(), BunkerLink::Installed(2));
         assert!(
-            unit.in_logic_vector.is_member(),
+            unit.seldom.in_logic_vector.is_member(),
             "install leaves the unit active"
         );
         assert!(unit.lifecycle.object_alive());
         assert!(!unit.lifecycle.in_limbo());
         assert!(unit.lifecycle.cell_marked());
-        assert!(!unit.selection.is_selected());
+        assert!(!unit.seldom.selection.is_selected());
         assert_eq!(unit.object_group(), -1);
         let follow: Vec<_> = sim
             .take_lifecycle_outputs_for_test()
@@ -899,7 +905,8 @@ mod tests {
         assert!(matches!(sim.reveal(1), RevealOutcome::Revealed { .. }));
         install_bunker_link(&mut sim, 2, 1, &rules);
 
-        let released = break_bunker_link(&mut sim, 2, crate::sim::world::FrameEffects::default());
+        let released =
+            break_bunker_link(&mut sim, 2, &mut crate::sim::world::FrameEffects::default());
         assert_eq!(released, Some(1));
         assert_eq!(
             sim.substrate.entities.get(2).unwrap().bunker.occupant(),
@@ -948,12 +955,14 @@ mod tests {
             .entities
             .get_mut(2)
             .unwrap()
+            .seldom
             .radio_contacts
             .insert(1);
         sim.substrate
             .entities
             .get_mut(1)
             .unwrap()
+            .seldom
             .radio_contacts
             .insert(2);
         let event = EntityDamageEvent::direct_receiver(
@@ -975,6 +984,7 @@ mod tests {
             None,
             &rules,
             Some(crate::sim::tiberium::test_support::overlay_registry()),
+            &mut Vec::new(),
         );
         assert!(
             !sim.substrate
@@ -1042,7 +1052,7 @@ mod tests {
                 z_leptons,
             }),
             z_leptons.div_euclid(crate::util::lepton::LEPTONS_PER_LEVEL as i32),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         // Native cell-list order: the prepended tank's record precedes the
         // bunker's, so the live receiver gate sees an intact link.
@@ -1061,6 +1071,7 @@ mod tests {
             &area.receivers,
             &rules,
             None,
+            &mut Vec::new(),
         );
 
         assert!(
@@ -1140,6 +1151,7 @@ mod tests {
                 .entities
                 .get(bunker)
                 .unwrap()
+                .building
                 .bunker_runtime
                 .as_ref()
                 .unwrap()
@@ -1154,6 +1166,7 @@ mod tests {
                 .entities
                 .get(bunker)
                 .unwrap()
+                .building
                 .bunker_runtime
                 .as_ref()
                 .unwrap()
@@ -1194,7 +1207,7 @@ mod tests {
                 z_leptons,
             }),
             z_leptons.div_euclid(crate::util::lepton::LEPTONS_PER_LEVEL as i32),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         // The impact cell is the tank's own foundation-centre cell, so its
         // prepended record precedes every bunker record of the transaction.
@@ -1213,6 +1226,7 @@ mod tests {
             &area.receivers,
             &rules,
             None,
+            &mut Vec::new(),
         );
 
         assert!(
@@ -1287,7 +1301,7 @@ mod tests {
                 z_leptons,
             }),
             z_leptons.div_euclid(crate::util::lepton::LEPTONS_PER_LEVEL as i32),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         let mut run = world_receiver::ReceiverRun::default();
         let _ = world_receiver::commit_area_with_dispatch(
@@ -1296,6 +1310,7 @@ mod tests {
             &area.receivers,
             &rules,
             None,
+            &mut Vec::new(),
         );
 
         let tank = sim.substrate.entities.get(1).unwrap();
@@ -1355,6 +1370,7 @@ mod tests {
             .entities
             .get_mut(3)
             .unwrap()
+            .seldom
             .airstrike
             .set_test_link(Some(3));
         assert_eq!(stored(&sim, 3, &rules), Some(TargetKind::Entity(2)));
@@ -1372,7 +1388,10 @@ mod tests {
             let held = stored(&sim, 3, &rules);
             let receiver = sim.substrate.entities.get_mut(3).unwrap();
             crate::sim::mission::concrete_effects::represented_assign_target_admitted(
-                receiver, tank, held,
+                receiver,
+                tank,
+                held,
+                rules.ares_form(),
             );
             assert_eq!(receiver.attack_target.target(), Some(TargetKind::Entity(2)));
         }
@@ -1400,11 +1419,11 @@ mod tests {
             &mut sim,
             2,
             &rules(),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         let unit = sim.substrate.entities.get(1).unwrap();
         assert_eq!(unit.bunker.link(), BunkerLink::None);
-        assert!(unit.in_logic_vector.is_member(), "unit revealed");
+        assert!(unit.seldom.in_logic_vector.is_member(), "unit revealed");
         assert!(unit.lifecycle.object_alive());
         assert!(!unit.lifecycle.in_limbo());
         assert!(unit.lifecycle.cell_marked());
@@ -1464,7 +1483,7 @@ mod tests {
             &mut sim,
             2,
             &rules(),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         assert_eq!(
             sim.substrate.entities.get(1).unwrap().navigation.nav_com(),
@@ -1479,11 +1498,14 @@ mod tests {
             &mut sim,
             2,
             &rules(),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         let unit = sim.substrate.entities.get(1).unwrap();
         assert_eq!(unit.bunker.link(), BunkerLink::None);
-        assert!(unit.in_logic_vector.is_member(), "unit remains active");
+        assert!(
+            unit.seldom.in_logic_vector.is_member(),
+            "unit remains active"
+        );
         assert!(unit.lifecycle.object_alive());
         assert!(!unit.lifecycle.in_limbo());
         assert!(unit.lifecycle.cell_marked());
@@ -1514,12 +1536,12 @@ mod tests {
             &mut sim,
             2,
             &rules(),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         let unit = sim.substrate.entities.get(1).unwrap();
         assert_eq!(unit.bunker.link(), BunkerLink::None);
         assert!(
-            unit.in_logic_vector.is_member(),
+            unit.seldom.in_logic_vector.is_member(),
             "clear preserves live membership"
         );
         assert!(unit.lifecycle.object_alive());
@@ -1579,7 +1601,7 @@ mod tests {
             &mut sim,
             2,
             &rules(),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         assert_eq!(
             down_anim_events(&sim),
@@ -1602,7 +1624,7 @@ mod tests {
             &mut sim,
             2,
             &rules(),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         assert_eq!(down_anim_events(&sim), 1, "one walls-down anim on clear");
     }
@@ -1615,7 +1637,7 @@ mod tests {
             &mut sim,
             2,
             &rules(),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         assert!(
             sim.bunker_wall_events.is_empty(),
@@ -1638,7 +1660,7 @@ mod tests {
             &mut sim,
             2,
             &rules(),
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         let ev = sim.bunker_wall_events.iter().find(|e| !e.up).unwrap();
         assert!(
@@ -1658,7 +1680,7 @@ mod tests {
         let unit = sim.substrate.entities.get(1).unwrap();
         assert_eq!(unit.bunker.link(), BunkerLink::None);
         assert!(
-            unit.in_logic_vector.is_member(),
+            unit.seldom.in_logic_vector.is_member(),
             "occupant remains active after sell"
         );
         assert_eq!((unit.position.rx(), unit.position.ry()), (12, 12));
@@ -1676,6 +1698,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 #[path = "bunker_release_tests.rs"]
 mod release_tests;

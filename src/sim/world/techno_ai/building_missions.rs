@@ -104,12 +104,14 @@ use super::ObjectAiCtx;
 use super::target_scan::{can_fire_at, fire_error_at, select_weapon, weapon_at_index};
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
+use crate::sim::ammo::TechnoAmmo;
 use crate::sim::building_art::requested_damage_state;
 use crate::sim::combat::TargetKind;
 use crate::sim::combat::combat_weapon::{self, WeaponSlot};
 use crate::sim::combat::fire_error::FireError;
 use crate::sim::combat::gattling::{StageCall, is_elite};
 use crate::sim::combat::{BuildingShot, fire_coord};
+use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::StringInterner;
 use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MISSION_STUB_FRAMES, MissionId, MissionType};
@@ -118,6 +120,10 @@ use crate::sim::rng::SimRng;
 use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::world::ObjectSubstrate;
 use crate::sim::world::Simulation;
+
+#[path = "ares_prism_forwarding.rs"]
+mod ares_prism_forwarding;
+pub(crate) use ares_prism_forwarding::AresPrismForwarding;
 
 /// A building's delayed fire (`BuildingClass+0x704` mode, `+0x714`
 /// countdown, `+0x708..+0x710` payload), armed by Mission_Attack and served by
@@ -250,12 +256,19 @@ pub(super) fn update_animation(sim: &mut Simulation, id: u64, rules: &RuleSet) {
         crate::sim::production::archive_less_sale(rules.into(), &object.id, entity);
     let now = sim.session.binary_frame() as i32;
     let options = sim.session.game_options();
-    if let Some(entity) = sim.substrate.entities.get_mut(id) {
+    if let Some(entity) = sim
+        .substrate
+        .entities
+        .get_mut_if(id, |entity| entity.building_body_advances(now, has_turret))
+    {
         entity.advance_building_body(now, archive_less_sale, has_turret, options);
     }
     // 450F9E..451145, between the step and the ready admission, which it
     // does not touch.
     sim.update_super_weapon_anims(id, rules);
+    // 451234..45128C, the tail before the ready admission: the turret
+    // animation in slot 9 takes its frame from the heading.
+    sim.aim_building_turret_anim(id, has_turret);
 }
 
 ///43FE27's first check requires BState!=0;43FF91's second does not.
@@ -281,7 +294,10 @@ pub(super) fn apply_queued_body(
     substrate: &mut ObjectSubstrate,
     id: u64,
 ) {
-    if let Some(entity) = substrate.entities.get_mut(id) {
+    if let Some(entity) = substrate
+        .entities
+        .get_mut_if(id, GameEntity::building_body_queued)
+    {
         entity.apply_queued_building_body(session.binary_frame() as i32, session.game_options());
     }
 }
@@ -291,7 +307,7 @@ pub(super) fn dispatch(
     sim: &mut Simulation,
     id: u64,
     rules: &RuleSet,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
     bridge_state_changed: &mut bool,
 ) {
     let Some(entity) = sim.substrate.entities.get(id) else {
@@ -304,7 +320,7 @@ pub(super) fn dispatch(
     }
     if current == Some(MissionType::Selling) {
         // Sell shares the same gate as Construction.
-        sim.visit_building_down(id, rules, ctx.overlay_registry, ctx.effects);
+        sim.visit_building_down(id, rules, ctx.overlay_registry, &mut ctx.effects);
         return;
     }
     let delay = match current {
@@ -325,12 +341,14 @@ pub(super) fn dispatch(
             rules,
             id,
             ctx.overlay_registry,
-            ctx.effects,
+            &mut ctx.effects,
         ) {
             Some(delay) => delay,
             None => return,
         },
-        Some(MissionType::Missile) => super::building_missile::mission_missile(sim, id, rules),
+        Some(MissionType::Missile) => {
+            super::building_missile::mission_missile(sim, id, rules, ctx, bridge_state_changed)
+        }
         // Every other slot of the building's table, and no mission (above
         // `0x1F`, `0x005B30BB`), is a MissionClass stub; its Capture, Sabotage
         // and Harvest slots jump to them (`0x0044B760`, `0x0044B770`).
@@ -347,7 +365,7 @@ fn mission_construction(
     sim: &mut Simulation,
     id: u64,
     rules: &RuleSet,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
 ) -> i32 {
     use crate::sim::building_construction::BuildingBodyMode;
     use crate::sim::radio::{RadioMessage, transmit_to_contact};
@@ -362,7 +380,7 @@ fn mission_construction(
             .get_mut(id)
             .unwrap()
             .begin_building_body(BuildingBodyMode::Construction, now as i32);
-        transmit_to_contact(sim, id, RadioMessage::DockApproach, rules, ctx.effects);
+        transmit_to_contact(sim, id, RadioMessage::DockApproach, rules, &mut ctx.effects);
         let sound = sim
             .substrate
             .entities
@@ -385,12 +403,19 @@ fn mission_construction(
             entity.mission.set_handler_state(1);
         }
     } else if status == 1 && entity.building_ready_latch() != 0 {
-        transmit_to_contact(sim, id, RadioMessage::DockArrived, rules, ctx.effects);
-        transmit_to_contact(sim, id, RadioMessage::Break, rules, ctx.effects);
+        transmit_to_contact(sim, id, RadioMessage::DockArrived, rules, &mut ctx.effects);
+        transmit_to_contact(sim, id, RadioMessage::Break, rules, &mut ctx.effects);
         if let Some(entity) = sim.substrate.entities.get_mut(id) {
             entity.begin_building_body(BuildingBodyMode::Idle, now as i32);
         }
-        sim.grand_opening(id, false, false, rules, ctx.overlay_registry, ctx.effects);
+        sim.grand_opening(
+            id,
+            false,
+            false,
+            rules,
+            ctx.overlay_registry,
+            &mut ctx.effects,
+        );
         let facing = sim
             .substrate
             .entities
@@ -437,7 +462,7 @@ fn mission_unload(
     sim: &mut Simulation,
     id: u64,
     rules: &RuleSet,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
 ) -> Option<i32> {
     crate::sim::passenger::garrison_eject::sell_building_occupants(
         sim,
@@ -445,12 +470,30 @@ fn mission_unload(
         ctx.overlay_registry,
         id,
         crate::sim::passenger::garrison_eject::GarrisonEjectMode::Release,
-        ctx.effects,
+        &mut ctx.effects,
     );
+    // Ares 3.0 BuildingClass_UnloadPassengers_Unload 100145B0 (hook
+    // 0x0044D8A1): a `Hospital=` or `Armory=` building kicks out its first
+    // passenger (BuildingExt::KickOutHospitalArmory, `sim::ares_transports`).
+    if rules.ares() {
+        sim.ares_kick_out_hospital_armory(id, rules, ctx.overlay_registry, &mut ctx.effects);
+    }
+    // Ares 3.0 100174A0 (hook 0x0044D8A7): a loaded tunnel entrance unloads
+    // one member of its owner's network (`sim::ares_tunnel`).
+    if rules.ares()
+        && let Some(delay) = crate::sim::transport_unload::ares_tunnel_mission_unload(
+            sim,
+            rules,
+            id,
+            &mut ctx.effects,
+        )
+    {
+        return Some(delay);
+    }
     let entity = sim.substrate.entities.get(id)?;
     let object = sim.object_type(entity.type_ref(), rules)?;
     let holds_passengers = entity
-        .passenger_role
+        .passenger_role()
         .cargo()
         .is_some_and(|cargo| !cargo.is_empty());
     if object.infantry_absorb && holds_passengers {
@@ -459,8 +502,7 @@ fn mission_unload(
                 sim,
                 rules,
                 id,
-                ctx.overlay_registry,
-                ctx.effects,
+                &mut ctx.effects,
             ),
         );
     }
@@ -491,7 +533,7 @@ fn mission_factory_unload(
     sim: &mut Simulation,
     id: u64,
     rules: &RuleSet,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
 ) -> i32 {
     use crate::sim::door::DoorPhase;
     let Some(entity) = sim.substrate.entities.get(id) else {
@@ -505,8 +547,8 @@ fn mission_factory_unload(
     let ticks = object.deploy_time_ticks;
     let naval = object.naval;
     let phase = entity.door_phase();
-    let contact = entity.radio_contacts.slot(0);
-    let tethered = entity.tether.partner().is_some();
+    let contact = entity.seldom.radio_contacts.slot(0);
+    let tethered = entity.seldom.tether.partner().is_some();
     let location = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
     let track = crate::sim::movement::factory_exit_track_coordinate(location, object);
     let damaged = requested_damage_state(
@@ -559,18 +601,28 @@ fn mission_factory_unload(
                     .map(|loco| loco.active_kind());
                 //44DED8..44DF1A dispatch on the active locomotor's CLSID.
                 //44DF72..44DFA4: a Drive product runs track 0x42 out of the
-                //bay. 44DFAD..44E163: a Teleport one (the Chrono Miner; no
-                //retail type names TS Tunnel, 44DEEA's other arm) first takes
-                //a Drive piggyback over its Teleport, the Unit setter's own
-                //install, then runs the same track. Native ends a carried
+                //bay. 44DFAD..44E163: a Teleport one (the Chrono Miner) or a
+                //Tunnel one (44DEDD; no retail type) first takes a Drive
+                //piggyback over it, then runs the same track. For Teleport
+                //that is the Unit setter's own install. Native ends a carried
                 //piggyback when Is_Piggybacking (IPiggyback vt+0x1C) holds,
                 //where the shared install asks Is_Ok_To_End; a product fresh
-                //from the factory carries none. The no-IPiggyback C4 arm
-                //(44E165) is dead: Drive implements it.
-                if active == Some(LocomotorKind::Teleport)
-                    && let Some(unit) = sim.substrate.entities.get_mut(product)
-                {
-                    crate::sim::movement::locomotor_owner::begin_drive_for_teleporter(unit, now);
+                //from the factory carries none, and Tunnel has no IPiggyback.
+                //The no-IPiggyback C4 arm (44E165) is dead: Drive implements it.
+                if let Some(unit) = sim.substrate.entities.get_mut(product) {
+                    match active {
+                        Some(LocomotorKind::Teleport) => {
+                            crate::sim::movement::locomotor_owner::begin_drive_for_teleporter(
+                                unit, now,
+                            );
+                        }
+                        Some(LocomotorKind::Tunnel) => {
+                            if let Some(locomotor) = unit.locomotor.as_mut() {
+                                locomotor.begin_piggyback(LocomotorKind::Drive, now);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 let drive = sim
                     .substrate
@@ -585,7 +637,7 @@ fn mission_factory_unload(
                         track,
                         rules,
                         ctx.overlay_registry,
-                        ctx.effects,
+                        &mut ctx.effects,
                     );
                 } else {
                     //44DF1C: any other locomotor takes the Cell beyond the bay.
@@ -595,7 +647,7 @@ fn mission_factory_unload(
                         crate::sim::components::NavTargetRef::cell(cell.0, cell.1),
                         rules,
                         true,
-                        ctx.effects,
+                        &mut ctx.effects,
                     );
                 }
                 if let Some(product) = sim.substrate.entities.get_mut(product) {
@@ -647,7 +699,7 @@ fn clear_factory_exit_bib(
     producer: u64,
     track: crate::sim::components::DriveCoord,
     rules: &RuleSet,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
 ) -> bool {
     use crate::sim::movement::locomotor::MovementLayer;
     let head = ((track.x / 256) as i16, (track.y / 256) as i16);
@@ -671,7 +723,7 @@ fn clear_factory_exit_bib(
         flags,
         rules,
         ctx.overlay_registry,
-        ctx.effects,
+        &mut ctx.effects,
     ) {
         log::warn!("factory {producer} bib Scatter failed: {error}");
     }
@@ -692,7 +744,7 @@ fn clear_factory_exit_bib(
             flags,
             rules,
             ctx.overlay_registry,
-            ctx.effects,
+            &mut ctx.effects,
         ) {
             log::warn!("factory {producer} bib neighbour Scatter failed: {error}");
         }
@@ -725,10 +777,10 @@ fn rate_delay(scenario_rng: &mut SimRng, frames: i32, multiplier: i32) -> i32 {
 }
 
 /// `BuildingClass::Mission_Guard` (`0x004496B0`).
-fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCtx<'_>) -> i32 {
+fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: &mut ObjectAiCtx<'_>) -> i32 {
     // The head (`0x004496C1..0x004496DF`), armed or not, before anything else
     // the handler reads or draws.
-    gattling_step(sim, id, rules, StageCall::Update, ctx.effects);
+    gattling_step(sim, id, rules, StageCall::Update, &mut ctx.effects);
     let Some(entity) = sim.substrate.entities.get(id) else {
         return 0;
     };
@@ -742,7 +794,7 @@ fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCt
         .unwrap_or(MissionType::Guard);
     // vt+0x2AC, `BuildingClass::Is_Armed 0x00458DB0`.
     if combat_weapon::is_armed(entity, obj, &sim.substrate.entities, rules, &sim.interner) {
-        let empty_garrison = obj.can_be_occupied && entity.passenger_role.occupants().is_empty();
+        let empty_garrison = obj.can_be_occupied && entity.passenger_role().occupants().is_empty();
         let has_target = entity.attack_target.target().is_some();
         if let Some(entity) = sim.substrate.entities.get_mut(id) {
             // `0x00449701`.
@@ -772,18 +824,16 @@ fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCt
     }
     // `0x00449817..0x00449833`: UnitRepair, UnitReload or Bunker
     // (`+0x16A9/+0x16AA/+0x16AB`) takes the contact arm.
-    if status == 1 && (obj.unit_repair || obj.unit_reload || obj.bunker) {
+    if status == 1
+        && (obj.unit_repair || obj.unit_reload || obj.bunker)
+        && let Some(depot) = sim.substrate.entities.get(id)
+    {
         //449839..44994A: scan contacts in slot order, raw GetCoords 3D
         //distance <64 (no Building foundation discount), then NEED_MOVE;
-        //on ROGER queue Repair and return 1 with no Scenario draw.
-        let contacts: Vec<_> = sim
-            .substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .radio_contacts
-            .iter_live()
-            .collect();
+        //on ROGER queue Repair and return 1 with no Scenario draw. Each
+        //NEED_MOVE runs the contact's receivers, so the scan walks the
+        //contacts as they stood when it began.
+        let contacts: Vec<_> = depot.seldom.radio_contacts.iter_live().collect();
         for contact in contacts {
             let Some(unit) = sim.substrate.entities.get(contact) else {
                 continue;
@@ -791,8 +841,11 @@ fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCt
             if unit.mission.effective() != MissionId::from_known(MissionType::Enter) {
                 continue;
             }
+            let Some(depot) = sim.substrate.entities.get(id) else {
+                break;
+            };
             let center = crate::sim::movement::ground_pose::object_get_coords(
-                sim.substrate.entities.get(id).unwrap(),
+                depot,
                 sim.resolved_terrain.as_ref(),
             );
             let position = crate::sim::movement::ground_pose::object_get_coords(
@@ -813,7 +866,7 @@ fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCt
                 crate::sim::radio::RadioMessage::NeedToMove,
                 crate::sim::radio::RadioPayload::default(),
                 rules,
-                ctx.effects,
+                &mut ctx.effects,
             ) == crate::sim::radio::RadioResponse::Roger
             {
                 let _ = sim.mission_queue_exact(
@@ -850,12 +903,17 @@ fn mission_guard(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCt
             .substrate
             .entities
             .get(id)
-            .is_some_and(|entity| !entity.radio_contacts.is_empty())
+            .is_some_and(|entity| !entity.seldom.radio_contacts.is_empty())
     {
         use crate::sim::radio::{RadioMessage, RadioResponse, transmit_to_contact};
-        if transmit_to_contact(sim, id, RadioMessage::QueryReloaded, rules, ctx.effects)
-            != RadioResponse::Roger
-            && transmit_to_contact(sim, id, RadioMessage::NeedToMove, rules, ctx.effects)
+        if transmit_to_contact(
+            sim,
+            id,
+            RadioMessage::QueryReloaded,
+            rules,
+            &mut ctx.effects,
+        ) != RadioResponse::Roger
+            && transmit_to_contact(sim, id, RadioMessage::NeedToMove, rules, &mut ctx.effects)
                 == RadioResponse::Roger
         {
             let _ = sim.mission_queue_exact(
@@ -881,31 +939,15 @@ fn mission_attack(
     sim: &mut Simulation,
     id: u64,
     rules: &RuleSet,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
     bridge_state_changed: &mut bool,
 ) -> i32 {
     let Some((target, weapon)) = attack_prelude(sim, id, rules) else {
         return 1;
     };
-    let mut code = fire_error_at(
-        sim,
-        rules,
-        id,
-        Some(target),
-        weapon,
-        true,
-        ctx.overlay_registry,
-    );
+    let mut code = fire_error_at(sim, rules, id, Some(target), weapon, true);
     if code == FireError::Facing && voxel_turret_snaps(sim, id, rules, target) {
-        code = fire_error_at(
-            sim,
-            rules,
-            id,
-            Some(target),
-            weapon,
-            true,
-            ctx.overlay_registry,
-        );
+        code = fire_error_at(sim, rules, id, Some(target), weapon, true);
     }
     attack_arm(
         sim,
@@ -931,8 +973,7 @@ fn attack_prelude(sim: &mut Simulation, id: u64, rules: &RuleSet) -> Option<(Tar
             id,
             None,
             rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         clear_support_count(&mut sim.substrate, id);
         //44AFA5..44AFB1: the warp-in readiness gate precedes705D60 ->6385C0.
@@ -958,22 +999,21 @@ fn attack_arm(
     target: TargetKind,
     weapon: i32,
     code: FireError,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
     bridge_state_changed: &mut bool,
 ) -> i32 {
     match code {
         FireError::Ok => {
             fire_arm(sim, id, rules, target, weapon, ctx, bridge_state_changed);
             // The tail every OK arm reaches (`0x0044B6D6..0x0044B724`).
-            if !gattling_step(sim, id, rules, StageCall::Increase, ctx.effects) {
+            if !gattling_step(sim, id, rules, StageCall::Increase, &mut ctx.effects) {
                 advance_turret_anim(&mut sim.substrate, id);
             }
             1
         }
         // `0x0044B0DE`: the drop tail (`+0x664 = 0` at `0x0044B0ED`).
         FireError::Ammo | FireError::Illegal | FireError::Cant | FireError::Range => {
-            let _ =
-                sim.assign_target_represented(id, None, rules, ctx.overlay_registry, ctx.effects);
+            let _ = sim.assign_target_represented(id, None, rules, &mut ctx.effects);
             clear_support_count(&mut sim.substrate, id);
             //44B0F3..44B0FF: retain the Wait queued by planned dispatch.
             sim.planning_enter_idle(id, rules, true);
@@ -981,7 +1021,7 @@ fn attack_arm(
                 return 1;
             }
             // `0x0044B113..0x0044B131`, before Commence zeroes the count.
-            gattling_step(sim, id, rules, StageCall::Update, ctx.effects);
+            gattling_step(sim, id, rules, StageCall::Update, &mut ctx.effects);
             queue_and_commence(sim, id, MissionType::Guard, rules);
             clear_ai_counter(&mut sim.substrate, id);
             1
@@ -991,7 +1031,7 @@ fn attack_arm(
         // on REARM advances `+0x148` (`0x0044B235..0x0044B23C`).
         FireError::Facing | FireError::Rearm => {
             aim_turret(sim, id, rules, target);
-            if !gattling_step(sim, id, rules, StageCall::Increase, ctx.effects)
+            if !gattling_step(sim, id, rules, StageCall::Increase, &mut ctx.effects)
                 && code == FireError::Rearm
             {
                 advance_turret_anim(&mut sim.substrate, id);
@@ -1002,7 +1042,7 @@ fn attack_arm(
         // the `0x0044B14E` tail.
         FireError::Cloaked => {
             crate::sim::combat::world_fire::start_uncloaking_to_fire(sim, rules, id);
-            gattling_step(sim, id, rules, StageCall::Update, ctx.effects);
+            gattling_step(sim, id, rules, StageCall::Update, &mut ctx.effects);
             aim_turret(sim, id, rules, target);
             clear_ai_counter(&mut sim.substrate, id);
             1
@@ -1010,7 +1050,7 @@ fn attack_arm(
         // `0x0044B24F`: a Gattling type decays (`0x0044B26C`); any other
         // keeps the count.
         FireError::Busy => {
-            gattling_step(sim, id, rules, StageCall::Update, ctx.effects);
+            gattling_step(sim, id, rules, StageCall::Update, &mut ctx.effects);
             1
         }
         // Codes 4, 7 and above 10 (`0x0044B14E`).
@@ -1068,7 +1108,7 @@ impl PrismSupport {
 /// `+0x664 = 0`, the Prism support count, after both tails' SetTarget(0).
 fn clear_support_count(substrate: &mut ObjectSubstrate, id: u64) {
     if let Some(entity) = substrate.entities.get_mut(id) {
-        entity.prism_support_count.reset();
+        entity.building.prism_support_count.reset();
     }
 }
 
@@ -1099,7 +1139,7 @@ fn gattling_step(
     id: u64,
     rules: &RuleSet,
     call: StageCall,
-    effects: crate::sim::world::FrameEffects<'_>,
+    effects: &mut crate::sim::world::FrameEffects<'_>,
 ) -> bool {
     if !is_gattling(sim, id, rules) {
         return false;
@@ -1158,7 +1198,13 @@ pub(super) fn gattling_idle(
         return;
     };
     let now = session.binary_frame() as i32;
-    let Some(entity) = substrate.entities.get_mut(id) else {
+    let refills = !obj.hospital && !obj.armory();
+    // Only a Gattling type, or an empty count it refills, changes anything.
+    // Ares reloads by its own clock, so there every refilling type is taken.
+    let Some(entity) = substrate.entities.get_mut_if(id, |entity| {
+        obj.is_gattling
+            || (refills && (rules.ares() || entity.ammo().is_some_and(TechnoAmmo::is_empty)))
+    }) else {
         return;
     };
     if obj.is_gattling && entity.gattling.value() > 0 {
@@ -1167,11 +1213,15 @@ pub(super) fn gattling_idle(
     // Building Update43FE8E..43FEB8: after TechnoAI/mission and the first
     // Gattling step, exactly zero refills from the live type. No timer or
     // rearm mutation; Hospital/Armory retain their depleted count.
-    if !obj.hospital
-        && !obj.armory()
-        && let Some(ammo) = entity.ammo_mut()
-    {
-        ammo.refill_empty_from_type(obj.ammo);
+    // Ares 3.0 BuildingClass_Update_Reload (100478E0, hook 0x43FE8E) calls
+    // TechnoClass::Reload (vt+0x424) there instead, with its clock and
+    // `ReloadAmount`.
+    if refills {
+        if rules.ares() {
+            entity.reload_techno_ammo(obj, now, rules.ares());
+        } else if let Some(ammo) = entity.ammo_mut() {
+            ammo.refill_empty_from_type(obj.ammo);
+        }
     }
     if !obj.is_gattling {
         return;
@@ -1201,7 +1251,7 @@ fn fire_arm(
     rules: &RuleSet,
     target: TargetKind,
     weapon: i32,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
     bridge_state_changed: &mut bool,
 ) {
     //44B2BC..44B2F7: any nonzero count admits slot0 only. A hole falls
@@ -1235,7 +1285,7 @@ fn fire_arm(
                             },
                             rules,
                             ctx.overlay_registry,
-                            ctx.effects,
+                            &mut ctx.effects,
                         )
                         .bridge_state_changed;
                 }
@@ -1251,7 +1301,13 @@ fn fire_arm(
     else {
         return;
     };
-    if rules.is_prism_type(obj) {
+    if rules.ares() {
+        // Ares BuildingClass_Mi_Attack_IsPrism (100167E0, hook 0x44B2FE) takes
+        // the arm for a `PrismForwarding=` tower in place of the PrismType test.
+        if ares_prism_forwarding::mission_attack_prism(sim, id, rules, obj) {
+            return;
+        }
+    } else if rules.is_prism_type(obj) {
         prism_arm(sim, id, rules, obj);
         return;
     }
@@ -1284,7 +1340,7 @@ fn fire_arm(
                     },
                     rules,
                     ctx.overlay_registry,
-                    ctx.effects,
+                    &mut ctx.effects,
                 )
                 .bridge_state_changed;
         }
@@ -1310,7 +1366,7 @@ fn arm_delayed_fire(
     let Some(entity) = sim.substrate.entities.get_mut(id) else {
         return;
     };
-    entity.pending_building_fire.arm(delay, fire);
+    entity.building.pending_building_fire.arm(delay, fire);
     let damaged =
         requested_damage_state(entity.health, obj.strength, rules.general.condition_yellow);
     sim.clear_building_anim_slot(id, ACTIVE_ANIM_SLOT);
@@ -1341,7 +1397,7 @@ fn prism_arm(
     let Some(master) = sim.substrate.entities.get(id) else {
         return;
     };
-    let supporter = (master.prism_support_count.count() < rules.general.prism_support.max)
+    let supporter = (master.building.prism_support_count.count() < rules.general.prism_support.max)
         .then(|| prism_supporter(sim, id, rules, obj))
         .flatten();
     let Some(supporter) = supporter else {
@@ -1356,7 +1412,7 @@ fn prism_arm(
         return;
     };
     if let Some(master) = sim.substrate.entities.get_mut(id) {
-        master.prism_support_count.recruit();
+        master.building.prism_support_count.recruit();
     }
     // `vt+0xB0(out, 0, {0, 0, 0})` (`0x0044B4F6`): the master's weapon-0 FLH.
     let Some(master) = sim.substrate.entities.get(id) else {
@@ -1368,7 +1424,7 @@ fn prism_arm(
         &fire_coord::FireSource::of_entity(master),
         obj,
         0,
-        (master.weapon_burst.index() & 1) as u8,
+        (master.seldom.weapon_burst.index() & 1) as u8,
         crate::rules::flh::Flh::default(),
     )
     .coord;
@@ -1418,8 +1474,8 @@ fn prism_supporter(
         };
         let admitted = candidate.lifecycle.object_alive()
             && candidate.type_ref() == master.type_ref()
-            && candidate.rearm_timer.remaining(now) == 0
-            && candidate.pending_building_fire.remaining_ticks() == 0
+            && candidate.seldom.rearm_timer.remaining(now) == 0
+            && candidate.building.pending_building_fire.remaining_ticks() == 0
             && candidate.drain.draining_me().is_none()
             && candidate.mission.effective() != attack
             && candidate_id != id;
@@ -1460,22 +1516,48 @@ fn prism_supporter(
 ///   `+0x664 = 0` (`0x0044ACCA`) and the downtime: the rearm timer
 ///   becomes {Frame, `PrismSupportDelay=`} (`0x0044ACD0..0x0044ACDC`). No
 ///   check, damage or Scenario draw.
+///
+/// Ares replaces the whole body (`ares_prism_forwarding::update_prism`).
 pub(super) fn process_delayed_fire(
     sim: &mut Simulation,
     id: u64,
     rules: &RuleSet,
-    ctx: ObjectAiCtx<'_>,
+    ctx: &mut ObjectAiCtx<'_>,
     bridge_state_changed: &mut bool,
 ) {
-    let now = sim.session.binary_frame() as i32;
-    let Some(entity) = sim.substrate.entities.get_mut(id) else {
+    let Some(entity) = sim.substrate.entities.get(id) else {
         return;
     };
     // Health 0 returned before the call (`0x00440072`).
     if entity.death.is_dying() || entity.health.current() == 0 {
         return;
     }
-    let Some(fire) = entity.pending_building_fire.count_down() else {
+    if rules.ares() {
+        ares_prism_forwarding::update_prism(sim, id, rules, ctx, bridge_state_changed);
+    } else {
+        stock_delayed_fire(sim, id, rules, ctx, bridge_state_changed);
+    }
+}
+
+/// The stock body of [`process_delayed_fire`].
+fn stock_delayed_fire(
+    sim: &mut Simulation,
+    id: u64,
+    rules: &RuleSet,
+    ctx: &mut ObjectAiCtx<'_>,
+    bridge_state_changed: &mut bool,
+) {
+    let now = sim.session.binary_frame() as i32;
+    // Health 0 returned before the call (`0x00440072`), and an unarmed slot
+    // counts nothing.
+    let Some(entity) = sim.substrate.entities.get_mut_if(id, |entity| {
+        !entity.death.is_dying()
+            && entity.health.current() != 0
+            && entity.building.pending_building_fire.pending().is_some()
+    }) else {
+        return;
+    };
+    let Some(fire) = entity.building.pending_building_fire.count_down() else {
         return;
     };
     match fire {
@@ -1487,16 +1569,7 @@ pub(super) fn process_delayed_fire(
                 WeaponSlot::Primary => 0,
                 WeaponSlot::Secondary => 1,
             };
-            if fire_error_at(
-                sim,
-                rules,
-                id,
-                Some(target),
-                weapon,
-                true,
-                ctx.overlay_registry,
-            ) == FireError::Ok
-            {
+            if fire_error_at(sim, rules, id, Some(target), weapon, true) == FireError::Ok {
                 *bridge_state_changed |= sim
                     .commit_fire_visit(
                         crate::sim::combat::world_fire::FireVisit::Building {
@@ -1505,7 +1578,7 @@ pub(super) fn process_delayed_fire(
                         },
                         rules,
                         ctx.overlay_registry,
-                        ctx.effects,
+                        &mut ctx.effects,
                     )
                     .bridge_state_changed;
             }
@@ -1517,8 +1590,9 @@ pub(super) fn process_delayed_fire(
                 .entities
                 .get_mut(id)
                 .expect("live support source");
-            entity.prism_support_count.reset();
+            entity.building.prism_support_count.reset();
             entity
+                .seldom
                 .rearm_timer
                 .start(now, rules.general.prism_support.delay);
         }
@@ -1540,10 +1614,8 @@ fn support_multiplier(modifier: i32, count: i32) -> i32 {
 /// ReceiveDamage's retaliation block stops (`0x004429B4..0x004429E5`).
 pub(super) fn building_weapon0_aims(sim: &Simulation, rules: &RuleSet, id: u64) -> bool {
     weapon_at_index(sim, rules, id, 0).is_some_and(|weapon| {
-        !weapon
-            .projectile
-            .as_deref()
-            .and_then(|projectile| rules.projectile(projectile))
+        !rules
+            .weapon_projectile(weapon)
             .is_some_and(|projectile| projectile.aa)
     })
 }
@@ -1605,7 +1677,12 @@ fn aim_turret(sim: &mut Simulation, id: u64, rules: &RuleSet, target: TargetKind
 /// (`vt+0x3AC`, `0x006F7780`) is dropped; an aircraft only while it is low
 /// (`AircraftClass 0x0041B980`, the V3 and Dreadnought rockets asking their
 /// locomotor: [`crate::sim::movement::air_movement::is_low_flying`]).
-pub(super) fn range_drop(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: ObjectAiCtx<'_>) {
+pub(super) fn range_drop(
+    sim: &mut Simulation,
+    id: u64,
+    rules: &RuleSet,
+    ctx: &mut ObjectAiCtx<'_>,
+) {
     let Some(entity) = sim.substrate.entities.get(id) else {
         return;
     };
@@ -1617,7 +1694,7 @@ pub(super) fn range_drop(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: Ob
         return;
     };
     let weapon = select_weapon(sim, rules, id, Some(target));
-    if can_fire_at(sim, rules, id, target, weapon, ctx.overlay_registry) {
+    if can_fire_at(sim, rules, id, target, weapon) {
         return;
     }
     if let TargetKind::Entity(target_id) = target
@@ -1632,7 +1709,7 @@ pub(super) fn range_drop(sim: &mut Simulation, id: u64, rules: &RuleSet, ctx: Ob
     {
         return;
     }
-    let _ = sim.assign_target_represented(id, None, rules, ctx.overlay_registry, ctx.effects);
+    let _ = sim.assign_target_represented(id, None, rules, &mut ctx.effects);
 }
 
 impl Simulation {
@@ -1649,7 +1726,6 @@ impl Simulation {
         id: u64,
         requested: Option<TargetKind>,
         rules: &RuleSet,
-        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     ) -> bool {
         let Some(entity) = self.substrate.entities.get(id) else {
             return true;
@@ -1669,7 +1745,7 @@ impl Simulation {
             return true;
         }
         let weapon = select_weapon(self, rules, id, Some(target));
-        can_fire_at(self, rules, id, target, weapon, overlay_registry)
+        can_fire_at(self, rules, id, target, weapon)
     }
 
     /// The phase-level combat fixture's stand-in for a building's object-pass
@@ -1683,7 +1759,7 @@ impl Simulation {
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     ) {
-        let ctx = ObjectAiCtx {
+        let mut ctx = ObjectAiCtx {
             overlay_registry,
             ..Default::default()
         };
@@ -1693,9 +1769,9 @@ impl Simulation {
             .get(id)
             .is_some_and(|entity| entity.attack_target.target().is_some())
         {
-            let _ = mission_attack(self, id, rules, ctx, &mut false);
+            let _ = mission_attack(self, id, rules, &mut ctx, &mut false);
         }
-        process_delayed_fire(self, id, rules, ctx, &mut false);
+        process_delayed_fire(self, id, rules, &mut ctx, &mut false);
     }
 }
 
@@ -1704,46 +1780,57 @@ impl crate::sim::world::ObjectSubstrate {
     /// (`0x00450496..0x004504CD`): a building with a support count (`+0x664`)
     /// gives the bullet the [`support_multiplier`] of it (`+0x150`) and
     /// restarts the count; with none the bullet keeps Construct's
-    /// [`ProjectilePayload::UNSCALED`]. The live receiver asks it for a
+    /// [`ProjectilePayload::UNSCALED`](crate::sim::projectile::ProjectilePayload::UNSCALED). The live receiver asks it for a
     /// launched delayed shot only ([`BuildingShot::Delayed`]); FireAt's early
     /// exits and a refused launch return no bullet and keep the count.
+    ///
+    /// Ares BuildingClass_Update_Prism (100169A0) writes the reserves'
+    /// multiplier instead and clears them after the shot.
     pub(crate) fn take_support_bonus(&mut self, id: u64, rules: &RuleSet) -> i32 {
+        if rules.ares() {
+            self.ares_prism_shot_multiplier(id)
+        } else {
+            self.stock_support_bonus(id, rules)
+        }
+    }
+
+    fn stock_support_bonus(&mut self, id: u64, rules: &RuleSet) -> i32 {
         let Some(entity) = self.entities.get_mut(id) else {
             return ProjectilePayload::UNSCALED;
         };
-        let count = entity.prism_support_count.count();
+        let count = entity.building.prism_support_count.count();
         if count == 0 {
             return ProjectilePayload::UNSCALED;
         }
-        entity.prism_support_count.reset();
+        entity.building.prism_support_count.reset();
         support_multiplier(rules.general.prism_support.modifier, count)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "building_missions_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "prism_support_tests.rs"]
 mod prism_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "building_gattling_tests.rs"]
 mod gattling_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "building_construction_tests.rs"]
 mod construction_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "building_opening_oracle_tests.rs"]
 mod opening_oracle_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "factory_unload_tests.rs"]
 mod factory_unload_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "../../docking/building_repair_service_oracle_tests.rs"]
 mod repair_service_oracle_tests;

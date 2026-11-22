@@ -51,7 +51,7 @@ use crate::util::lepton::{BRIDGE_DECK_HEIGHT_LEPTONS, LEPTONS_PER_LEVEL};
 use crate::util::native_random::unit_draw_threshold;
 use crate::util::native_x87::{NativeF64Bits, X87Chop53};
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_debris_tests.rs"]
 mod debris_tests;
 
@@ -84,8 +84,7 @@ pub fn apply_bridge_damage_events(
         sim,
         rules,
         events,
-        None,
-        crate::sim::world::FrameEffects::default(),
+        &mut crate::sim::world::FrameEffects::default(),
     )
 }
 
@@ -93,16 +92,14 @@ pub(crate) fn apply_bridge_damage_events_with_overlay_registry(
     sim: &mut Simulation,
     rules: &RuleSet,
     events: &[BridgeDamageEvent],
-    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let mut collapsed = false;
     // Finish each event's existing callbacks before another event can enter
     // the live body driver. Otherwise its immediate fallout would overtake an
     // earlier event's still-pending direct/head fallout.
     for event in events {
-        collapsed |=
-            apply_one_bridge_damage_event(sim, rules, event, overlay_registry, frame_effects);
+        collapsed |= apply_one_bridge_damage_event(sim, rules, event, frame_effects);
     }
     collapsed
 }
@@ -119,7 +116,7 @@ pub(crate) fn damage_at_waypoint(
     rules: &RuleSet,
     waypoint: i32,
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> Option<bool> {
     use crate::sim::combat::{RAD_NO_ATTACKER, world_receiver::apply_area_damage};
     use crate::sim::projectile::ProjectileCoord;
@@ -147,7 +144,7 @@ pub(crate) fn damage_at_waypoint(
     if sim.session.waypoint_is_valid(waypoint)
         && let Some(cell) = sim.session.waypoint_cell(waypoint)
     {
-        let mut drivers = BridgeDamageDrivers::new(sim, rules, overlay_registry, frame_effects);
+        let mut drivers = BridgeDamageDrivers::new(sim, rules, frame_effects.reborrow());
         for _ in 0..4 {
             if drivers.apply_damage_to_cell(cell) {
                 break;
@@ -164,8 +161,7 @@ fn apply_one_bridge_damage_event(
     sim: &mut Simulation,
     rules: &RuleSet,
     event: &BridgeDamageEvent,
-    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let events = std::slice::from_ref(event);
 
@@ -176,14 +172,7 @@ fn apply_one_bridge_damage_event(
     };
 
     // Every driver publishes its cascade synchronously.
-    damage_dispatch::run(
-        sim,
-        events,
-        bridge_strength,
-        rules,
-        overlay_registry,
-        frame_effects,
-    )
+    damage_dispatch::run(sim, events, bridge_strength, rules, frame_effects)
 }
 
 /// Bridge-collapse dispatch from a `BridgeRepairHut` death event (C4 timer
@@ -220,8 +209,7 @@ pub(crate) fn dispatch_bridge_collapse_from_hut(
         sim,
         rules,
         hut_center,
-        None,
-        crate::sim::world::FrameEffects::default(),
+        &mut crate::sim::world::FrameEffects::default(),
     )
 }
 
@@ -229,8 +217,7 @@ pub(crate) fn dispatch_bridge_collapse_from_hut_with_overlay_registry(
     sim: &mut Simulation,
     rules: &RuleSet,
     hut_center: (u16, u16),
-    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let scan: Vec<(u16, u16)> = hut_destroy_5x5_scan(hut_center).collect();
     let family = choose_hut_bridge_family(sim, &scan);
@@ -238,15 +225,15 @@ pub(crate) fn dispatch_bridge_collapse_from_hut_with_overlay_registry(
         return false;
     }
     let seed_axis = find_destroy_overlay_seed(&|x, y| bridge_overlay_at(sim, x, y), &scan, family);
-    let mut host = BridgeDamageDrivers::new(sim, rules, overlay_registry, frame_effects);
+    let mut host = BridgeDamageDrivers::new(sim, rules, frame_effects.reborrow());
     let fallback = if let Some((rx, ry, axis)) = seed_axis {
         run_hut_collapse_bounded(&mut host, family, axis, rx, ry);
         HutFallbackExecution::default()
     } else {
         run_hut_fallback(&mut host, family, hut_center)
     };
-    let BridgeDamageDrivers { sim, collapsed, .. } = host;
-    finish_hut_fallback(sim, rules, fallback, overlay_registry, frame_effects) || collapsed
+    let collapsed = host.collapsed;
+    finish_hut_fallback(sim, rules, fallback, frame_effects) || collapsed
 }
 
 /// Engineer WhatAction's complete Map587410 admission. Each ordinary input
@@ -357,14 +344,12 @@ fn finish_hut_fallback(
     sim: &mut Simulation,
     rules: &RuleSet,
     extra: HutFallbackExecution,
-    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let rim_collapsed = extra.rim_cell.is_some_and(|ramp| {
         live_publication::update_adjacent_bridges(
             sim,
             rules,
-            overlay_registry,
             ramp,
             HutBridgeFamily::High,
             frame_effects,
@@ -775,14 +760,14 @@ pub(super) fn blow_up_bridge_cell_fallout(
     rx: u16,
     ry: u16,
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) {
     kill_ground_occupants_at(sim, rules, rx, ry, overlay_registry, frame_effects);
     drop_in_bridge_deck_entities(
         sim,
         rx,
         ry,
-        super::UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
+        super::UninitContext::new(rules).with_effects(frame_effects),
     );
     //47DDD5..47DE2B publishes after ground/deck receivers, before debris
     //draws/constructors. Direct callers also leave pending entries for save;
@@ -802,7 +787,7 @@ pub(super) fn kill_ground_occupants_at(
     rx: u16,
     ry: u16,
     overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) {
     ground_fallout::apply(sim, rules, overlay_registry, rx, ry, frame_effects);
 }
@@ -975,7 +960,7 @@ fn drop_in_bridge_deck_entities(
     sim: &mut Simulation,
     rx: u16,
     ry: u16,
-    context: super::UninitContext<'_>,
+    mut context: super::UninitContext<'_>,
 ) {
     use crate::sim::movement::locomotor::MovementLayer;
     let mut next = sim
@@ -989,11 +974,11 @@ fn drop_in_bridge_deck_entities(
             .occupancy
             .get(rx, ry)
             .and_then(|cell| cell.next_on_layer(MovementLayer::Bridge, id));
-        sim.drop_as_bomb(id, context);
+        sim.drop_as_bomb(id, context.reborrow());
     }
 }
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 mod tests {
     use super::*;
     use crate::map::bridge_facts::{BRIDGE_FLAG_DESTROYED_OR_RAMP, BRIDGE_FLAG_DIRECTION_ZERO};
@@ -1120,8 +1105,7 @@ mod tests {
             id,
             -8,
             crate::rules::ruleset::RuleSet::empty_for_test(),
-            None,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         ) {
             frames += 1;
             assert!(frames < 200, "the fall reaches the ground");
@@ -1143,12 +1127,13 @@ mod tests {
         let mut rules = crate::rules::ruleset::RuleSet::from_ini(&ini).expect("rules parse");
         let mut art = crate::rules::art_data::ArtRegistry::from_ini(
             &crate::rules::ini_parser::IniFile::from_str(
-                "[BRIDGEEXP1]\nTranslucent=yes\nReport=Explosion06\n\
-                 [BRIDGEEXP2]\nTranslucent=yes\nReport=Explosion07\n",
+                "[BRIDGEEXP1]\nTranslucent=yes\n[BRIDGEEXP2]\nTranslucent=yes\n",
             ),
         );
         art.bind_anim_frame_count_for_test("BRIDGEEXP1", 8);
         art.bind_anim_frame_count_for_test("BRIDGEEXP2", 8);
+        art.set_anim_sounds_for_test("BRIDGEEXP1", Some("Explosion06"), None);
+        art.set_anim_sounds_for_test("BRIDGEEXP2", Some("Explosion07"), None);
         rules.replace_art_registry_for_test(art);
         rules
     }
@@ -1351,8 +1336,7 @@ mod tests {
             &[event],
             bridge_strength,
             &rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
 
         assert_eq!(
@@ -1547,8 +1531,7 @@ mod tests {
                 simulation,
                 &resources.rules,
                 hut,
-                Some(&resources.overlay_registry),
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             );
             assert_eq!(
                 flags(simulation),
@@ -1671,7 +1654,7 @@ mod tests {
             5,
             5,
             None,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
 
         let retired = sim.substrate.entities.get(3).unwrap();
@@ -1697,6 +1680,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_deck_tests.rs"]
 mod deck_tests;

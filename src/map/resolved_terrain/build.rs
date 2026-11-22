@@ -251,28 +251,31 @@ impl ResolvedTerrainGrid {
             let mut grid = Self {
                 width: 0,
                 height: 0,
-                cells: Vec::new(),
+                cells: super::terrain_cells::TerrainCells::default(),
                 level_span: LevelSpan::of([]),
                 land_speed_costs: land_speed_cost_profiles(None),
-                overlay_passability: Vec::new(),
-                native_tmp_draw_heights: LookupMap::default(),
+                overlay_passability: Default::default(),
+                native_tmp_draw_heights: Default::default(),
                 shared_cell_dummy,
                 mutation_epoch: 0,
-                native_allocated: materialized_size_diamond.then(Vec::new),
-                radar_color_valid: Vec::new(),
-                damaged_radar_metadata: Vec::new(),
+                native_allocated: materialized_size_diamond.then(|| Vec::new().into()),
+                radar_color_valid: Default::default(),
+                damaged_radar_metadata: Default::default(),
                 tube_facts: Vec::new(),
                 native_tube_indices: Vec::new(),
                 tube_native_ids: Vec::new(),
                 clear_tile_id: 0,
                 water_tiles: crate::map::rmg::tiles::TileIds::from_keys(&Default::default()),
                 tile_registry_len: None,
+                tile_burrowing_permissions: None,
                 dummy_accepts_smudge: false,
                 high_bridge_rim_tiles: None,
                 bridge_set_start: None,
                 wood_bridge_set_start: None,
                 tile_animations: Vec::new(),
                 destroyable_cliff_catalog: None,
+                deformation_catalog: None,
+                deformation_enabled: false,
                 bridge_recalc_catalog: None,
                 allocation_caches: Default::default(),
             };
@@ -350,7 +353,8 @@ impl ResolvedTerrainGrid {
         let final_lookup: HashMap<(u16, u16), &MapCell> =
             final_cells.iter().map(|c| ((c.rx, c.ry), c)).collect();
 
-        let snow_theater = map.header.theater.eq_ignore_ascii_case("SNOW");
+        let snow_theater = crate::rules::object_image::ImageTheater::from_name(&map.header.theater)
+            == crate::rules::object_image::ImageTheater::Snow;
         let mut terrain_objects = HashMap::new();
         if projection.is_eager() {
             for obj in &map.terrain_objects {
@@ -740,7 +744,10 @@ impl ResolvedTerrainGrid {
         // The engine reaches cells through an anti-diagonal iterator, so the
         // animations are constructed in that order. The loop above is row-major,
         // so restore the sweep order here: the spawner then assigns animation
-        // identities the way a native load would.
+        // identities the way a native load would. On a Size at least two wide
+        // this is the allocated-cell walk's order
+        // (`map::playfield::SizeDiamond::allocated_cells`); only generated
+        // maps, which are at least four wide, spawn from this list.
         tile_animations.sort_by_key(|anim| (anim.rx as u32 + anim.ry as u32, anim.rx));
         if !tile_animations.is_empty() {
             log::info!(
@@ -959,27 +966,30 @@ impl ResolvedTerrainGrid {
             width,
             height,
             level_span: LevelSpan::of(cells.iter().map(|cell| cell.level)),
-            cells,
+            cells: super::terrain_cells::TerrainCells::new(cells),
             land_speed_costs: land_speed_cost_profiles(None),
-            overlay_passability: Vec::new(),
-            native_tmp_draw_heights: LookupMap::default(),
+            overlay_passability: Default::default(),
+            native_tmp_draw_heights: Default::default(),
             shared_cell_dummy,
             mutation_epoch: 0,
-            native_allocated,
-            radar_color_valid,
-            damaged_radar_metadata,
+            native_allocated: native_allocated.map(Into::into),
+            radar_color_valid: radar_color_valid.into(),
+            damaged_radar_metadata: damaged_radar_metadata.into(),
             tube_facts,
             native_tube_indices,
             tube_native_ids,
             clear_tile_id: 0,
             water_tiles: crate::map::rmg::tiles::TileIds::from_keys(&Default::default()),
             tile_registry_len: None,
+            tile_burrowing_permissions: None,
             dummy_accepts_smudge: false,
             high_bridge_rim_tiles: None,
             bridge_set_start: None,
             wood_bridge_set_start: None,
             tile_animations,
             destroyable_cliff_catalog: None,
+            deformation_catalog: None,
+            deformation_enabled: false,
             bridge_recalc_catalog: None,
             allocation_caches: Default::default(),
         };
@@ -1473,16 +1483,26 @@ pub(super) fn height_in_pixels_from_tmp(tile_height: u32, relative_extra_y: i32)
     Some((numerator / 15) as i8)
 }
 
+/// The last record of the 21-row ground slope tables.
+pub(super) const MAX_TMP_RAMP_TYPE: u8 = 20;
+
 pub(super) fn merge_tmp_metadata(metadata: &mut TileMetadata, tile: &TmpTile) {
     metadata.subtile_entry_valid = Some(true);
     metadata.raw_land_type = tile.terrain_type;
     metadata.land_type =
         crate::rules::terrain_rules::tmp_terrain_to_land_type(tile.terrain_type).as_index();
-    metadata.slope_type = tile.ramp_type;
+    // The slope tables hold 21 records (0..=20). gamemd indexes them with the
+    // raw byte and reads past the table for a larger one; VERA-only: such a
+    // tile (damaged or mod art) is flat ground.
+    metadata.slope_type = if tile.ramp_type <= MAX_TMP_RAMP_TYPE {
+        tile.ramp_type
+    } else {
+        0
+    };
     metadata.template_height = tile.height;
     metadata.render_offset_x = tile.offset_x;
     metadata.render_offset_y = tile.offset_y;
-    metadata.has_ramp = tile.ramp_type != 0;
+    metadata.has_ramp = metadata.slope_type != 0;
     metadata.has_tmp_metadata = true;
     metadata.radar_left = tile.radar_left;
     metadata.radar_right = tile.radar_right;
@@ -1675,30 +1695,42 @@ pub(super) fn materialize_map_load_cells(
         .unwrap_or(0);
     let mut cells = Vec::with_capacity(expected_count);
     let mut index_by_coord = HashMap::with_capacity(expected_count);
-    let last_sum = n + m * 2;
+    let mut allocate = |x: u32, y: u32, tile_index: i32, z: u8| {
+        let rx = u16::try_from(x).expect("validated Size diamond x fits u16");
+        let ry = u16::try_from(y).expect("validated Size diamond y fits u16");
+        index_by_coord.insert((rx, ry), cells.len());
+        cells.push(MapCell {
+            rx,
+            ry,
+            tile_index,
+            sub_tile: 0,
+            z,
+            // CellClass::Constructor47BBF0 writes zero at47BCFE before
+            // authored Pack5 records overwrite allocated cells.
+            legacy_ice_byte: 0,
+        });
+    };
 
-    // This sum-major form is the native iterator's anti-diagonal order: each
-    // diagonal advances x and retreats y, beginning at (1, Size.Width).
-    for sum in (n + 1)..=last_sum {
-        for rx in 0..=sum {
-            let ry = sum - rx;
-            if rx.abs_diff(ry) >= n {
-                continue;
-            }
-            let rx = u16::try_from(rx).expect("validated Size diamond x fits u16");
-            let ry = u16::try_from(ry).expect("validated Size diamond y fits u16");
-            let index = cells.len();
-            cells.push(MapCell {
-                rx,
-                ry,
-                tile_index: selector.draw_fill_tile_index(is_water, scenario_fill_ranged),
-                sub_tile: 0,
-                z: 0u8.wrapping_add(map.header.level as u8),
-                // CellClass::Constructor47BBF0 writes zero at47BCFE before
-                // authored Pack5 records overwrite allocated cells.
-                legacy_ice_byte: 0,
-            });
-            index_by_coord.insert((rx, ry), index);
+    // `MapClass::Resize @ 0x00565C10` has allocated every Size-diamond cell
+    // at level 0 (the call at 0x004ACF0D). The fill walk at
+    // 0x004ACF81..0x004ACFD6 then gives each cell `Next` returns one Scenario
+    // `RandomRanged` tile and adds the map's Level to its level.
+    let diamond = crate::map::playfield::SizeDiamond::from_size(n as i32, m as i32);
+    for (x, y) in diamond.allocated_cells() {
+        let tile_index = selector.draw_fill_tile_index(is_water, scenario_fill_ranged);
+        allocate(
+            x as u32,
+            y as u32,
+            tile_index,
+            0u8.wrapping_add(map.header.level as u8),
+        );
+    }
+    // On a Size one cell wide that walk ends after (1, 1), while Resize
+    // allocated the whole diagonal: its later cells keep the constructor's
+    // tile 0xFFFF (0x0047BC11) and level 0.
+    if n == 1 {
+        for k in 2..=m {
+            allocate(k, k, 0xFFFF, 0);
         }
     }
     debug_assert_eq!(cells.len(), expected_count);

@@ -2,6 +2,7 @@
 //! Destroy callbacks. Techno then reads their live consequences before its
 //! anger, delay-kill and survivor/death continuations.
 
+use super::receiver_call::ReceiverDamage;
 use super::*;
 use crate::sim::world::{FrameEffects, Simulation, UninitContext};
 
@@ -35,8 +36,8 @@ pub(super) struct ReceiverHealthCommit {
 struct ReceiverHealthHost<'world, 'input, 'effects> {
     world: &'world mut Simulation,
     event: &'input EntityDamageEvent,
+    caller_damage: &'input mut ReceiverDamage,
     rules: &'input RuleSet,
-    registry: Option<&'input OverlayTypeRegistry>,
     effects: FrameEffects<'effects>,
     execute_world_callbacks: bool,
     #[cfg(any(test, feature = "test-support"))]
@@ -63,17 +64,51 @@ impl super::object_health::ObjectHealthHost for ReceiverHealthHost<'_, '_, '_> {
     }
 
     fn write_damage(&mut self, damage: i32) {
-        if self.execute_world_callbacks
-            && let Some(writeback) = self.event.damage_writeback
-        {
-            writeback.write(self.world, self.rules, damage);
+        if self.execute_world_callbacks {
+            self.caller_damage.write(self.world, self.rules, damage);
         }
+    }
+
+    /// 10053A10 culls only without ignoreDefenses, with a warhead and an
+    /// attacker object; it passes the attacker without a Techno check. An
+    /// observation-only commit never draws, and neither does a game without
+    /// Ares, which never culls: the switch is asked before the warhead.
+    fn culls(&mut self) -> bool {
+        let event = self.event;
+        if !self.rules.ares()
+            || !self.execute_world_callbacks
+            || event.receiver_flags.ignore_defenses
+            || event.attacker_id == RAD_NO_ATTACKER
+        {
+            return false;
+        }
+        let rules = self.rules;
+        let Some(warhead) = self.world.interner.warhead_type(event.warhead_ref, rules) else {
+            return false;
+        };
+        let (Some(attacker), Some(victim), Some(strength)) = (
+            self.world.substrate.entities.get(event.attacker_id),
+            self.world.substrate.entities.get(event.target_id),
+            self.current_strength(),
+        ) else {
+            return false;
+        };
+        let (veterancy, health) = (attacker.veterancy.raw(), victim.health);
+        super::object_health::ares_can_cull(
+            warhead,
+            veterancy,
+            health,
+            strength,
+            rules.general.condition_red,
+            rules.general.condition_yellow,
+            &mut self.world.scenario_rng,
+        )
     }
 
     fn invoke(&mut self, callback: super::object_health::HealthCallback) {
         use super::object_health::HealthCallback;
         let id = self.event.target_id;
-        let context = UninitContext::new(self.rules, self.registry).with_effects(self.effects);
+        let context = UninitContext::new(self.rules).with_effects(&mut self.effects);
         match callback {
             //5F5486: a heal that changed Strength calls vt+148 Flash(7).
             HealthCallback::Changed => {
@@ -150,11 +185,11 @@ impl super::object_health::ObjectHealthHost for ReceiverHealthHost<'_, '_, '_> {
 
 pub(super) fn commit_receiver_health(
     event: &EntityDamageEvent,
+    caller_damage: &mut ReceiverDamage,
     world: &mut Simulation,
     rules: &RuleSet,
-    registry: Option<&OverlayTypeRegistry>,
     receiver_outcome: Option<ResolvedReceiveDamage>,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
     execute_world_callbacks: bool,
 ) -> Option<ReceiverHealthCommit> {
     let target_id = event.target_id;
@@ -236,9 +271,9 @@ pub(super) fn commit_receiver_health(
     let mut host = ReceiverHealthHost {
         world,
         event,
+        caller_damage,
         rules,
-        registry,
-        effects,
+        effects: effects.reborrow(),
         execute_world_callbacks,
         #[cfg(any(test, feature = "test-support"))]
         reached_exact_zero: false,
@@ -251,16 +286,19 @@ pub(super) fn commit_receiver_health(
         building_no_c4,
         rules.general.condition_red,
         attacker_id != RAD_NO_ATTACKER,
+        rules.ares(),
     );
     #[cfg(any(test, feature = "test-support"))]
     let reached_exact_zero = host.reached_exact_zero;
-    //End the adapter's exclusive borrow before the Techno continuation.
-    let world = host.world;
-    let final_packet = if receive_outcome.apply_object_damage {
+    // Techno701DF8 reads the caller's word after Object and its callbacks.
+    let final_packet = if execute_world_callbacks {
+        host.caller_damage.read(host.world, rules)
+    } else if receive_outcome.apply_object_damage {
         packet
     } else {
         receive_outcome.post_object_damage.unwrap_or(packet)
     };
+    let world = host.world;
     let reached_survivor_postlude = receive_outcome.reached_survivor_postlude;
     let live_source_owner = (attacker_id != RAD_NO_ATTACKER)
         .then(|| {
@@ -292,6 +330,9 @@ pub(super) fn commit_receiver_health(
                 victim_owner,
                 source_owner,
                 delta,
+                world.session.rule_policy(),
+                rules.ares_form(),
+                rules.general.ai_nearest_enemy,
             );
         }
         Some(delta)
@@ -374,6 +415,7 @@ pub(super) fn commit_receiver_health(
             )
         {
             target
+                .seldom
                 .radar_combat_flash
                 .start(binary_frame as i32, rules.general.radar_combat_flash_time);
         }

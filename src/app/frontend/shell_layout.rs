@@ -36,14 +36,26 @@ pub(crate) fn window_takes_fitted_shell(size: (u32, u32)) -> bool {
 }
 
 /// How much a menu's software cursor grows: with a fitted menu's art, by the
-/// same factor. An active-game shell draws its cursor in the match frame,
-/// which the match zoom scales instead.
+/// same factor, and half that in VERA's online lobby and its rooms, whose
+/// text is smaller. An active-game shell draws its cursor in the match
+/// frame, which the match zoom scales instead.
 pub(crate) fn menu_cursor_scale(state: &AppState) -> f32 {
-    if state.frontend.screen == crate::ui::game_screen::GameScreen::InGame || !fills_window(state) {
+    if state.frontend.screen == crate::ui::game_screen::GameScreen::InGame {
         return 1.0;
     }
-    let (width, height) = shell_screen_size(state);
-    crate::ui::shell::geom::ShellScale::from_screen(width as i32, height as i32).factor()
+    let fitted = if fills_window(state) {
+        let (width, height) = shell_screen_size(state);
+        crate::ui::shell::geom::ShellScale::from_screen(width as i32, height as i32).factor()
+    } else {
+        1.0
+    };
+    let route = state.frontend.shell_route;
+    let vera_online = (route.wol_lobby() && crate::app::shell_wol::lobby::modern_lobby(state))
+        || (route.network_setup() && {
+            let dialog = crate::app::shell_network_setup::dialog(state);
+            dialog.wol() && dialog.modern
+        });
+    if vera_online { fitted * 0.5 } else { fitted }
 }
 
 /// Main menu dialog `0xE2`.
@@ -56,13 +68,38 @@ pub(crate) fn main_menu_layout(state: &AppState) -> MainMenuShellLayout {
     }
 }
 
-/// Count-rule message boxes over the front-end shell use the same mapping for
-/// their art, labels and controller hit rectangles as the page beneath them.
+/// Front-end message boxes, including VERA's Esc menu, share their rendered
+/// button geometry with the pointer feed.
 pub(crate) fn shell_message_box_layout(
     state: &AppState,
     kind: crate::ui::shell::modal::ModalKind,
 ) -> crate::ui::shell::modal::MessageBoxLayout {
-    message_box_layout_for_screen(kind, shell_screen_size(state))
+    let size = shell_screen_size(state);
+    if kind == crate::ui::shell::modal::ModalKind::ThreeButton
+        && state
+            .frontend
+            .shell_message_box
+            .as_ref()
+            .is_some_and(|dialog| dialog.menu_settings().is_some())
+    {
+        return crate::ui::shell::modal::esc_menu_box_layout_on(
+            size.0 as i32,
+            size.1 as i32,
+            shell_scale_for_screen(size),
+        );
+    }
+    let layout = message_box_layout_for_screen(kind, size);
+    #[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+    if state
+        .frontend
+        .shell_message_box
+        .as_ref()
+        .is_some_and(|message| message.is_mod_import())
+    {
+        use crate::app::shell_mod_import;
+        return shell_mod_import::layout(layout, shell_mod_import::visible_parts(state).is_some());
+    }
+    layout
 }
 
 fn message_box_layout_for_screen(
@@ -71,6 +108,19 @@ fn message_box_layout_for_screen(
 ) -> crate::ui::shell::modal::MessageBoxLayout {
     let scale = shell_scale_for_screen(size);
     crate::ui::shell::modal::message_box_layout_on(kind, size.0 as i32, size.1 as i32, scale)
+}
+
+/// The settings in VERA's Esc menu, on its message box's mapping.
+pub(crate) fn shell_menu_settings_layout(
+    size: (u32, u32),
+    font: &crate::render::bit_font::BitFont,
+) -> crate::ui::main_menu_dialogs::options::shell::LauncherOptionsLayout {
+    crate::ui::main_menu_dialogs::options::shell::LauncherOptionsLayout::esc_menu(
+        size.0 as i32,
+        size.1 as i32,
+        shell_scale_for_screen(size),
+        |caption| font.text_width(caption),
+    )
 }
 
 pub(crate) fn shell_scale_for_screen(size: (u32, u32)) -> crate::ui::shell::geom::ShellScale {
@@ -88,13 +138,28 @@ pub(crate) fn menu_page_layout(state: &AppState, spec: &MenuPageSpec) -> MenuPag
     }
 }
 
-/// The skirmish dialog `0x102`, the page behind its modals.
+/// The skirmish dialog `0x102`, the page behind its modals, for the selected
+/// map's player rows: VERA's longer list past eight. The unscaled 640x480
+/// page has no room for it under its options, so there a longer list takes
+/// the scaled 800x600 page every other window size already gets.
 pub(crate) fn skirmish_layout(state: &AppState) -> SkirmishShellLayout {
+    use crate::ui::skirmish_shell::{
+        SKIRMISH_ROW_COUNT, compute_layout_for_rows, compute_responsive_layout_for_rows,
+        selected_player_rows,
+    };
     let (width, height) = (state.render_width(), state.render_height());
-    if fills_window(state) {
-        crate::ui::skirmish_shell::compute_responsive_layout(width, height)
+    let rows = selected_player_rows(
+        &state.frontend.skirmish_shell_state,
+        state.frontend.scenario_catalog.shell_maps(),
+    );
+    let layout = compute_layout_for_rows(width, height, rows);
+    if fills_window(state)
+        || (layout.shown_rows > SKIRMISH_ROW_COUNT
+            && layout.authored_width() < crate::ui::shell::geom::SHELL_BASE_W)
+    {
+        compute_responsive_layout_for_rows(width, height, rows)
     } else {
-        crate::ui::skirmish_shell::compute_layout(width, height)
+        layout
     }
 }
 
@@ -125,6 +190,16 @@ pub(crate) fn saved_seed_layout(state: &AppState, mode: SavedSeedMode) -> SavedS
         crate::ui::skirmish_shell::compute_responsive_saved_seed_layout(mode, width, height)
     } else {
         crate::ui::skirmish_shell::compute_saved_seed_layout(mode, width, height)
+    }
+}
+
+/// VERA's Skirmish Setups page, on the Save browser's rects.
+pub(crate) fn setups_layout(state: &AppState) -> SavedSeedLayout {
+    let (width, height) = (state.render_width(), state.render_height());
+    if fills_window(state) {
+        crate::ui::skirmish_shell::compute_responsive_setups_layout(width, height)
+    } else {
+        crate::ui::skirmish_shell::compute_setups_layout(width, height)
     }
 }
 
@@ -159,6 +234,16 @@ pub(crate) fn movie_list_layout(
         crate::ui::movies_credits_shell::compute_responsive_movie_list_layout(width, height)
     } else {
         crate::ui::movies_credits_shell::compute_movie_list_layout(width, height)
+    }
+}
+
+/// VERA's Mods page, behind the Mods button of Options.
+pub(crate) fn mods_layout(state: &AppState) -> crate::ui::mods_shell::ModsLayout {
+    let (width, height) = shell_screen_size(state);
+    if fills_window(state) {
+        crate::ui::mods_shell::compute_responsive_layout(width, height)
+    } else {
+        crate::ui::mods_shell::compute_layout(width, height)
     }
 }
 
@@ -225,7 +310,7 @@ pub(crate) fn keyboard_layout(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::window_takes_fitted_shell;
 

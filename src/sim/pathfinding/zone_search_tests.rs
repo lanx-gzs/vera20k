@@ -106,9 +106,7 @@ fn wrapper_rejection_precedes_the_marker_transaction() {
         ) -> Result<crate::util::native_x87::NativeF64Bits, String> {
             Ok(crate::util::native_x87::NativeF64Bits::POSITIVE_ZERO)
         }
-        fn prepare_search_markers(
-            &self,
-        ) -> Result<Option<(u8, std::cell::Ref<'_, SearchMarkerOverlay>)>, String> {
+        fn prepare_search_markers(&self) -> Result<Option<(u8, &SearchMarkerOverlay)>, String> {
             Err("reached429C1A".into())
         }
     }
@@ -278,16 +276,18 @@ fn caller_count_bridge_detour(
         start,
         MovementLayer::Ground,
         goal,
-        Some(HierarchyGate {
-            level0_zones: level0,
-            marked_level0: &precheck.marked[0],
-            blocker_neighbor_counts: &zero_counts,
-            level0_route: &precheck.paths[0],
-            progress: &Cell::new(RouteProgress {
+        Some((
+            HierarchyGate {
+                level0_zones: level0,
+                marked_level0: precheck.marked(0),
+                blocker_neighbor_counts: &zero_counts,
+                level0_route: precheck.route(0),
+            },
+            &mut RouteProgress {
                 index: 0,
                 cell: start,
-            }),
-        }),
+            },
+        )),
         Some(&terrain),
         None,
         MoverSearchFacts {
@@ -349,7 +349,7 @@ fn gsi_04_12_interaction_order_entry_threads_exact_blocker_counts() {
     }));
     sim.set_playfield_size_height_for_test(Some(4));
     sim.install_resolved_terrain_for_new_map(terrain);
-    sim.zone_grid = Some(zone_grid);
+    sim.zone_grid = Some(zone_grid.into());
     let engineer_id = sim
         .spawn_object("ENGINEER", "Americans", 1, 0, 0, &rules)
         .expect("engineer should spawn");
@@ -425,7 +425,6 @@ fn gsi_04_12_interaction_order_entry_threads_exact_blocker_counts() {
             target_cell,
             crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
             &rules,
-            None,
         )
         .expect("Capture target admission uses the live Building NavCom"),
         crate::sim::movement::infantry_entry::InfantryEntryClass::Clear
@@ -468,7 +467,6 @@ fn gsi_04_12_interaction_order_entry_threads_exact_blocker_counts() {
                     previous_cell: Some(terrain.native_cell_identity(previous)),
                 },
                 &rules,
-                None,
             )
             .expect("live Capture corridor admission"),
             0,
@@ -600,7 +598,7 @@ fn tube_hierarchy_gate_uses_raw_invalid_labels_and_goal_bridge_flag() {
     zones
         .map_mut(MovementZone::Normal)
         .unwrap()
-        .set_bridge_redirect(Some(vec![None, Some((0, 0)), None, None]));
+        .set_bridge_redirect(Some(vec![None, Some((0, 0)), None, None].into()));
     zones.set_hierarchy(level0_hierarchy(vec![1; 4], 2, 2, &[]));
     terrain.cell_mut_for_test(0, 0).unwrap().level = 4;
     {

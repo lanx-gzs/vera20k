@@ -207,7 +207,7 @@ fn deploy_mcv_on(
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default(),
+        &mut crate::sim::world::FrameEffects::default(),
     );
     let mcv_remains = sim.substrate.entities.get(mcv).is_some();
     (applied, mcv_remains, sim.sound_events.len())
@@ -267,7 +267,7 @@ fn deploy_then_undeploy_returns_the_mcv_to_its_original_cell() {
                 mcv,
                 &rules,
                 None,
-                crate::sim::world::FrameEffects::default()
+                &mut crate::sim::world::FrameEffects::default()
             ),
             "clear ConYard footprint should deploy"
         );
@@ -317,6 +317,49 @@ fn deploy_then_undeploy_returns_the_mcv_to_its_original_cell() {
     }
 }
 
+/// Deploy (`0x00739971..0x007399B2`) and Selling (`0x0044A0D4..0x0044A115`)
+/// copy the voice handle and latch (`+0x4DC..+0x4F4`) to the new object and
+/// empty the old one's, so its destructor (`0x006F4607`) cannot stop a line
+/// it was speaking: the hand-off is ordered ahead of the destruction.
+#[test]
+fn a_deploy_conversion_hands_the_voice_on_before_the_old_object_is_destroyed() {
+    fn voice_facts(sim: &Simulation) -> Vec<(u64, Option<u64>)> {
+        sim.sound_events
+            .iter()
+            .filter_map(|event| match event {
+                SimSoundEvent::UnitVoiceMoved { from, to } => Some((*from, Some(*to))),
+                SimSoundEvent::UnitVoiceDestroyed { owner } => Some((*owner, None)),
+                _ => None,
+            })
+            .collect()
+    }
+    let mut rules = make_mcv_rules();
+    rules.set_buildup_control_for_test("GACNST", [0, 29, 1]);
+    let mut sim = deploy_sim(&rules);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    add_house(&mut sim, "Americans", true);
+    let mcv = sim
+        .spawn_object("AMCV", "Americans", 20, 22, 128, &rules)
+        .expect("spawn MCV");
+    assert!(sim.deploy_mcv(
+        mcv,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default()
+    ));
+    tick_n(&mut sim, &rules, 60);
+    let yard = deployed_type(&sim, "GACNST").stable_id();
+    assert_eq!(voice_facts(&sim), [(mcv, Some(yard)), (mcv, None)]);
+
+    sim.sound_events.clear_for_test();
+    let undeploy = Command::UndeployBuilding { entity_id: yard };
+    assert!(sim.apply_command("Americans", &undeploy, Some(&rules)));
+    tick_n(&mut sim, &rules, 40);
+    let unit = deployed_type(&sim, "AMCV").stable_id();
+    assert_eq!(voice_facts(&sim), [(yard, Some(unit)), (yard, None)]);
+}
+
 /// A lit yard outside a campaign. Its Unlimbo skips the light block
 /// (`0x00440D4D..0x00440D54`), so its light first comes on as it opens
 /// (`0x004466D5..0x0044676C`), centred on its GetCoords (`0x00447AC0`, the
@@ -338,7 +381,7 @@ fn a_lit_yard_lights_as_it_opens_and_goes_dark_as_it_undeploys() {
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
     sim.flush_pending_delete();
     let yard = deployed_type(&sim, "GACNST").stable_id();
@@ -417,7 +460,7 @@ fn a_computer_mcv_deploys_into_a_yard_that_follows_the_native_deploy_route() {
             mcv,
             &rules,
             None,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         ));
         let yard = deployed_type(&sim, "GACNST");
         let id = yard.stable_id();
@@ -435,7 +478,11 @@ fn a_computer_mcv_deploys_into_a_yard_that_follows_the_native_deploy_route() {
         for frame in row["frames"].as_array().unwrap() {
             let now = deployed_at + frame["frame"].as_u64().unwrap() as u32;
             sim.session.set_binary_frame_for_test(now);
-            sim.object_ai_visit_one(id, Some(&rules), crate::sim::world::ObjectAiCtx::default());
+            sim.object_ai_visit_one(
+                id,
+                Some(&rules),
+                &mut crate::sim::world::ObjectAiCtx::default(),
+            );
             let yard = sim.substrate.entities.get(id).unwrap();
             if native_route::assert_frame(yard, frame, &format!("{name} frame {now}")) {
                 break;
@@ -463,7 +510,7 @@ fn deploy_mcv_accepts_mixed_height_clear_foundation() {
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default(),
+        &mut crate::sim::world::FrameEffects::default(),
     );
     assert!(
         applied,
@@ -523,7 +570,7 @@ Buildable=yes
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
 
     let entity = sim
@@ -595,7 +642,7 @@ fn a_computer_mcv_deploy_turns_the_computers_paranoid() {
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
     let allies = |name: &str| sim.house_alliances.as_map()[&name.to_ascii_uppercase()].clone();
     assert!(allies("Americans").contains("COMPUTER2"));
@@ -647,14 +694,14 @@ fn base_plan_recalc_deploy_generates_and_anchors_nonhuman_conyard() {
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
 
     let yard = deployed_type(&sim, "GACNST");
     assert_eq!((yard.position.rx(), yard.position.ry()), (19, 21));
     assert!(yard.building_up());
     assert!(
-        yard.ai_sell_repair.ai_repairable(),
+        yard.seldom.ai_sell_repair.ai_repairable(),
         "a computer's yard is AI-repairable"
     );
     let owner = sim.interner.get("Americans").unwrap();
@@ -690,7 +737,7 @@ fn a_damaged_computer_yard_starts_its_repair_as_its_build_up_completes() {
         .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     add_house(&mut sim, "Americans", false);
     let owner = sim.interner.get("Americans").unwrap();
-    let game_mode_nonzero = sim.session.game_mode_nonzero();
+    let policy = sim.session.rule_policy();
     let house = sim.houses.get_mut(&owner).unwrap();
     house.set_current_iq_for_test(5);
     // Scenario setup's SetDifficulty supplies the RepairDelay the latch timer
@@ -699,7 +746,7 @@ fn a_damaged_computer_yard_starts_its_repair_as_its_build_up_completes() {
         crate::sim::house_state::HouseDifficulty::Normal,
         &rules.general,
         Default::default(),
-        game_mode_nonzero,
+        policy,
         0,
         0,
     );
@@ -717,7 +764,7 @@ fn a_damaged_computer_yard_starts_its_repair_as_its_build_up_completes() {
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
     sim.flush_pending_delete();
     let yard = deployed_type(&sim, "GACNST").stable_id();
@@ -730,7 +777,7 @@ fn a_damaged_computer_yard_starts_its_repair_as_its_build_up_completes() {
         frames.push((
             frame,
             entity.building_up(),
-            entity.repairing.is_on(),
+            entity.building.repairing.is_on(),
             house.repair_start_latch(),
         ));
     }
@@ -748,10 +795,23 @@ fn a_damaged_computer_yard_starts_its_repair_as_its_build_up_completes() {
 }
 
 #[test]
-fn base_plan_recalc_deploy_skips_human_campaign_and_non_conyard_targets() {
-    let rules = make_recalc_mcv_rules("0,0,0");
+fn base_plan_recalc_deploy_respects_policy_human_control_and_nonyard_targets() {
+    use crate::sim::scenario_session::ScenarioGameMode;
 
-    for (is_human, game_mode_nonzero) in [(true, true), (false, false)] {
+    let rules = make_recalc_mcv_rules("0,0,0");
+    let campaign = ScenarioGameMode::from_game_mode(0);
+    let skirmish = ScenarioGameMode::from_game_mode(5);
+    let skirmish_rules = skirmish.stock_rule_policy(None);
+
+    for (is_human, mode, policy) in [
+        (true, skirmish, skirmish_rules),
+        (false, campaign, campaign.stock_rule_policy(None)),
+        (
+            false,
+            skirmish,
+            skirmish_rules.with_uses_managed_ai_base(false),
+        ),
+    ] {
         let mut sim = deploy_sim(&rules);
         add_house(&mut sim, "Americans", is_human);
         let owner = sim.interner.get("Americans").unwrap();
@@ -759,9 +819,7 @@ fn base_plan_recalc_deploy_skips_human_campaign_and_non_conyard_targets() {
             .get_mut(&owner)
             .unwrap()
             .set_ai_activation_for_test(SPLIT_AI_ACTIVATION);
-        sim.session.set_game_mode(
-            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(game_mode_nonzero),
-        );
+        sim.install_session_admission(mode, None, policy);
         sim.scenario_rng = crate::sim::rng::SimRng::new(0x5566_7788);
         let mcv = sim
             .spawn_object("AMCV", "Americans", 20, 22, 128, &rules)
@@ -773,13 +831,16 @@ fn base_plan_recalc_deploy_skips_human_campaign_and_non_conyard_targets() {
             mcv,
             &rules,
             None,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         ));
         assert!(deployed_type(&sim, "GACNST").building_up());
         // UnitClass::Deploy marks a computer's building AI-repairable in a
         // campaign too (`0x007397E4..0x007397F4`); Unlimbo does not there.
         assert_eq!(
-            deployed_type(&sim, "GACNST").ai_sell_repair.ai_repairable(),
+            deployed_type(&sim, "GACNST")
+                .seldom
+                .ai_sell_repair
+                .ai_repairable(),
             !is_human
         );
         let house = &sim.houses[&owner];
@@ -814,10 +875,15 @@ fn base_plan_recalc_deploy_skips_human_campaign_and_non_conyard_targets() {
         miner,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
     assert!(deployed_type(&sim, "YAREFN").building_up());
-    assert!(deployed_type(&sim, "YAREFN").ai_sell_repair.ai_repairable());
+    assert!(
+        deployed_type(&sim, "YAREFN")
+            .seldom
+            .ai_sell_repair
+            .ai_repairable()
+    );
     assert_eq!(sim.houses[&owner].base_center(), None);
     assert_eq!(sim.houses[&owner].base_plan_center(), (0, 0));
     assert!(sim.houses[&owner].base_plan().nodes().is_empty());
@@ -855,7 +921,7 @@ fn a_human_deploy_empties_the_base_cell_until_the_next_building_counts_the_yard(
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
     assert!(deployed_type(&sim, "GACNST").building_up());
     assert_eq!(sim.houses[&owner].base_center(), None);
@@ -903,7 +969,7 @@ fn base_plan_recalc_deploy_countryless_nonempty_plan_only_reanchors_node_zero() 
         mcv,
         &rules,
         None,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
     assert!(deployed_type(&sim, "GACNST").building_up());
     let house = &sim.houses[&owner];
@@ -953,7 +1019,12 @@ fn base_plan_recalc_deploy_failures_preserve_source_rng_plan_and_centers() {
         }
         let rng_before = sim.scenario_rng.state();
 
-        assert!(!sim.deploy_mcv(mcv, rules, None, crate::sim::world::FrameEffects::default()));
+        assert!(!sim.deploy_mcv(
+            mcv,
+            rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        ));
         assert!(!sim.substrate.entities.get(mcv).unwrap().death.is_dying());
         let house = &sim.houses[&owner];
         assert_eq!(house.base_center(), None);
@@ -1030,7 +1101,7 @@ UndeploysInto=SMIN
         .expect("spawn refinery");
     sim.session.game_options_mut_for_test().mcv_redeploy = false;
 
-    assert!(sim.can_undeploy_building_runtime(refinery, &rules));
+    assert!(sim.can_undeploy_building_runtime(refinery, false, &rules));
 }
 
 /// Reproduce only the prior state declared by an original execution row. These
@@ -1057,6 +1128,14 @@ fn native_deploy_rules(input: &serde_json::Value) -> RuleSet {
         .as_f64()
         .map(|frequency| format!("[AudioVisual]\nIdleActionFrequency={frequency}\n"))
         .unwrap_or_default();
+    // Ares 3.0 tests IsDesolator where the stock deploy shim tests
+    // ImmuneToRadiation (hooks 0x5215F9/0x52138C); a type other than DESO
+    // authors it from the row's immune bit so the executions keep their gate.
+    let desolator = if crate::rules::ares_switch::ares_way() && type_name != "DESO" {
+        format!("IsDesolator={}\n", input["immune"].as_i64().unwrap_or(0))
+    } else {
+        String::new()
+    };
     let ini = IniFile::from_str(&format!(
         "{idle_keys}[General]\nAIAutoDeployFrameDelay={delays}\n\
          [Guard]\nRate=0.1\n[Sticky]\nRate=0.1\n[Area Guard]\nRate=0.1\n[Move]\nRate=0.1\n\
@@ -1065,7 +1144,7 @@ fn native_deploy_rules(input: &serde_json::Value) -> RuleSet {
          Locomotor={{4A582744-9839-11D1-B709-00A024DDAFD1}}\n\
          Deployer={}\nDeployedCrushable={}\nDeployFire={}\nUndeployDelay={}\nImmuneToRadiation={}\n\
          SprayAttack={}\nDeploySound=GIDeploy\nUndeploySound=GIUndeploy\n\
-         {weapon_keys}\n\
+         {desolator}{weapon_keys}\n\
          [SUPPLIED0]\nAreaFire={}\n[SUPPLIED1]\nAreaFire={}\n",
         input["blockage_path_delay"].as_i64().unwrap_or(0),
         input["deployer"].as_i64().unwrap_or(1),
@@ -1157,7 +1236,7 @@ pub(crate) fn native_deploy_fixture(row: &serde_json::Value) -> (Simulation, Rul
         .unwrap(),
         &rules.general,
         Default::default(),
-        sim.session.game_mode_nonzero(),
+        sim.session.rule_policy(),
         0,
         0,
     );
@@ -1480,7 +1559,7 @@ fn guard_auto_deploy_reaches_the_native_action_from_infantry_ai() {
         })
         .unwrap();
     let (mut sim, rules, id) = native_deploy_fixture(row);
-    sim.object_ai_visit_one(id, Some(&rules), Default::default());
+    sim.object_ai_visit_one(id, Some(&rules), &mut Default::default());
     let actor = sim.substrate.entities.get(id).unwrap();
     assert_eq!(
         actor.mission_leaf.as_infantry().unwrap().doing(),
@@ -1510,13 +1589,13 @@ fn walk_stop_and_pending_callback_match_original_deployment_rows() {
         let (mut sim, rules, id) = native_deploy_fixture(row);
         let untouched = (sim.main_rng.logical_state(), sim.mapgen_rng.logical_state());
         if row["input"]["kind"] == "stop" {
-            sim.walk_stop_moving(id, &rules, crate::sim::world::FrameEffects::default())
+            sim.walk_stop_moving(id, &rules, &mut crate::sim::world::FrameEffects::default())
                 .unwrap();
         } else {
             sim.infantry_pending_deploy_stop_callback(
                 id,
                 &rules,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         }
@@ -1545,7 +1624,7 @@ fn deploy_completion_keeps_suffix_effects_when_next_action_refuses() {
     {
         let (mut sim, rules, id) = native_deploy_fixture(row);
         assert!(
-            !sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()),
+            !sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()),
             "deployment does not UnInit"
         );
         assert_native_deploy_state(&sim, id, row);
@@ -1599,14 +1678,20 @@ fn infantry_unload_full_original_handler_matches52_supplied_controls() {
             row["rng_streams_before"]["mapgen"].as_str().unwrap()
         );
         let result = sim
-            .infantry_mission_unload(id, &rules, crate::sim::world::FrameEffects::default())
+            .infantry_mission_unload(id, &rules, &mut crate::sim::world::FrameEffects::default())
             .unwrap();
-        assert_eq!(
-            result as u32,
-            row["return_eax"].as_u64().unwrap() as u32,
-            "{}: native return",
-            row["input"]
-        );
+        // Ares InfantryClass_Mi_Unload_Undeploy (1005CD20, hook 0x51F716):
+        // a Deployer's deployed arm (Doing 27..30) returns 1, not 450.
+        let input = &row["input"];
+        let deployed_arm = input["kind"] == "unload"
+            && input["deployer"].as_i64().unwrap_or(1) != 0
+            && (27..=30).contains(&input["doing"].as_i64().unwrap_or(-1));
+        let expected = if rules.ares() && deployed_arm {
+            1
+        } else {
+            row["return_eax"].as_u64().unwrap() as u32
+        };
+        assert_eq!(result as u32, expected, "{}: native return", row["input"]);
         assert_native_deploy_state(&sim, id, row);
     }
     assert_eq!(corpus.as_array().unwrap().len(), 52);
@@ -1622,7 +1707,7 @@ fn synchronized_deploy_queues_unload_before_handler_action_and_sound() {
     .unwrap();
     let (mut sim, rules, id) = native_deploy_fixture(&row[0]);
     let actor = sim.substrate.entities.get(id).unwrap();
-    let before_mission = actor.mission;
+    let before_mission = actor.mission.clone();
     let before_stage = serde_json::to_value(actor.native_stage()).unwrap();
     assert_eq!(before_mission.current().known(), Some(MissionType::Enter));
     assert!(sim.apply_command(
@@ -1808,11 +1893,11 @@ fn can_deploy_slash_unload_follows_each_class_arm() {
         .set_eater_for_test(Some(tank));
     assert!(!can(&sim, mcv));
     entity(&mut sim, mcv).parasite.set_eater_for_test(None);
-    entity(&mut sim, mcv).mind_control =
+    entity(&mut sim, mcv).seldom.mind_control =
         crate::sim::capture_manager::MindControlLink::controlled_by_for_test(tank);
     assert!(!can(&sim, mcv));
     // A mind-controlled unit deploying into anything else may.
-    entity(&mut sim, refiner).mind_control =
+    entity(&mut sim, refiner).seldom.mind_control =
         crate::sim::capture_manager::MindControlLink::controlled_by_for_test(tank);
     assert!(can(&sim, refiner));
 
@@ -1831,6 +1916,7 @@ fn can_deploy_slash_unload_follows_each_class_arm() {
         let soldier = entity(&mut sim, id);
         soldier.mission_leaf.set_infantry_doing_verified(0).unwrap();
         soldier
+            .seldom
             .rearm_timer
             .set_for_test(crate::sim::timer::CdTimer::started(frame, 40));
     }
@@ -1864,20 +1950,47 @@ fn a_chaos_drone_deploy_fires_its_weapon_at_its_own_cell() {
         entity.mission.queued().known(),
         Some(crate::sim::mission::MissionType::Unload)
     );
-    assert_eq!(entity.rearm_timer.duration(), 0);
+    assert_eq!(entity.seldom.rearm_timer.duration(), 0);
     assert_eq!(entity.attack_target.target(), None);
 
     let (delay, _) = sim.unit_deploy_fire_unload(
         drone,
         rules,
         None,
-        crate::sim::world::FrameEffects::default(),
+        &mut crate::sim::world::FrameEffects::default(),
     );
     let entity = sim.substrate.entities.get(drone).unwrap();
     assert!((14..=16).contains(&delay), "{delay}");
-    assert!(entity.rearm_timer.duration() > 0, "the arm fired");
+    assert!(entity.seldom.rearm_timer.duration() > 0, "the arm fired");
     assert_eq!(
         entity.attack_target.target(),
         Some(TargetKind::Cell(10, 10))
     );
+}
+
+/// Ares 3.0 TechnoClass_CanDeploySlashUnload_NoManualUnload (10049E70, hook
+/// 0x700EEC): a `NoManualUnload` transport outside a tank bunker refuses at
+/// the bridge test, though the stock transport arm admits it.
+#[test]
+fn ares_no_manual_unload_refuses_an_unbunkered_transport() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[VehicleTypes]\n0=LCRF\n1=SEALED\n[LCRF]\nPassengers=5\n\
+         [SEALED]\nPassengers=5\nNoManualUnload=yes\n",
+    ))
+    .expect("transport rules");
+    let mut sim = Simulation::new();
+    let owner = sim.interner.intern("Americans");
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, false, 0, 10,
+        ));
+    let open = sim
+        .spawn_object("LCRF", "Americans", 20, 22, 0, &rules)
+        .unwrap();
+    let sealed = sim
+        .spawn_object("SEALED", "Americans", 24, 22, 0, &rules)
+        .unwrap();
+    assert!(sim.can_deploy_slash_unload(open, &rules));
+    assert!(!sim.can_deploy_slash_unload(sealed, &rules));
 }

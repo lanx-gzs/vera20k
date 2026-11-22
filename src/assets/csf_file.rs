@@ -1,8 +1,8 @@
 //! CSF string table parser — localized text for RA2/YR UI, EVA, and menus.
 //!
 //! Active Yuri's Revenge initializes only `ra2md.csf` from the retail language
-//! archive stack. Optional Ares builds compose its supplemental tables through
-//! [`CsfFile::load_active`]. Each entry maps a label name (e.g., `"NAME:MTNK"`) to a
+//! archive stack. A game that ships `ares.mix` composes its supplemental tables
+//! through [`CsfFile::load_active`]. Each entry maps a label name (e.g., `"NAME:MTNK"`) to a
 //! Unicode display string (e.g., `"Grizzly Battle Tank"`).
 //!
 //! ## Binary format
@@ -13,6 +13,12 @@
 //! ## Dependency rules
 //! - Part of assets/ — no dependencies on game modules.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)
+)]
+
 use std::borrow::Cow;
 
 use crate::assets::error::AssetError;
@@ -20,9 +26,7 @@ use crate::util::lookup_hash::LookupMap;
 use crate::util::native_string::with_ascii_uppercase;
 use crate::util::read_helpers::read_u32_le;
 
-#[cfg(feature = "ares")]
 mod ares_labels;
-#[cfg(feature = "ares")]
 use ares_labels::{native_label_search, sort_labels as ares_sort_labels};
 
 /// Magic bytes for the file header: " FSC".
@@ -61,7 +65,6 @@ pub struct CsfFile {
 #[derive(Debug, Clone)]
 enum CsfEntries {
     Raw(LookupMap<String, Option<CsfText>>),
-    #[cfg(feature = "ares")]
     Ares(Vec<(String, Option<CsfText>)>),
 }
 
@@ -77,7 +80,21 @@ struct CsfText {
 impl CsfFile {
     /// Parse a CSF file from raw bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, AssetError> {
-        if data.len() < MIN_FILE_SIZE {
+        // +0x10 is reserved.
+        let (
+            Some(magic),
+            Some(version),
+            Some(label_count),
+            Some(string_count),
+            Some(stored_language),
+        ) = (
+            read_u32_le(data, 0),
+            read_u32_le(data, 4),
+            read_u32_le(data, 8),
+            read_u32_le(data, 12),
+            read_u32_le(data, 20),
+        )
+        else {
             return Err(AssetError::ParseError {
                 format: "CSF".to_string(),
                 detail: format!(
@@ -86,9 +103,8 @@ impl CsfFile {
                     MIN_FILE_SIZE
                 ),
             });
-        }
+        };
 
-        let magic: u32 = read_u32_le(data, 0);
         if magic != HEADER_MAGIC {
             return Err(AssetError::ParseError {
                 format: "CSF".to_string(),
@@ -99,22 +115,15 @@ impl CsfFile {
             });
         }
 
-        let version: u32 = read_u32_le(data, 4);
-        let label_count: u32 = read_u32_le(data, 8);
-        let string_count = read_u32_le(data, 12);
         if label_count == 0 || string_count == 0 {
             return Err(AssetError::ParseError {
                 format: "CSF".to_string(),
                 detail: "header label and string counts must both be nonzero".to_string(),
             });
         }
-        // +0x10 is reserved. Version 2+
-        // stores the language DWORD at +0x14; older tables force language 0.
-        let language = if version >= 2 {
-            read_u32_le(data, 20)
-        } else {
-            0
-        };
+        // Version 2+ stores the language DWORD at +0x14; older tables force
+        // language 0.
+        let language = if version >= 2 { stored_language } else { 0 };
 
         // The header counts are validated but are not the loop bound: retail
         // walks records until the next read/magic check fails. Bound the map
@@ -154,27 +163,28 @@ impl CsfFile {
 
     /// The process string table used by both the game and asset diagnostics.
     /// Stock YR loads the md table alone. Installed Ares6BD886->10060DF0
-    /// appends its fixed candidates; native controls: tools/rules_oracle/ares_csf.
+    /// appends its fixed candidates, for a game whose files take Ares' forms
+    /// (`ares`, `AssetManager::ships_ares`); native controls:
+    /// tools/rules_oracle/ares_csf.
     pub fn load_active<'a>(
+        ares: bool,
         mut lookup: impl FnMut(&str) -> Option<&'a [u8]>,
     ) -> Result<(Self, Vec<String>), AssetError> {
         let bytes = lookup("ra2md.csf").ok_or_else(|| AssetError::AssetNotFound {
             name: "ra2md.csf".to_string(),
         })?;
         let mut table = Self::from_bytes(bytes)?;
-        #[cfg(feature = "ares")]
-        {
-            let CsfEntries::Raw(entries) = table.entries else {
-                unreachable!("from_bytes returns a raw table")
-            };
+        let mut admitted = Vec::new();
+        if !ares {
+            return Ok((table, admitted));
+        }
+        if let CsfEntries::Raw(entries) = table.entries {
             let mut labels: Vec<_> = entries.into_iter().collect();
             // Base unique labels are sorted before the supplemental loader runs.
             // Their map iteration order cannot affect this unique-key order.
             ares_sort_labels(&mut labels);
             table.entries = CsfEntries::Ares(labels);
         }
-        let mut admitted = Vec::new();
-        #[cfg(feature = "ares")]
         for (name, ignore_language) in table.ares_candidates() {
             if let Some(bytes) = lookup(&name)
                 && table.append_ares(bytes, ignore_language)
@@ -182,13 +192,9 @@ impl CsfFile {
                 admitted.push(name);
             }
         }
-        // Keep the feature-OFF load route unchanged.
-        #[cfg(not(feature = "ares"))]
-        let _ = (&mut table, &mut admitted);
         Ok((table, admitted))
     }
 
-    #[cfg(feature = "ares")]
     fn ares_candidates(&self) -> impl Iterator<Item = (String, bool)> + use<> {
         // Original GetLanguage734640 table845678, descriptor+8. Ares
         //10060E13 uses "us" for an unknown language, not a host locale.
@@ -214,12 +220,17 @@ impl CsfFile {
 
     ///100608C0's admission is distinct from LoadFile's base-header checks:
     /// supplemental zero counts are valid, and the base language never changes.
-    #[cfg(feature = "ares")]
     fn append_ares(&mut self, data: &[u8], ignore_language: bool) -> bool {
-        if data.len() < MIN_FILE_SIZE
-            || read_u32_le(data, 0) != HEADER_MAGIC
-            || (read_u32_le(data, 4) as i32) < 2
-            || (!ignore_language && ![self.language, u32::MAX].contains(&read_u32_le(data, 20)))
+        let (Some(magic), Some(version), Some(language)) = (
+            read_u32_le(data, 0),
+            read_u32_le(data, 4),
+            read_u32_le(data, 20),
+        ) else {
+            return false;
+        };
+        if magic != HEADER_MAGIC
+            || (version as i32) < 2
+            || (!ignore_language && ![self.language, u32::MAX].contains(&language))
         {
             return false;
         }
@@ -294,7 +305,6 @@ impl CsfFile {
         with_ascii_uppercase(key, |key| {
             let loaded = match &self.entries {
                 CsfEntries::Raw(entries) => entries.get(key).and_then(Option::as_ref),
-                #[cfg(feature = "ares")]
                 CsfEntries::Ares(labels) => {
                     native_label_search(labels, key).and_then(|slot| labels[slot].1.as_ref())
                 }
@@ -318,7 +328,6 @@ impl CsfFile {
     pub fn len(&self) -> usize {
         match &self.entries {
             CsfEntries::Raw(entries) => entries.len(),
-            #[cfg(feature = "ares")]
             CsfEntries::Ares(labels) => labels.len(),
         }
     }
@@ -336,7 +345,6 @@ impl CsfFile {
                     .iter()
                     .filter_map(|(k, v)| v.as_ref().map(|v| (k.as_str(), v.value.as_str()))),
             ),
-            #[cfg(feature = "ares")]
             CsfEntries::Ares(labels) => Box::new(
                 labels
                     .iter()
@@ -442,12 +450,17 @@ pub fn format_csf(fmt: &str, args: &[CsfArg]) -> String {
 /// (`%02d` in `TXT_TIME_FORMAT_HOURS`). Anything else in the flag run is
 /// ignored, matching how the retail formats actually use it.
 fn push_padded_int(out: &mut String, flags: &[char], value: i64) {
+    /// Retail formats pad to two digits; a string table is outside data, and
+    /// `%0999999999999d` would otherwise push a terabyte of zeros.
+    const MAX_PAD_WIDTH: usize = 64;
     let zero_pad = flags.first() == Some(&'0');
     let width: usize = flags
         .iter()
         .skip(usize::from(zero_pad))
         .take_while(|c| c.is_ascii_digit())
-        .fold(0usize, |acc, c| acc * 10 + (*c as usize - '0' as usize));
+        .fold(0usize, |acc, c| {
+            (acc * 10 + (*c as usize - '0' as usize)).min(MAX_PAD_WIDTH)
+        });
     let digits = value.to_string();
     if digits.len() < width {
         let pad = if zero_pad { '0' } else { ' ' };
@@ -487,65 +500,47 @@ fn parse_label_entry(data: &[u8], offset: usize) -> Result<(String, CsfText, usi
 
 /// One header/value decoder serves base tables and in-place Ares overrides.
 fn parse_label_header(data: &[u8], offset: usize) -> Result<(String, u32, usize), ()> {
-    // Need at least 12 bytes: 4 (LBL magic) + 4 (pair count) + 4 (name length).
-    if offset + 12 > data.len() {
-        return Err(());
-    }
-
-    let magic: u32 = read_u32_le(data, offset);
-    if magic != LABEL_MAGIC {
-        return Err(());
-    }
-
-    let pair_count: u32 = read_u32_le(data, offset + 4);
-    let name_len: u32 = read_u32_le(data, offset + 8);
-    let name_start: usize = offset + 12;
-    let name_end: usize = name_start + name_len as usize;
-
-    if name_end > data.len() {
-        return Err(());
-    }
-
-    let label_name = crate::util::native_string::widen_bytes(&data[name_start..name_end]);
-
-    Ok((label_name, pair_count, name_end))
+    // 12 bytes, 4 (LBL magic) + 4 (pair count) + 4 (name length), then the
+    // name. A header or name the buffer does not hold is an error.
+    let header = || {
+        let rest = data.get(offset..)?;
+        if read_u32_le(rest, 0)? != LABEL_MAGIC {
+            return None;
+        }
+        let pair_count: u32 = read_u32_le(rest, 4)?;
+        let name_len = read_u32_le(rest, 8)? as usize;
+        let name = rest.get(12..)?.get(..name_len)?;
+        let label_name = crate::util::native_string::widen_bytes(name);
+        Some((label_name, pair_count, offset + 12 + name_len))
+    };
+    header().ok_or(())
 }
 
-fn parse_value(data: &[u8], mut pos: usize, stored_key: &str) -> Result<(CsfText, usize), ()> {
-    if pos + 8 > data.len() {
-        return Err(());
-    }
-
-    let str_magic: u32 = read_u32_le(data, pos);
-    let has_extra = str_magic == STRING_EXTRA_MAGIC;
-
-    if str_magic != STRING_MAGIC && str_magic != STRING_EXTRA_MAGIC {
-        return Err(());
-    }
-
-    let char_count: u32 = read_u32_le(data, pos + 4);
-    let byte_count: usize = char_count as usize * 2; // UTF-16-LE: 2 bytes per char.
-    pos += 8;
-
-    if pos + byte_count > data.len() {
-        return Err(());
-    }
-
-    let value = decode_csf_string(&data[pos..pos + byte_count], stored_key);
-    pos += byte_count;
-
-    // Skip the extra value if present (used for audio cue names, not display text).
-    if has_extra {
-        if pos + 4 > data.len() {
-            return Err(());
+fn parse_value(data: &[u8], pos: usize, stored_key: &str) -> Result<(CsfText, usize), ()> {
+    let value = || {
+        let rest = data.get(pos..)?;
+        let str_magic: u32 = read_u32_le(rest, 0)?;
+        let has_extra = str_magic == STRING_EXTRA_MAGIC;
+        if str_magic != STRING_MAGIC && str_magic != STRING_EXTRA_MAGIC {
+            return None;
         }
-        let extra_len: u32 = read_u32_le(data, pos);
-        pos += 4 + extra_len as usize;
-        if pos > data.len() {
-            return Err(());
+
+        // UTF-16-LE: 2 bytes per char.
+        let byte_count = (read_u32_le(rest, 4)? as usize).checked_mul(2)?;
+        let text = rest.get(8..)?.get(..byte_count)?;
+        let mut next = pos + 8 + byte_count;
+
+        // Skip the extra value if present (used for audio cue names, not display text).
+        if has_extra {
+            let extra_len = read_u32_le(data, next)? as usize;
+            next = next.checked_add(4)?.checked_add(extra_len)?;
+            if next > data.len() {
+                return None;
+            }
         }
-    }
-    Ok((value, pos))
+        Some((decode_csf_string(text, stored_key), next))
+    };
+    value().ok_or(())
 }
 
 /// Decode a CSF-encoded string: bitwise-NOT each byte, interpret as UTF-16-LE,
@@ -649,6 +644,13 @@ fn build_test_csf(label: &str, value: &str) -> Vec<u8> {
 }
 
 /// Authored localization fixture using the CSF owner's binary encoder.
+#[cfg_attr(
+    not(test),
+    expect(
+        clippy::unwrap_used,
+        reason = "a test fixture: a bad fixture is a bug in the test that built it"
+    )
+)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn test_csf(entries: &[(&str, &str)]) -> CsfFile {
     assert!(!entries.is_empty());
@@ -662,10 +664,9 @@ pub fn test_csf(entries: &[(&str, &str)]) -> CsfFile {
     CsfFile::from_bytes(&data).unwrap()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::*;
-    #[cfg(feature = "ares")]
     use std::collections::HashMap;
 
     #[test]
@@ -683,12 +684,10 @@ mod tests {
         let parsed = CsfFile::from_bytes(&data).expect("parse walks until reads fail");
         match parsed.entries {
             CsfEntries::Raw(entries) => assert!(entries.is_empty()),
-            #[cfg(feature = "ares")]
             CsfEntries::Ares(entries) => assert!(entries.is_empty()),
         }
     }
 
-    #[cfg(feature = "ares")]
     fn supplemental_fixture(
         entries: &[(&str, &str)],
         language: u32,
@@ -710,36 +709,27 @@ mod tests {
     fn active_csf_profile_uses_shared_base_and_optional_supplements() {
         let base = build_test_csf("A", "base");
         let extra = build_test_csf("A", "extra");
-        let mut requested = Vec::new();
-        let (table, admitted) = CsfFile::load_active(|name| {
-            requested.push(name.to_string());
-            match name {
-                "ra2md.csf" => Some(base.as_slice()),
-                "stringtable00.csf" => Some(extra.as_slice()),
-                _ => None,
-            }
-        })
-        .unwrap();
-        assert_eq!(
-            table.get("a"),
-            Some(if cfg!(feature = "ares") {
-                "extra"
-            } else {
-                "base"
+        for ares in [false, true] {
+            let mut requested = Vec::new();
+            let (table, admitted) = CsfFile::load_active(ares, |name| {
+                requested.push(name.to_string());
+                match name {
+                    "ra2md.csf" => Some(base.as_slice()),
+                    "stringtable00.csf" => Some(extra.as_slice()),
+                    _ => None,
+                }
             })
-        );
-        assert_eq!(admitted.len(), usize::from(cfg!(feature = "ares")));
-        assert_eq!(
-            requested.len(),
-            if cfg!(feature = "ares") { 103 } else { 1 }
-        );
-        assert!(
-            CsfFile::load_active(|_| None).is_err(),
-            "base table is required in both profiles"
-        );
+            .unwrap();
+            assert_eq!(table.get("a"), Some(if ares { "extra" } else { "base" }));
+            assert_eq!(admitted.len(), usize::from(ares));
+            assert_eq!(requested.len(), if ares { 103 } else { 1 });
+            assert!(
+                CsfFile::load_active(ares, |_| None).is_err(),
+                "base table is required in both profiles"
+            );
+        }
     }
 
-    #[cfg(feature = "ares")]
     #[test]
     fn supplemental_csf_three_native_histories_preserve_order_gates_and_partial_writes() {
         let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
@@ -789,7 +779,7 @@ mod tests {
                 supplemental_fixture(&[("A", "base"), ("KEEP", "keep")], 0, 3, 2),
             );
             let mut requested = Vec::new();
-            let (table, admitted) = CsfFile::load_active(|name| {
+            let (table, admitted) = CsfFile::load_active(true, |name| {
                 if name != "ra2md.csf" {
                     requested.push(name.to_string());
                 }
@@ -807,7 +797,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "ares")]
     #[test]
     fn supplemental_unique_records_match_native_ordered_slots_and_lookup() {
         let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
@@ -826,7 +815,7 @@ mod tests {
             };
             let base = fixture(&row["base"]);
             let extra = fixture(&row["supplemental"]);
-            let (table, _) = CsfFile::load_active(|name| match name {
+            let (table, _) = CsfFile::load_active(true, |name| match name {
                 "ra2md.csf" => Some(base.as_slice()),
                 "stringtable00.csf" => Some(extra.as_slice()),
                 _ => None,
@@ -897,6 +886,13 @@ mod tests {
         // The engine's wide call sites carry %hs / %ls.
         assert_eq!(format_csf("%hs", &[CsfArg::Str("ok")]), "ok");
         assert_eq!(format_csf("%ls", &[CsfArg::Str("ok")]), "ok");
+    }
+
+    #[test]
+    fn format_csf_caps_a_hostile_pad_width() {
+        let out = format_csf("%0999999999999d", &[CsfArg::Int(5)]);
+        assert_eq!(out.len(), 64, "{out}");
+        assert!(out.ends_with('5') && out.starts_with("000"), "{out}");
     }
 
     #[test]

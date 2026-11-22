@@ -241,7 +241,16 @@ fn gsi_13_06_counter_suppressions_hold_the_persistent_value() {
 
     for (name, mut entity) in variants {
         entity.body_frame_counter.set_for_test(17);
-        tick_foot_body_frame_counter(&mut entity, speed.rules(), cadence, false, false, None, 1);
+        tick_foot_body_frame_counter(
+            &mut entity,
+            speed.rules(),
+            cadence,
+            false,
+            false,
+            0,
+            None,
+            1,
+        );
         assert_eq!(entity.body_frame_counter.get(), 17, "{name}");
     }
 }
@@ -274,6 +283,7 @@ fn gsi_13_06_positive_fraction_below_get_current_speed_threshold_is_idle() {
             },
             false,
             false,
+            0,
             None,
             1,
         );
@@ -421,7 +431,7 @@ fn gsi_13_06_dlph_sqd_and_dron_draw_from_native_counter_blocks() {
         },
     );
     assert_eq!(
-        resolve_shp_vehicle_body_frame(&dlph, 0, 7, -1, false, false),
+        resolve_shp_vehicle_body_frame(&dlph, 0, 7, -1, -1, false, false),
         Some(7),
         "idle Dolphin uses walk/swim slot 1 and counter 7 % 6"
     );
@@ -435,19 +445,19 @@ fn gsi_13_06_dlph_sqd_and_dron_draw_from_native_counter_blocks() {
         },
     );
     assert_eq!(
-        resolve_shp_vehicle_body_frame(&sqd, 0, 3, -1, false, false),
+        resolve_shp_vehicle_body_frame(&sqd, 0, 3, -1, -1, false, false),
         Some(23),
         "idle Squid uses walk/swim slot 1 and counter 3"
     );
 
     let dron = gsi_13_06_shp_set(6, 48, FootBodyCadence::native_defaults());
     assert_eq!(
-        resolve_shp_vehicle_body_frame(&dron, 0, 99, -1, false, false),
+        resolve_shp_vehicle_body_frame(&dron, 0, 99, -1, -1, false, false),
         Some(49),
         "idle Terror Drone with IdleRate=0 uses standing slot 1"
     );
     assert_eq!(
-        resolve_shp_vehicle_body_frame(&dron, 0, 7, -1, true, false),
+        resolve_shp_vehicle_body_frame(&dron, 0, 7, -1, -1, true, false),
         Some(7),
         "moving Terror Drone uses counter 7 % 6"
     );
@@ -498,7 +508,7 @@ fn retail_drone_firing_counter_and_frames_match_original() {
         .enumerate()
     {
         assert_eq!(
-            resolve_shp_vehicle_body_frame(set, facing as u8, 0, 7, false, false),
+            resolve_shp_vehicle_body_frame(set, facing as u8, 0, 7, -1, false, false),
             Some(u16::try_from(expected.as_u64().unwrap()).unwrap()),
             "native DRON first firing image, facing {facing}"
         );
@@ -507,12 +517,63 @@ fn retail_drone_firing_counter_and_frames_match_original() {
         let facing = u8::try_from(row["facing"].as_u64().unwrap()).unwrap();
         for (step, expected) in row["frames"].as_array().unwrap().iter().enumerate() {
             assert_eq!(
-                resolve_shp_vehicle_body_frame(set, facing, 99, 7 - step as i32, true, false),
+                resolve_shp_vehicle_body_frame(set, facing, 99, 7 - step as i32, -1, true, false),
                 Some(u16::try_from(expected.as_u64().unwrap()).unwrap()),
                 "firing precedes moving body: facing {facing}, step {step}"
             );
         }
     }
+}
+
+/// The frame-end step walks the store's slots: no entity is looked up by id,
+/// the infantry and buildings beside an SHP unit are never handed out, and
+/// the unit's sequence steps as before.
+#[test]
+fn the_frame_end_step_reads_only_units_and_aircraft() {
+    use crate::map::entities::EntityCategory;
+    let mut interner = StringInterner::new();
+    let kind = interner.intern("DRON");
+    let mut store = crate::sim::entity_store::EntityStore::new();
+    let mut add = |id: u64, category| {
+        let mut entity =
+            GameEntity::test_default_of_category(id, "DRON", "Americans", 4, 4, category);
+        entity.set_type_ref_for_test(kind);
+        if category == EntityCategory::Unit {
+            entity.animation = Some(Animation::new(SequenceKind::Walk));
+        }
+        store.insert(entity);
+    };
+    for id in 1..=6 {
+        add(id, EntityCategory::Infantry);
+    }
+    for id in 7..=9 {
+        add(id, EntityCategory::Structure);
+    }
+    add(10, EntityCategory::Unit);
+    let mut set = SequenceSet::new();
+    set.insert(SequenceKind::Walk, test_def(0, 6, 8, 1, LoopMode::Loop));
+    let sequences = std::collections::BTreeMap::from([("DRON".to_string(), set)]);
+
+    let (before, _) = store.lookups();
+    let handed_out = store.hand_outs();
+    tick_non_dying_animations(
+        &mut store,
+        &sequences,
+        RuleSet::empty_for_test(),
+        &GameOptions::default(),
+        &interner,
+        1,
+    );
+    let (after, _) = store.lookups();
+
+    assert_eq!(after - before, 0, "no entity is looked up by id");
+    assert_eq!(
+        store.hand_outs() - handed_out,
+        1,
+        "only the unit is handed out"
+    );
+    let unit = store.get(10).unwrap();
+    assert_eq!(unit.animation.as_ref().unwrap().frame_index(), 1);
 }
 
 // --- advance_animation tests ---
@@ -645,7 +706,7 @@ fn infantry_action_fixture_with(
             0,
             0,
             &rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .unwrap();
     sim.substrate
@@ -660,7 +721,7 @@ fn infantry_action_fixture_with(
             0,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -715,7 +776,12 @@ fn assert_infantry_pose(
 fn infantry_limbo_stops_walk_animation_and_resets_water_state() {
     let (mut sim, rules, id) = infantry_action_fixture(Some("S"));
     set_infantry_walk_motion(&mut sim, id, true);
-    sim.infantry_movement_actions(id, &rules, None, crate::sim::world::FrameEffects::default());
+    sim.infantry_movement_actions(
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_infantry_pose(&sim, id, 3, SequenceKind::Walk, 0);
     let actor = sim.substrate.entities.get_mut(id).unwrap();
     actor.mission_leaf.install_infantry_water_state_fixture(1);
@@ -736,14 +802,24 @@ fn infantry_limbo_stops_walk_animation_and_resets_water_state() {
 fn infantry_stopped_walk_returns_to_ready_through_class_action() {
     let (mut sim, rules, id) = infantry_action_fixture(Some("S"));
     set_infantry_walk_motion(&mut sim, id, true);
-    sim.infantry_movement_actions(id, &rules, None, crate::sim::world::FrameEffects::default());
+    sim.infantry_movement_actions(
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     sim.substrate
         .entities
         .get_mut(id)
         .unwrap()
         .set_native_stage_value(3);
     set_infantry_walk_motion(&mut sim, id, false);
-    sim.infantry_movement_actions(id, &rules, None, crate::sim::world::FrameEffects::default());
+    sim.infantry_movement_actions(
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_infantry_pose(&sim, id, 0, SequenceKind::Stand, 0);
 }
 
@@ -751,7 +827,12 @@ fn infantry_stopped_walk_returns_to_ready_through_class_action() {
 fn infantry_walk_stage_uses_absolute_frames_and_presentation_leaves_it_alone() {
     let (mut sim, rules, id) = infantry_action_fixture(Some("S"));
     set_infantry_walk_motion(&mut sim, id, true);
-    sim.infantry_movement_actions(id, &rules, None, crate::sim::world::FrameEffects::default());
+    sim.infantry_movement_actions(
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(
         sim.substrate
             .entities
@@ -807,7 +888,7 @@ fn presentation_preserves_infantry_fire_action_latch_and_signed_stage() {
             4,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -847,7 +928,7 @@ fn gsi_05_07_idle_completion_snaps_current_hint_before_ready_dispatch() {
             9,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -856,7 +937,7 @@ fn gsi_05_07_idle_completion_snaps_current_hint_before_ready_dispatch() {
         .get_mut(id)
         .unwrap()
         .set_native_stage_value(15);
-    assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(!sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     assert_infantry_pose(&sim, id, 0, SequenceKind::Stand, 0);
     let body = sim.substrate.entities.get(id).unwrap().body_facing;
     assert_eq!(body.destination(), 0x8000);
@@ -876,7 +957,7 @@ fn gsi_05_07_unhinted_completion_preserves_body_facing() {
             9,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -885,7 +966,7 @@ fn gsi_05_07_unhinted_completion_preserves_body_facing() {
         .get_mut(id)
         .unwrap()
         .set_native_stage_value(15);
-    assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(!sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     assert_infantry_pose(&sim, id, 0, SequenceKind::Stand, 0);
     let body = sim.substrate.entities.get(id).unwrap().body_facing;
     assert_eq!(body.destination(), 0x2000);
@@ -916,7 +997,11 @@ fn sequence_sound_plays_on_its_stage_frame_after_a_step() {
             1,
         ));
         sim.sound_events.clear_for_test();
-        assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+        assert!(!sim.infantry_sequencer(
+            id,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default()
+        ));
         sim.sound_events.as_slice().to_vec()
     };
     let played = run(&mut sim, 2, 1);
@@ -934,7 +1019,7 @@ fn sequence_sound_plays_on_its_stage_frame_after_a_step() {
     else {
         panic!("PlayAt is a located Voc request: {played:?}");
     };
-    assert_eq!(sound_id, "SlaveAttack");
+    assert_eq!(sound_id.name_in(&rules), "SlaveAttack");
     assert_eq!(*audible_to, None);
     assert_eq!(
         (*rx, *ry, *sub_x, *sub_y),
@@ -1033,7 +1118,7 @@ fn layered_slave_sequence_keeps_runtime_frames_and_sound_in_one_bank() {
             0,
             0,
             &rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .unwrap();
     sim.substrate
@@ -1048,7 +1133,7 @@ fn layered_slave_sequence_keeps_runtime_frames_and_sound_in_one_bank() {
             3,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -1065,12 +1150,12 @@ fn layered_slave_sequence_keeps_runtime_frames_and_sound_in_one_bank() {
             1,
         ));
     sim.sound_events.clear_for_test();
-    assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(!sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     let actor = sim.substrate.entities.get(id).unwrap();
     assert_eq!(actor.infantry_sprite_pose(), Some((3, 8)));
     assert_eq!(resolve_shp_frame(walk, 224, 8), 102);
     assert!(
-        matches!(sim.sound_events.as_slice(), [crate::sim::world::SimSoundEvent::VocAt { sound_id, .. }] if sound_id == "SlaveAttack")
+        matches!(sim.sound_events.as_slice(), [crate::sim::world::SimSoundEvent::VocAt { sound_id, .. }] if sound_id.name_in(&rules) == "SlaveAttack")
     );
 }
 
@@ -1095,7 +1180,11 @@ fn walk_sequence_sound_plays_once_per_cycle_of_stage_steps() {
     for now in 1..=14 {
         let actor = sim.substrate.entities.get_mut(id).unwrap();
         assert!(actor.tick_native_stage(now));
-        assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+        assert!(!sim.infantry_sequencer(
+            id,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default()
+        ));
         let actor = sim.substrate.entities.get(id).unwrap();
         assert_eq!(actor.mission_leaf.as_infantry().unwrap().doing(), 3);
         for _ in sim.sound_events.take_for_test() {
@@ -1122,16 +1211,26 @@ fn infantry_prone_state_drives_prone_crawl_and_fireprone_actions() {
             2,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
     assert_infantry_pose(&sim, id, 2, SequenceKind::Prone, 0);
     set_infantry_walk_motion(&mut sim, id, true);
-    sim.infantry_movement_actions(id, &rules, None, crate::sim::world::FrameEffects::default());
+    sim.infantry_movement_actions(
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_infantry_pose(&sim, id, 6, SequenceKind::Crawl, 0);
     set_infantry_walk_motion(&mut sim, id, false);
-    sim.infantry_movement_actions(id, &rules, None, crate::sim::world::FrameEffects::default());
+    sim.infantry_movement_actions(
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_infantry_pose(&sim, id, 2, SequenceKind::Prone, 0);
     assert!(
         sim.infantry_do_action(
@@ -1139,7 +1238,7 @@ fn infantry_prone_state_drives_prone_crawl_and_fireprone_actions() {
             8,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -1165,7 +1264,7 @@ fn infantry_down_and_up_remain_uninterruptible_until_sequence_completion() {
             5,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -1185,7 +1284,7 @@ fn infantry_down_and_up_remain_uninterruptible_until_sequence_completion() {
             3,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -1194,14 +1293,14 @@ fn infantry_down_and_up_remain_uninterruptible_until_sequence_completion() {
         .get_mut(id)
         .unwrap()
         .set_native_stage_value(1);
-    assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(!sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     assert_infantry_pose(&sim, id, 5, SequenceKind::Down, 1);
     sim.substrate
         .entities
         .get_mut(id)
         .unwrap()
         .set_native_stage_value(2);
-    assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(!sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     assert_infantry_pose(&sim, id, 2, SequenceKind::Prone, 0);
 
     assert!(
@@ -1210,7 +1309,7 @@ fn infantry_down_and_up_remain_uninterruptible_until_sequence_completion() {
             7,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -1230,7 +1329,7 @@ fn infantry_down_and_up_remain_uninterruptible_until_sequence_completion() {
             3,
             false,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -1239,14 +1338,14 @@ fn infantry_down_and_up_remain_uninterruptible_until_sequence_completion() {
         .get_mut(id)
         .unwrap()
         .set_native_stage_value(1);
-    assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(!sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     assert_infantry_pose(&sim, id, 7, SequenceKind::Up, 1);
     sim.substrate
         .entities
         .get_mut(id)
         .unwrap()
         .set_native_stage_value(2);
-    assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(!sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     assert_infantry_pose(&sim, id, 0, SequenceKind::Stand, 0);
 }
 
@@ -1259,7 +1358,7 @@ fn infantry_death_finishes_at_its_sequence_count_and_not_one_frame_early() {
             11,
             true,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -1282,22 +1381,21 @@ fn infantry_death_finishes_at_its_sequence_count_and_not_one_frame_early() {
         (11, 14, "E1", 15),
         "the supplied death pose and the bound action record must agree",
     );
-    assert!(!sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(!sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     assert_infantry_pose(&sim, id, 11, SequenceKind::Die1, 14);
     sim.substrate
         .entities
         .get_mut(id)
         .unwrap()
         .set_native_stage_value(15);
-    assert!(sim.infantry_sequencer(id, &rules, crate::sim::world::FrameEffects::default()));
+    assert!(sim.infantry_sequencer(id, &rules, &mut crate::sim::world::FrameEffects::default()));
     let retired = sim.substrate.entities.get(id).unwrap();
     assert!(!retired.lifecycle.object_alive());
     assert!(retired.lifecycle.in_limbo());
     assert!(sim.substrate.pending_delete.contains_object(&id));
     sim.process_pending_delete_with(
         &rules,
-        None,
-        crate::sim::world::FrameEffects::default(),
+        &mut crate::sim::world::FrameEffects::default(),
         1,
         false,
     );
@@ -1459,10 +1557,8 @@ fn raw_infantry_frames_match_whole_original_selector_rows() {
         return;
     };
     let set = rules.animation_sequence("E1").unwrap();
-    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
-        "tools/spatial_oracle/anytown_damage/foot_missions.json",
-    ))
-    .unwrap();
+    let corpus =
+        crate::test_fixture::json("tools/spatial_oracle/anytown_damage/foot_missions.json");
     let receipt = &corpus["infantry_frame_selection_receipt"];
     assert_eq!(receipt["native_span"]["address"], "0x00518D80");
     assert_eq!(receipt["native_span"]["stop"], "0x00518F89");
@@ -1624,6 +1720,7 @@ fn unit_body_counter_matches_original_foot_cadence() {
                 },
                 flag("hover_attack"),
                 flag("deploy_to_land"),
+                0,
                 None,
                 integer("frame", 0) as u32,
             );
@@ -1735,6 +1832,7 @@ fn foot_body_counter_matches_original_concrete_classes() {
             },
             flag("hover_attack"),
             flag("deploy_to_land"),
+            0,
             None,
             integer("frame", 0) as u32,
         );
@@ -1750,4 +1848,47 @@ fn foot_body_counter_matches_original_concrete_classes() {
             assert_eq!(row["observed"]["unit_deployed_calls"], 0, "{input}");
         }
     }
+}
+
+/// Ares 3.0 FootClass_Update_AnimRate (100493D0, hook 0x4DA8B2): an airborne
+/// Foot with an `AirRate` steps only on the frames it divides, whatever its
+/// IdleRate; on the ground the stock cadence decides again.
+#[test]
+fn ares_air_rate_alone_steps_an_airborne_foot() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let cadence = FootBodyCadence {
+        walk_rate: 1,
+        idle_rate: 1,
+    };
+    let speed = Gsi1306Speed::new();
+    let mut entity = gsi_13_06_active_shp_unit("DRON", LocomotorKind::Drive);
+    entity.position.set_exact_z_leptons_for_test(Some(300));
+    entity.body_frame_counter.set_for_test(0);
+    for frame in 1..=6 {
+        tick_foot_body_frame_counter(
+            &mut entity,
+            speed.rules(),
+            cadence,
+            false,
+            false,
+            3,
+            None,
+            frame,
+        );
+    }
+    assert_eq!(entity.body_frame_counter.get(), 2);
+    entity.position.set_exact_z_leptons_for_test(Some(0));
+    for frame in 7..=8 {
+        tick_foot_body_frame_counter(
+            &mut entity,
+            speed.rules(),
+            cadence,
+            false,
+            false,
+            3,
+            None,
+            frame,
+        );
+    }
+    assert_eq!(entity.body_frame_counter.get(), 4);
 }

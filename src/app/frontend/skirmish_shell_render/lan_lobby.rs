@@ -59,15 +59,46 @@ fn paint_create_box(
         });
     }
     let mut controls = Vec::new();
-    super::wol_lobby::paint_room_limits(
-        state,
+    super::wol_lobby::paint_room_players(
         atlas,
         &mut controls,
         &mut labels,
-        picker,
-        &layout.room,
+        picker.limits.players,
+        layout.room.players,
         ShellScale::RETAIL,
     );
+    paint_control(
+        &mut controls,
+        &atlas.control_chrome(),
+        ControlPaint::Checkbox {
+            rect: layout.room.spectators,
+            checked: picker.limits.spectators,
+        },
+        ShellScale::RETAIL,
+    );
+    for (key, rect, align) in [
+        (
+            "VERA:MaxPlayers",
+            layout.room.players_label,
+            ShellAlign::H_RIGHT | ShellAlign::V_CENTER,
+        ),
+        (
+            "VERA:AllowSpectators",
+            crate::ui::skirmish_shell::checkbox_text_rect(
+                layout.room.spectators,
+                ShellScale::RETAIL,
+            ),
+            ShellAlign::V_CENTER,
+        ),
+    ] {
+        labels.push(PaintLabel {
+            text: crate::i18n::tr(key).into(),
+            rect,
+            align,
+            rgb: SHELL_LABEL_TEXT_RGB,
+            path_a_reveal: None,
+        });
+    }
     let draw = shell_paint::paint_modal_shp(
         &state.renderer.bit_font,
         atlas
@@ -206,6 +237,7 @@ pub(crate) fn render_lan_lobby(
                 composition,
                 rect,
                 lobby.enabled && lobby.caret_visible(now),
+                SHELL_LABEL_TEXT_RGB,
                 SHELL_CONTROL_TEXT_DEPTH,
                 scale,
             );
@@ -372,7 +404,9 @@ pub(crate) fn render_lan_lobby(
             );
             overlay.texts.push(shell_text::draw_in_rect(
                 font,
-                &crate::i18n::label(state.process_assets.csf.as_ref(), key, key),
+                &runtime.modal_body.clone().unwrap_or_else(|| {
+                    crate::i18n::label(state.process_assets.csf.as_ref(), key, key)
+                }),
                 rect_to_text_rect(modal.body),
                 SHELL_LABEL_TEXT_RGB,
                 super::text::validation_modal_body_text_align(),

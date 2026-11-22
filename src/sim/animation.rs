@@ -93,7 +93,7 @@ pub fn infantry_facing_slot(facing: u8) -> u16 {
 /// `frame_index` to select the correct SHP frame via `resolve_shp_frame()`.
 /// Only this module writes it. Its native counterpart has not been traced
 /// (#1593).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Animation {
     /// Currently playing sequence.
     sequence: SequenceKind,
@@ -335,8 +335,66 @@ impl UnitFiringCounter {
         self.value = self.value.wrapping_sub(1).max(-1);
     }
 
+    /// Whether the countdown moves: every value but the resting -1, which
+    /// [`tick_unit_firing_counter`] leaves as it is.
+    pub(crate) const fn counting(self) -> bool {
+        self.value != -1
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     /// Install an original comparison or persistence fixture's raw counter.
+    pub fn set_for_test(&mut self, value: i32) {
+        self.value = value;
+    }
+}
+
+/// UnitClass+6D8, the art `DeathFrames=` counter. The constructor stores -1
+/// (`0x00735416`); a lethal hit on a type with `DeathFrames=` above zero
+/// starts it at 0 (`UnitClass::ReceiveDamage`, `0x00737DB1..0x00737DBF`), and
+/// `UnitClass::AI` counts it (`0x0073635B..0x0073637D`) until the count passes
+/// `MaxDeathCounter=`. While it runs the Unit's vt+0x37C (`0x00746C90`)
+/// answers yes and its SHP body draws death frames (`0x0073C6AD`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct UnitDeathCounter {
+    value: i32,
+}
+
+impl Default for UnitDeathCounter {
+    fn default() -> Self {
+        Self { value: -1 }
+    }
+}
+
+impl UnitDeathCounter {
+    pub const fn get(self) -> i32 {
+        self.value
+    }
+
+    /// Every value but the constructor's -1.
+    pub(crate) const fn running(self) -> bool {
+        self.value != -1
+    }
+
+    /// `0x00737DB1..0x00737DBF`: the first lethal hit starts the count, a
+    /// later one leaves it. Returns whether this hit started it.
+    pub(crate) fn start(&mut self) -> bool {
+        if self.value != -1 {
+            return false;
+        }
+        self.value = 0;
+        true
+    }
+
+    /// `0x00736366..0x0073637D`: store the next count and answer whether the
+    /// one before it had reached `max` (a signed compare).
+    pub(crate) fn advance(&mut self, max: i32) -> bool {
+        let old = self.value;
+        self.value = old.wrapping_add(1);
+        max <= old
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub fn set_for_test(&mut self, value: i32) {
         self.value = value;
     }
@@ -373,22 +431,51 @@ pub(crate) fn commit_unit_firing_counter(
 /// Aircraft414DA3. Only the HoverAttack arm asks for a Unit; the ordinary
 /// moving/idle/DeployToLand arms serve every Foot. Original concrete-class
 /// controls: tools/spatial_oracle/unit_simple_deploy.json.
+///
+/// `air_rate` is the type's Ares `AirRate` (0 in a stock game).
 pub(crate) fn tick_foot_body_frame_counter(
     entity: &mut crate::sim::game_entity::GameEntity,
     rules: crate::sim::movement::SpeedRules<'_>,
     cadence: FootBodyCadence,
     hover_attack: bool,
     deploy_to_land: bool,
+    air_rate: i32,
     terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
     binary_frame: u32,
 ) {
+    if foot_body_frame_due(
+        entity,
+        rules,
+        cadence,
+        hover_attack,
+        deploy_to_land,
+        air_rate,
+        terrain,
+        binary_frame,
+    ) {
+        entity.body_frame_counter.advance();
+    }
+}
+
+/// Whether [`tick_foot_body_frame_counter`] advances `entity`'s counter at
+/// `binary_frame`; otherwise it changes nothing.
+pub(crate) fn foot_body_frame_due(
+    entity: &crate::sim::game_entity::GameEntity,
+    rules: crate::sim::movement::SpeedRules<'_>,
+    cadence: FootBodyCadence,
+    hover_attack: bool,
+    deploy_to_land: bool,
+    air_rate: i32,
+    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    binary_frame: u32,
+) -> bool {
     if !entity.category().is_foot()
         || entity.death.is_dying()
         || !entity.lifecycle.object_alive()
         || entity.lifecycle.in_limbo()
         || entity.is_falling_down()
     {
-        return;
+        return false;
     }
 
     if entity.locomotor.is_none()
@@ -396,7 +483,14 @@ pub(crate) fn tick_foot_body_frame_counter(
         || entity.is_warped_out()
         || entity.is_warping_in()
     {
-        return;
+        return false;
+    }
+    // Ares 3.0 FootClass_Update_AnimRate (100493D0, hook 0x4DA8B2), past the
+    // same warp and locomotor-swap refusals: a nonzero `AirRate` alone
+    // decides an airborne (GetHeight > 0) Foot's step.
+    if air_rate != 0 && crate::sim::movement::air_movement::current_fly_height(entity, terrain) > 0
+    {
+        return (binary_frame as i32).wrapping_rem(air_rate) == 0;
     }
     // Foot4DA886..4DAA01: the same+538 feeds SHP and voxel drawing.
     // HoverAttack is Type+390, not TurretSpins. Native deploy6E0 only
@@ -407,25 +501,24 @@ pub(crate) fn tick_foot_body_frame_counter(
             && entity.attack_target.target().is_some()
             && hover_attack
             && !entity.is_fully_deployed());
-    let due = (walking && (binary_frame as i32) % cadence.walk_rate == 0)
+    (walking && (binary_frame as i32) % cadence.walk_rate == 0)
         || (cadence.idle_rate != 0 && !moving && (binary_frame as i32) % cadence.idle_rate == 0)
         // GetHeight (vt+0x1C8) at `0x004DA9CD`.
         || (deploy_to_land
-            && crate::sim::movement::air_movement::current_fly_height(entity, terrain) > 0);
-    if due {
-        entity.body_frame_counter.advance();
-    }
+            && crate::sim::movement::air_movement::current_fly_height(entity, terrain) > 0)
 }
 
 /// Unit73C64B..73C725: an active firing counter precedes Stand/Walk and
 /// advances one image per two counter steps, in descending image order.
-/// The persistent Foot counter continues to own Stand/Walk. Death drawing
-/// remains outside this admitted live-body branch.
+/// The persistent Foot counter continues to own Stand/Walk. A still body
+/// with no `IdleRate=` and a running death counter draws its death image
+/// instead of Stand (`0x0073C6AD..0x0073C6D3`).
 pub fn resolve_shp_vehicle_body_frame(
     set: &SequenceSet,
     facing: u8,
     body_frame_counter: u32,
     firing_counter: i32,
+    death_counter: i32,
     locomotor_is_moving: bool,
     disguised: bool,
 ) -> Option<u16> {
@@ -448,6 +541,8 @@ pub fn resolve_shp_vehicle_body_frame(
     }
     let sequence = if locomotor_is_moving || cadence.idle_rate != 0 {
         SequenceKind::Walk
+    } else if death_counter >= 0 {
+        return u16::try_from(set.shp_vehicle_death()?.image(death_counter)).ok();
     } else {
         SequenceKind::Stand
     };
@@ -535,96 +630,115 @@ fn tick_animations_impl(
     tick_dying: bool,
 ) -> Vec<u64> {
     let mut dying_finished: Vec<u64> = Vec::new();
-    let keys: Vec<u64> = entities.keys_sorted();
+    // Only a Unit or an Aircraft is built with an Animation
+    // (`world_spawn::construction`), and an Infantry leaves below whatever it
+    // holds, so the frame-end step reads those two classes alone (VERA-only,
+    // results unchanged). The whole-store walk also reports dying objects
+    // that hold none.
+    let animated = |category| {
+        matches!(
+            category,
+            crate::map::entities::EntityCategory::Unit
+                | crate::map::entities::EntityCategory::Aircraft
+        )
+    };
+    debug_assert!(
+        tick_dying
+            || !crate::sim::touch_log::live_read_check_enabled()
+            || entities
+                .values_of_category(crate::map::entities::EntityCategory::Structure)
+                .all(|entity| entity.animation.is_none()),
+        "a Structure holds an Animation the frame-end step would not advance"
+    );
+    entities.for_each_entry_mut(
+        |category| tick_dying || animated(category),
+        |entry| {
+            let id = entry.id();
+            let entity = entry.get();
+            if entity.death.is_dying() && !tick_dying {
+                return;
+            }
+            // The stage steps in TechnoClass::AI_Update (`0x006FAC4D`), which a
+            // warped object never reaches (`GameEntity::ai_frozen`): its pose holds.
+            if !entity.death.is_dying() && entity.ai_frozen() {
+                return;
+            }
+            // Its Doing's sequence, which its actions restart and whose stage
+            // steps in its own turn (`sim::movement::infantry_action`); this
+            // frame-end clock leaves it.
+            if crate::sim::movement::infantry_action::doing_owns_sequence(entity) {
+                return;
+            }
+            if entity.animation.is_none() {
+                // Dying entity with no animation → ready for despawn.
+                if entity.death.is_dying() {
+                    dying_finished.push(id);
+                }
+                return;
+            }
+            let entity = entry.into_mut();
+            let type_ref = entity.type_ref();
+            let category = entity.category();
+            let anim = entity
+                .animation
+                .as_mut()
+                .expect("an animated entity was just read");
 
-    for &id in &keys {
-        let Some(entity) = entities.get(id) else {
-            continue;
-        };
-        if entity.death.is_dying() && !tick_dying {
-            continue;
-        }
-        // The stage steps in TechnoClass::AI_Update (`0x006FAC4D`), which a
-        // warped object never reaches (`GameEntity::ai_frozen`): its pose holds.
-        if !entity.death.is_dying() && entity.ai_frozen() {
-            continue;
-        }
-        // Its Doing's sequence, which its actions restart and whose stage
-        // steps in its own turn (`sim::movement::infantry_action`); this
-        // frame-end clock leaves it.
-        if crate::sim::movement::infantry_action::doing_owns_sequence(entity) {
-            continue;
-        }
-        if entity.animation.is_none() {
-            // Dying entity with no animation → ready for despawn.
+            // Dying entities: only advance the death animation, skip all transitions.
             if entity.death.is_dying() {
-                dying_finished.push(id);
+                if anim.finished {
+                    dying_finished.push(id);
+                    return;
+                }
+                let Some(seq_set) =
+                    sequence_set_for_type(sequences, rules, interner.resolve(type_ref))
+                else {
+                    dying_finished.push(id);
+                    return;
+                };
+                let Some(def) = seq_set.get(&anim.sequence) else {
+                    dying_finished.push(id);
+                    return;
+                };
+                advance_animation(anim, def, game_options);
+                if anim.finished {
+                    dying_finished.push(id);
+                }
+                return;
             }
-            continue;
-        }
-        let entity = entities
-            .get_mut(id)
-            .expect("an animated entity was just read");
-        let type_ref = entity.type_ref();
-        let category = entity.category();
-        let anim = entity
-            .animation
-            .as_mut()
-            .expect("an animated entity was just read");
 
-        // Dying entities: only advance the death animation, skip all transitions.
-        if entity.death.is_dying() {
-            if anim.finished {
-                dying_finished.push(id);
-                continue;
-            }
-            let Some(seq_set) = sequence_set_for_type(sequences, rules, interner.resolve(type_ref))
-            else {
-                dying_finished.push(id);
-                continue;
+            // Infantry never enters this cascade: Doing/Stage is its only
+            // sequence clock. Motion does not switch the sequence either: the Unit
+            // SHP draw picks Walk or Stand by the locomotor's Is_Moving (vt+0x10 at
+            // `0x0073C696`, `resolve_shp_vehicle_body_frame`).
+            let seq_set = sequence_set_for_type(sequences, rules, interner.resolve(type_ref));
+
+            // Advance frame timing.
+            let Some(set) = seq_set else {
+                return;
             };
-            let Some(def) = seq_set.get(&anim.sequence) else {
-                dying_finished.push(id);
-                continue;
+            let Some(def) = set.get(&anim.sequence) else {
+                return;
             };
-            advance_animation(anim, def, game_options);
-            if anim.finished {
-                dying_finished.push(id);
+
+            // UnitClass SHP Stand/Walk images are selected from Foot's persistent
+            // body counter at draw time. Do not advance a second relative clock or
+            // reset cadence when the generic visual sequence changes.
+            if category == crate::map::entities::EntityCategory::Unit
+                && set.shp_vehicle_cadence().is_some()
+                && matches!(anim.sequence, SequenceKind::Stand | SequenceKind::Walk)
+            {
+                return;
             }
-            continue;
-        }
 
-        // Infantry never enters this cascade: Doing/Stage is its only
-        // sequence clock. Motion does not switch the sequence either: the Unit
-        // SHP draw picks Walk or Stand by the locomotor's Is_Moving (vt+0x10 at
-        // `0x0073C696`, `resolve_shp_vehicle_body_frame`).
-        let seq_set = sequence_set_for_type(sequences, rules, interner.resolve(type_ref));
-
-        // Advance frame timing.
-        let Some(set) = seq_set else {
-            continue;
-        };
-        let Some(def) = set.get(&anim.sequence) else {
-            continue;
-        };
-
-        // UnitClass SHP Stand/Walk images are selected from Foot's persistent
-        // body counter at draw time. Do not advance a second relative clock or
-        // reset cadence when the generic visual sequence changes.
-        if category == crate::map::entities::EntityCategory::Unit
-            && set.shp_vehicle_cadence().is_some()
-            && matches!(anim.sequence, SequenceKind::Stand | SequenceKind::Walk)
-        {
-            continue;
-        }
-
-        if let Some(next) = advance_animation(anim, def, game_options) {
-            if let Some(facing) = def.completion_facing {
-                snap_completion_facing(&mut entity.body_facing, facing, binary_frame);
+            if let Some(next) = advance_animation(anim, def, game_options) {
+                if let Some(facing) = def.completion_facing {
+                    snap_completion_facing(&mut entity.body_facing, facing, binary_frame);
+                }
+                anim.switch_to(next);
             }
-            anim.switch_to(next);
-        }
-    }
+        },
+    );
 
     dying_finished
 }
@@ -711,6 +825,6 @@ pub(crate) fn tick_dying_animation(
     anim.finished
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "animation_tests.rs"]
 mod tests;

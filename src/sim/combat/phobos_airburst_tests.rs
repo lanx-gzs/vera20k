@@ -29,7 +29,6 @@ fn rules_ini(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn rules_ini_full(
     parent: &str,
     child_weapon: &str,
@@ -74,7 +73,6 @@ struct Scene {
     victims: Vec<u64>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_scene(
     ini: &IniFile,
     source_cell: (u16, u16),
@@ -447,7 +445,10 @@ fn child_rad_beam_takes_the_house_color_and_the_scattered_source_coords() {
         .collect();
     assert_eq!(births.len(), 1, "the expired firer no longer blocks it");
     assert_eq!(births[0].house, Some(americans));
-    assert!(births[0].house_color);
+    assert_eq!(
+        births[0].house_color,
+        crate::sim::combat::radiation_beam::BeamHouseColor::Laser
+    );
     assert_eq!(
         births[0].to, births[0].from,
         "GetTargetCoordsForFiring: Inviso + FlakScatter uses the bullet's own location"
@@ -1102,7 +1103,9 @@ fn firing_effects_play_the_child_weapon_anim_and_report() {
     );
     assert!(
         scene.world.sound_events().iter().any(|event| match event {
-            crate::sim::world::SimSoundEvent::VocAt { sound_id, .. } => sound_id == "GUNRPT",
+            crate::sim::world::SimSoundEvent::VocAt { sound_id, .. } => {
+                sound_id.name_in(&scene.rules) == "GUNRPT"
+            }
             _ => false,
         }),
         "weapon Report is played"
@@ -1132,7 +1135,9 @@ fn firing_effects_play_the_child_weapon_anim_and_report() {
     detonate(&mut scene);
     assert_eq!(scene.world.anims().count(), 0);
     assert!(!scene.world.sound_events().iter().any(|event| match event {
-        crate::sim::world::SimSoundEvent::VocAt { sound_id, .. } => sound_id == "GUNRPT",
+        crate::sim::world::SimSoundEvent::VocAt { sound_id, .. } => {
+            sound_id.name_in(&scene.rules) == "GUNRPT"
+        }
         _ => false,
     }));
 }
@@ -1535,8 +1540,9 @@ fn splits_detonates_once_and_emits_only_its_cluster() {
 }
 
 #[test]
-#[cfg(all(feature = "phobos", feature = "ares"))]
+#[cfg(feature = "phobos")]
 fn phobos_replaces_ares_airburst() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let ini = rules_ini(
         "Airburst=yes\nAirburstWeapon=CHILD_GUN\nCluster=1\n\
          AirburstSpread=1.5\nAirburst.UseCluster=yes\n",

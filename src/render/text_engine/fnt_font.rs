@@ -18,12 +18,12 @@
 //!
 //! GAME.FNT has no width axis, so it is also built narrowed to each width a
 //! squeeze asks for ([`super::Fit`]), one family per width: text too long for
-//! its box narrows in GAME.FNT as it does in the bundled fonts, instead of
-//! only shrinking.
+//! its box narrows in GAME.FNT as it does in the bundled fonts.
 
 use crate::assets::fnt_file::{FntFile, FntGlyph};
+use crate::i18n::is_cjk_sized;
 
-use super::fonts::{CJK_SIZE, LATIN_SIZE, is_cjk_sized};
+use super::fonts::{CJK_SIZE, LATIN_SIZE};
 
 /// 315 * 16: a multiple of both 12.6 and 15.
 const UNITS_PER_EM: u16 = 5040;

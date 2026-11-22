@@ -12,7 +12,9 @@
 //!   game's files, those drawn letters alone.
 //! - Behind it, the bundled Noto fonts ([`fonts`]) for what it lacks, such as
 //!   Arabic and Thai: shaped as vector fonts, so letters join and marks
-//!   stack.
+//!   stack. The browser build fetches them: Noto Sans before the game
+//!   starts, the others the first time text needs one ([`web_fonts`]). An
+//!   installer's build reads those others from the languages folder.
 //!
 //! Every glyph, GAME.FNT's own too, draws as hard pixels on the line's native
 //! grid ([`pixels`]), so a glyph off that grid, squeezed narrower or shrunk
@@ -25,6 +27,7 @@ mod fnt_fill;
 pub(crate) mod fnt_font;
 pub(crate) mod fonts;
 mod pixels;
+pub(crate) mod web_fonts;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -42,27 +45,24 @@ pub(crate) use atlas::SUBPIXEL_STEPS;
 use atlas::{GlyphAtlas, GlyphKey, SIZE_STEPS};
 use fonts::{BASELINE, CJK_WEIGHT, LATIN_WEIGHT, LATIN_WIDTH_PERCENT, OTHER_WEIGHT, TextClass};
 
-/// How far a text is squeezed to fit the box it draws in: narrower letters
-/// first, along the bundled fonts' width axis, then smaller ones. VERA's own:
+/// How far a text is squeezed to fit the box it draws in: narrower letters,
+/// along the bundled fonts' width axis, at their own height. VERA's own:
 /// gamemd cuts off what does not fit, and translations run longer than the
-/// English the boxes were drawn for.
+/// English the boxes were drawn for. What the narrowest letters still do not
+/// fit is cut off as gamemd cuts it: smaller letters would read worse, since
+/// GAME.FNT's whole-pixel strokes run together when shrunk.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Fit(u8);
 
-/// Each step's width and size as shares of the text's own. Noto Sans's width
-/// axis ends at 62.5, a quarter narrower than Latin text's 82.
-const FIT_STEPS: [(f32, f32); 5] = [
-    (1.0, 1.0),
-    (72.0 / LATIN_WIDTH_PERCENT, 1.0),
-    (62.5 / LATIN_WIDTH_PERCENT, 1.0),
-    (62.5 / LATIN_WIDTH_PERCENT, 0.9),
-    (62.5 / LATIN_WIDTH_PERCENT, 0.8),
-];
+/// Each step's width as a share of the text's own. Noto Sans's width axis
+/// ends at 62.5, a quarter narrower than Latin text's 82.
+const FIT_STEPS: [f32; 3] = [1.0, 72.0 / LATIN_WIDTH_PERCENT, 62.5 / LATIN_WIDTH_PERCENT];
 
 impl Fit {
     /// The text as designed.
     pub const NONE: Self = Self(0);
-    /// The last step, where a word too long for a line splits.
+    /// The narrowest letters: the last step, where a word too long for a
+    /// line splits.
     pub const TIGHTEST: Self = Self(FIT_STEPS.len() as u8 - 1);
 
     /// The next step, or `None` past the tightest.
@@ -71,22 +71,12 @@ impl Fit {
     }
 
     fn width(self) -> f32 {
-        FIT_STEPS[usize::from(self.0)].0
+        FIT_STEPS[usize::from(self.0)]
     }
 
     /// Each width the steps narrow text to, as designed first.
     fn widths() -> impl Iterator<Item = f32> {
-        let mut widths: Vec<f32> = Vec::with_capacity(FIT_STEPS.len());
-        for (width, _) in FIT_STEPS {
-            if !widths.contains(&width) {
-                widths.push(width);
-            }
-        }
-        widths.into_iter()
-    }
-
-    fn size(self) -> f32 {
-        FIT_STEPS[usize::from(self.0)].1
+        FIT_STEPS.into_iter()
     }
 }
 
@@ -154,8 +144,16 @@ pub(crate) struct TextEngine {
     /// Blob id and face index to slot.
     slot_of: HashMap<(u64, u32), u16>,
     coords: Vec<Vec<i16>>,
-    /// Family names: the bundled fallback order.
-    bundled_stack: Vec<String>,
+    /// Family names in the bundled fallback order, each with its font's
+    /// place in [`fonts::bundled`].
+    bundled_stack: Vec<(usize, String)>,
+    /// The bundled fonts this build fetches that are not registered yet
+    /// ([`web_fonts`]): place and baseline shift.
+    unfetched: Vec<(usize, f32)>,
+    /// [`web_fonts::arrivals`] when the engine last registered what arrived.
+    arrivals_seen: usize,
+    /// The folder a waiting font is read from, where an installer made one.
+    font_folder: Option<std::path::PathBuf>,
     /// GAME.FNT's family at each width a [`Fit`] narrows to, as designed
     /// first ([`fnt_font`]).
     original_families: Vec<(f32, String)>,
@@ -164,13 +162,24 @@ pub(crate) struct TextEngine {
     layouts: HashMap<(u32, Fit), HashMap<String, Arc<ShapedText>>>,
     cached_layouts: usize,
     atlas: GlyphAtlas,
+    /// The interface language, so CJK text takes its region's glyph forms
+    /// (Noto Sans CJK carries Japanese, Korean and Traditional variants).
     locale: Option<String>,
-    /// The interface language reads right to left (`i18n::right_to_left`).
+    /// The interface language reads right to left.
     right_to_left: bool,
+    /// The `i18n::catalog_revision` `locale` and `right_to_left` were read
+    /// at ([`Self::follow_interface_language`]); none before the first.
+    language_revision: Option<u64>,
 }
 
 /// Cached layouts kept before the cache starts over.
 const LAYOUT_CACHE_LIMIT: usize = 8192;
+
+/// How many fonts the browser build has fetched ([`web_fonts`]): text drawn
+/// before one arrived may draw differently after.
+pub(crate) fn fetched_fonts() -> usize {
+    web_fonts::arrivals()
+}
 
 /// GAME.FNT's family for `fit` among [`TextEngine::original_families`]: the
 /// face narrowed to its width.
@@ -184,6 +193,17 @@ fn original_family(families: &[(f32, String)], fit: Fit) -> Option<&str> {
 
 impl TextEngine {
     pub(crate) fn new(gpu: Option<(&wgpu::Device, &wgpu::Queue, &BatchRenderer)>) -> Self {
+        Self::with_fonts(gpu, fonts::bundled(), crate::i18n::installed_language_dir())
+    }
+
+    /// The engine with `bundled`'s fonts in their fallback order; one without
+    /// bytes is registered once [`web_fonts`] has fetched it, from
+    /// `font_folder` outside the browser.
+    fn with_fonts(
+        gpu: Option<(&wgpu::Device, &wgpu::Queue, &BatchRenderer)>,
+        bundled: impl IntoIterator<Item = fonts::BundledFont>,
+        font_folder: Option<std::path::PathBuf>,
+    ) -> Self {
         let mut engine = Self {
             fonts: FontContext {
                 collection: parley::fontique::Collection::new(
@@ -200,6 +220,9 @@ impl TextEngine {
             slot_of: HashMap::new(),
             coords: vec![Vec::new()],
             bundled_stack: Vec::new(),
+            unfetched: Vec::new(),
+            arrivals_seen: 0,
+            font_folder,
             original_families: Vec::new(),
             original_slot: None,
             layouts: HashMap::new(),
@@ -207,16 +230,72 @@ impl TextEngine {
             atlas: GlyphAtlas::new(gpu),
             locale: None,
             right_to_left: false,
+            language_revision: None,
         };
-        for font in fonts::bundled() {
-            let blob = Blob::new(Arc::new(font.data));
-            for family in engine.register(blob, font.baseline_shift, false) {
-                if !engine.bundled_stack.contains(&family) {
-                    engine.bundled_stack.push(family);
+        for (place, font) in bundled.into_iter().enumerate() {
+            match font.data {
+                Some(data) => {
+                    engine.add_bundled(place, Blob::new(Arc::new(data)), font.baseline_shift);
                 }
+                None => engine.unfetched.push((place, font.baseline_shift)),
             }
         }
+        engine.add_fetched_fonts();
         engine
+    }
+
+    /// Register bundled font `place` behind the bundled fonts before it.
+    fn add_bundled(&mut self, place: usize, blob: Blob<u8>, baseline_shift: f32) {
+        for family in self.register(blob, baseline_shift, false) {
+            if !self.bundled_stack.iter().any(|(_, known)| *known == family) {
+                let at = self
+                    .bundled_stack
+                    .partition_point(|&(before, _)| before <= place);
+                self.bundled_stack.insert(at, (place, family));
+            }
+        }
+    }
+
+    /// Register the waiting fonts [`web_fonts`] has fetched since the engine
+    /// last looked, and lay text out again with them.
+    fn add_fetched_fonts(&mut self) {
+        let arrivals = web_fonts::arrivals();
+        if arrivals == self.arrivals_seen {
+            return;
+        }
+        self.arrivals_seen = arrivals;
+        let waiting = self.unfetched.len();
+        for (place, baseline_shift) in std::mem::take(&mut self.unfetched) {
+            match web_fonts::fetched(place) {
+                Some(blob) => self.add_bundled(place, blob, baseline_shift),
+                None => self.unfetched.push((place, baseline_shift)),
+            }
+        }
+        if self.unfetched.len() != waiting {
+            self.clear_layouts();
+        }
+    }
+
+    /// Fetch the waiting fonts `text` draws from: for each character GAME.FNT
+    /// lacks, the first bundled font that maps it.
+    fn fetch_fonts_for(&self, text: &str) {
+        for c in text.chars() {
+            if let Some(place) = web_fonts::owner(c)
+                && self.unfetched.iter().any(|&(waiting, _)| waiting == place)
+                && !self.original_draws(c)
+            {
+                web_fonts::fetch(place, self.font_folder.as_deref());
+            }
+        }
+    }
+
+    /// Whether GAME.FNT, first in the fallback order, draws `c`.
+    fn original_draws(&self, c: char) -> bool {
+        self.original_slot.is_some_and(|slot| {
+            let slot = &self.slots[usize::from(slot)];
+            swash::FontRef::from_index(slot.data.as_ref(), slot.index as usize)
+                .is_some_and(|font| font.charmap().map(c) != 0)
+        })
     }
 
     /// The engine without GAME.FNT (no game files yet, or a damaged
@@ -270,19 +349,21 @@ impl TextEngine {
         self.clear_layouts();
     }
 
-    /// The interface language, so CJK text takes its region's glyph forms
-    /// (Noto Sans CJK carries Japanese, Korean and Traditional variants).
-    pub(crate) fn locale(&self) -> Option<&str> {
-        self.locale.as_deref()
-    }
-
-    /// Whether the interface language reads right to left.
-    pub(crate) fn right_to_left(&self) -> bool {
-        self.right_to_left
+    /// Read the interface language (`i18n::interface_language`) again when
+    /// the catalog changed since this engine last did: at its first text,
+    /// after a pick in the Language list and after the language files
+    /// reloaded. Every font follows it, a scenario's GAME.FNT font included.
+    fn follow_interface_language(&mut self) {
+        if self.language_revision == Some(crate::i18n::catalog_revision()) {
+            return;
+        }
+        let (revision, tag, right_to_left) = crate::i18n::interface_language();
+        self.language_revision = Some(revision);
+        self.set_locale(Some(&tag), right_to_left);
     }
 
     /// The interface language and whether it reads right to left.
-    pub(crate) fn set_locale(&mut self, locale: Option<&str>, right_to_left: bool) {
+    fn set_locale(&mut self, locale: Option<&str>, right_to_left: bool) {
         let locale = locale.map(str::to_owned);
         if self.locale != locale || self.right_to_left != right_to_left {
             self.locale = locale;
@@ -307,12 +388,21 @@ impl TextEngine {
     /// Shape `text` at `fit`, wrapping at `max_width` native pixels (0: one
     /// line per paragraph). Cached.
     pub(crate) fn shape(&mut self, text: &str, max_width: u32, fit: Fit) -> Arc<ShapedText> {
+        self.follow_interface_language();
+        if !self.unfetched.is_empty() {
+            self.add_fetched_fonts();
+        }
         if let Some(shaped) = self
             .layouts
             .get(&(max_width, fit))
             .and_then(|layouts| layouts.get(text))
         {
             return Arc::clone(shaped);
+        }
+        if !self.unfetched.is_empty() {
+            self.fetch_fonts_for(text);
+            // A font read from the languages folder has already come.
+            self.add_fetched_fonts();
         }
         crate::render::text_audit::laid_out(text);
         let shaped = Arc::new(self.shape_uncached(text, max_width, fit));
@@ -398,7 +488,7 @@ impl TextEngine {
         stack.extend(
             self.bundled_stack
                 .iter()
-                .map(|family| FontFamilyName::Named(Cow::Borrowed(family.as_str()))),
+                .map(|(_, family)| FontFamilyName::Named(Cow::Borrowed(family.as_str()))),
         );
         let locale = self
             .locale
@@ -416,9 +506,7 @@ impl TextEngine {
         builder.push_default(StyleProperty::FontFamily(FontFamily::List(Cow::Borrowed(
             &stack,
         ))));
-        builder.push_default(StyleProperty::FontSize(
-            TextClass::Latin.size() * fit.size(),
-        ));
+        builder.push_default(StyleProperty::FontSize(TextClass::Latin.size()));
         builder.push_default(StyleProperty::FontWeight(FontWeight::new(LATIN_WEIGHT)));
         builder.push_default(StyleProperty::FontWidth(FontWidth::from_percentage(
             LATIN_WIDTH_PERCENT * fit.width(),
@@ -438,10 +526,7 @@ impl TextEngine {
                 TextClass::Cjk => CJK_WEIGHT,
                 TextClass::Other(_) => OTHER_WEIGHT,
             };
-            builder.push(
-                StyleProperty::FontSize(class.size() * fit.size()),
-                start..end,
-            );
+            builder.push(StyleProperty::FontSize(class.size()), start..end);
             builder.push(
                 StyleProperty::FontWeight(FontWeight::new(weight)),
                 start..end,
@@ -559,7 +644,6 @@ impl TextEngine {
     /// One glyph drawn `pixel_size` pixels tall, `native` its native size and
     /// pen phase ([`split_phase`]), with `pen` (device pixels, on the
     /// baseline) at the corner of the native pixel the pen lies in.
-    #[allow(clippy::too_many_arguments)]
     fn place_glyph(
         &mut self,
         font: u16,
@@ -735,7 +819,7 @@ fn paragraphs(text: &str) -> Vec<(usize, usize)> {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::*;
     use crate::assets::fnt_file::FntFile;
@@ -833,11 +917,12 @@ mod tests {
     }
 
     /// A squeeze narrows GAME.FNT's own letters by the width it narrows the
-    /// bundled fonts to, before shrinking them; GAME.FNT has no width axis.
+    /// bundled fonts to (GAME.FNT has no width axis), and even the tightest
+    /// keeps their height: shrunk, their whole-pixel strokes run together.
     #[test]
-    fn a_squeeze_narrows_game_fnt_letters() {
+    fn a_squeeze_narrows_game_fnt_letters_and_keeps_their_height() {
         let mut engine = engine_with_tiny_fnt();
-        let narrowest = Fit(2);
+        let narrowest = Fit::TIGHTEST;
         let designed = engine.shape("AAAA", 0, Fit::NONE);
         let narrowed = engine.shape("AAAA", 0, narrowest);
         let slots = &engine.slots;
@@ -849,7 +934,9 @@ mod tests {
         );
         let share = narrowed.width() / designed.width();
         assert!((share - narrowest.width()).abs() < 0.01, "{share}");
-        assert!(narrowest.width() < 0.8 && narrowest.size() == 1.0);
+        assert!(narrowest.width() < 0.8);
+        let size = |shaped: &ShapedText| shaped.lines[0].glyphs[0].size;
+        assert_eq!(size(&narrowed), size(&designed));
     }
 
     /// A letter GAME.FNT lacks draws from it in its style ([`fnt_fill`]); a
@@ -905,7 +992,7 @@ mod tests {
         let mut engine = engine_with_tiny_fnt();
         let after_thai = engine.shape("กA", 0, Fit::NONE);
         assert!(after_thai.lines[0].glyphs[1].x.fract() != 0.0);
-        for (text, fit) in [("AAAA", Fit(2)), ("AAAA", Fit::TIGHTEST), ("กA", Fit::NONE)] {
+        for (text, fit) in [("AAAA", Fit(1)), ("AAAA", Fit::TIGHTEST), ("กA", Fit::NONE)] {
             let alpha = draw_fit(&mut engine, text, fit, 1.0, 64, 16);
             assert!(alpha.contains(&255), "{text} {fit:?}");
             assert!(alpha.iter().all(|&a| a == 0 || a == 255), "{text} {fit:?}");
@@ -1007,6 +1094,52 @@ mod tests {
         assert_eq!(name_on_the_right(&mut engine, "Abort?"), (false, false));
     }
 
+    /// A language file rewritten while the game runs turns the fonts'
+    /// reading direction, as a pick in the Language list does. The probe
+    /// changes the process's interface language, so it runs in a process of
+    /// its own.
+    #[test]
+    fn a_reloaded_language_file_turns_the_reading_direction() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "render::text_engine::tests::reloaded_language_probe",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("VERA20K_LANGUAGE_RELOAD_PROBE", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("VERA20K_LANGUAGE_RELOAD_PROBE=done"),
+            "{output:?}"
+        );
+    }
+
+    /// [`a_reloaded_language_file_turns_the_reading_direction`]'s process.
+    #[test]
+    fn reloaded_language_probe() {
+        if std::env::var_os("VERA20K_LANGUAGE_RELOAD_PROBE").is_none() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("vera20k-language-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("vera20k.xx.ini");
+        std::fs::write(&file, "[Strings]\nVERA:Unlimited=Unlimited\n").unwrap();
+        assert_eq!(crate::i18n::init(Some(&dir), Some("xx")), "xx");
+        let mut engine = TextEngine::new(None);
+        let mut reads_from_the_right = || engine.shape("Tanya انضم", 0, Fit::NONE).lines[0].rtl;
+        assert!(!reads_from_the_right());
+        std::fs::write(&file, "[Strings]\nVERA:Unlimited=غير محدود\n").unwrap();
+        assert!(crate::i18n::LanguageFileWatch::default().poll(Some(&dir)));
+        let turned = reads_from_the_right();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(turned, "the rewritten file reads right to left");
+        println!("VERA20K_LANGUAGE_RELOAD_PROBE=done");
+    }
+
     #[test]
     fn text_without_spaces_breaks_between_its_words() {
         let mut engine = TextEngine::new(None);
@@ -1018,11 +1151,15 @@ mod tests {
             assert!(line.width <= 75.0, "{line:?}");
             assert!(text.is_char_boundary(line.start) && line.end > line.start);
         }
-        // Thai breaks at word boundaries from the dictionary, never before a
-        // combining vowel or tone mark.
+        // Thai has no word dictionary (Cargo.toml's parley): a run breaks
+        // where its line runs out, never before a combining vowel or tone
+        // mark.
         let text = "ภาษาไทยไม่มีช่องว่างระหว่างคำ";
         let shaped = engine.shape(text, 60, Fit::NONE);
         assert!(shaped.lines.len() >= 2);
+        for line in &shaped.lines {
+            assert!(line.width <= 60.0, "{line:?}");
+        }
         for line in &shaped.lines[1..] {
             let first = text[line.start..].chars().next().unwrap() as u32;
             assert!(
@@ -1042,5 +1179,77 @@ mod tests {
             assert_eq!(&text[pair[0].end..pair[1].start], " ");
         }
         assert_eq!(shaped.lines.last().unwrap().end, text.len());
+    }
+
+    /// The bundled fonts with `file`'s bytes held back, as the browser build
+    /// holds them, and its place and bytes.
+    fn waiting_for(file: &str) -> ([fonts::BundledFont; 21], usize, &'static [u8]) {
+        let mut bundled = fonts::bundled();
+        let place = bundled.iter().position(|font| font.file == file).unwrap();
+        let data = bundled[place].data.take().unwrap();
+        (bundled, place, data)
+    }
+
+    /// A font fetched for text draws it once it arrives, in its place in the
+    /// fallback order.
+    #[test]
+    fn a_fetched_font_draws_the_text_that_asked_for_it() {
+        let (bundled, thai, data) = waiting_for("NotoSansThai-VF.ttf");
+        let mut engine = TextEngine::with_fonts(None, bundled, None);
+        let text = "สวัสดี";
+        let before = engine.shape(text, 0, Fit::NONE);
+        assert!(web_fonts::asked_for(thai));
+        assert!(before.lines[0].glyphs.iter().all(|glyph| glyph.id == 0));
+
+        web_fonts::arrive_for_test(thai, data.to_vec());
+        let after = engine.shape(text, 0, Fit::NONE);
+        assert!(after.lines[0].glyphs.iter().all(|glyph| glyph.id != 0));
+        let places: Vec<usize> = engine
+            .bundled_stack
+            .iter()
+            .map(|&(place, _)| place)
+            .collect();
+        assert!(places.contains(&thai) && places.is_sorted(), "{places:?}");
+    }
+
+    /// A font in the languages folder draws the text that needs it at once,
+    /// and one deleted from the folder leaves its characters undrawn.
+    #[test]
+    fn a_font_in_the_languages_folder_draws_the_text_that_needs_it() {
+        let folder = std::env::temp_dir().join(format!("vera-font-folder-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let (mut bundled, _, data) = waiting_for("NotoSansHebrew-VF.ttf");
+        std::fs::write(folder.join("NotoSansHebrew-VF.ttf"), data).unwrap();
+        let georgian = bundled
+            .iter()
+            .position(|font| font.file == "NotoSansGeorgian-VF.ttf")
+            .unwrap();
+        bundled[georgian].data = None;
+        let mut engine = TextEngine::with_fonts(None, bundled, Some(folder.clone()));
+
+        let drawn = engine.shape("שלום", 0, Fit::NONE);
+        assert!(drawn.lines[0].glyphs.iter().all(|glyph| glyph.id != 0));
+        let undrawn = engine.shape("გამარჯობა", 0, Fit::NONE);
+        assert!(web_fonts::asked_for(georgian));
+        assert!(undrawn.lines[0].glyphs.iter().all(|glyph| glyph.id == 0));
+        std::fs::remove_dir_all(&folder).unwrap();
+    }
+
+    /// Hanzi GAME.FNT draws, its own or drawn in its style, fetch no font.
+    #[test]
+    fn characters_game_fnt_draws_fetch_nothing() {
+        use crate::render::bit_font::{BITMAP_ROWS, CELL_HEIGHT};
+        let (bundled, cjk, _) = waiting_for("NotoSansCJKsc-Regular.otf");
+        let mut engine = TextEngine::with_fonts(None, bundled, None);
+        engine.set_original_font(fnt_font::FntFont::build(
+            &FntFile::blank(CELL_HEIGHT, BITMAP_ROWS),
+            BASELINE as u32,
+            None,
+        ));
+        // Retail GAME.FNT lacks 语, which VERA draws in its style.
+        engine.shape("语", 0, Fit::NONE);
+        assert!(!web_fonts::asked_for(cjk));
+        engine.shape("的", 0, Fit::NONE);
+        assert!(web_fonts::asked_for(cjk));
     }
 }

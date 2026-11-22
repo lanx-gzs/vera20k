@@ -20,8 +20,7 @@ impl Simulation {
         &mut self,
         target: u64,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         use crate::sim::mission::{MissionId, MissionType};
         let Some(actor) = self.substrate.entities.get(target) else {
@@ -33,8 +32,8 @@ impl Simulation {
         {
             return;
         }
-        let _ = self.assign_target_represented(target, None, rules, registry, effects);
-        let _ = self.assign_destination_represented(target, None, rules, registry, effects);
+        let _ = self.assign_target_represented(target, None, rules, effects);
+        let _ = self.assign_destination_represented(target, None, rules, effects);
         let _ = self.mission_queue_exact(
             target,
             MissionId::from_known(MissionType::Harmless),
@@ -46,6 +45,10 @@ impl Simulation {
 
     /// ReceiveDamage_Aftermath1004AB50, after protected-Techno responses and
     /// before the native Uncloak70281D. Unlike EMP this is not a Bullet AoE.
+    /// A damaging hit first restarts the victim's self-heal combat timer with
+    /// its type's `SelfHealing.CombatDelay`. Behind the EffectsRequireDamage/
+    /// EffectsRequireVerses gates it applies KillDriver (10052B40), then
+    /// `Sonar.Duration`, `DisableWeapons.Duration` and `Flash.Duration`.
     pub(crate) fn ares_driver_kill_aftermath(
         &mut self,
         event: &EntityDamageEvent,
@@ -54,17 +57,37 @@ impl Simulation {
         current_damage: i32,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
-        let Some(warhead) = rules.warhead(self.interner.resolve(event.warhead_ref)) else {
+        //1004AB9C..1004ABC4: a nonzero result of an initially positive hit
+        // starts SelfHealingCombatTimer (TechnoExt+5C) for a positive delay,
+        // before the warhead is read.
+        if state != DamageState::Unaffected && initially_positive {
+            let frame = self.session.binary_frame() as i32;
+            let delay = self
+                .substrate
+                .entities
+                .get(event.target_id)
+                .and_then(|target| self.entity_object_type(target, rules))
+                .map_or(0, |kind| kind.techno_combat().self_healing().combat_delay());
+            if delay > 0
+                && let Some(target) = self.substrate.entities.get_mut(event.target_id)
+            {
+                target.seldom.ares.ares_self_heal_combat.start(frame, delay);
+            }
+        }
+        let Some(warhead) = self.interner.warhead_type(event.warhead_ref, rules) else {
             return;
         };
-        let Some(settings) = warhead
-            .ares_rules()
-            .filter(|rules| rules.kill_driver().enabled())
-        else {
+        let Some(settings) = warhead.ares_rules() else {
             return;
         };
+        let flash = settings.combat().flash_duration();
+        let disable_weapons = settings.combat().disable_weapons_duration();
+        let sonar = settings.combat().sonar_duration();
+        if !settings.kill_driver().enabled() && flash <= 0 && disable_weapons <= 0 && sonar <= 0 {
+            return;
+        }
         if state == DamageState::Unaffected
             && !event.receiver_flags.ignore_defenses
             && initially_positive
@@ -88,6 +111,63 @@ impl Simulation {
         {
             return;
         }
+        if settings.kill_driver().enabled() {
+            self.ares_apply_kill_driver(event, warhead, settings, rules, registry, effects);
+        }
+        // Sonar.Duration (WarheadExt+F8) and then DisableWeapons.Duration
+        // (+FC) restart SonarTimer (TechnoExt+44) and DisableWeaponTimer
+        // (+50) when longer than the timer's GetTimeLeft.
+        let frame = self.session.binary_frame() as i32;
+        if sonar > 0
+            && let Some(target) = self.substrate.entities.get_mut(event.target_id)
+            && target.seldom.ares.sonar_timer.remaining(frame) < sonar
+        {
+            target.seldom.ares.sonar_timer.start(frame, sonar);
+        }
+        if disable_weapons > 0
+            && let Some(target) = self.substrate.entities.get_mut(event.target_id)
+            && target.seldom.ares.ares_disable_weapons.remaining(frame) < disable_weapons
+        {
+            target
+                .seldom
+                .ares
+                .ares_disable_weapons
+                .start(frame, disable_weapons);
+        }
+        // 1004AB50 last: a Flash.Duration above Flashing (+0xF0) calls vt+0x148.
+        if flash > 0
+            && self
+                .substrate
+                .entities
+                .get(event.target_id)
+                .is_some_and(|target| flash > target.flashing.frames())
+        {
+            Simulation::flash_object(
+                &self.interner,
+                &self.session,
+                &self.fog,
+                &self.house_alliances,
+                &mut self.substrate,
+                event.target_id,
+                flash,
+            );
+        }
+    }
+
+    /// WarheadTypeExt::applyKillDriver 10052B40 for an aftermath that passed
+    /// its gates.
+    fn ares_apply_kill_driver(
+        &mut self,
+        event: &EntityDamageEvent,
+        warhead: &crate::rules::warhead_type::WarheadType,
+        settings: &crate::rules::ares_warhead::AresWarheadRules,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: &mut FrameEffects<'_>,
+    ) {
+        let Some(target) = self.substrate.entities.get(event.target_id) else {
+            return;
+        };
         //10052B4D/5F: no invoker or non-Foot target never attempts the draw.
         let Some(invoker) = (event.attacker_id != RAD_NO_ATTACKER)
             .then(|| self.substrate.entities.get(event.attacker_id))
@@ -153,7 +233,7 @@ impl Simulation {
         if let Some(owner) = owner {
             self.ares_replace_driver(
                 event.target_id,
-                event.attacker_id,
+                Some(event.attacker_id),
                 owner,
                 settings.kill_driver().remove_veterancy(),
                 rules,
@@ -165,7 +245,12 @@ impl Simulation {
 
     /// CanKillDriver100434C0: live class/radio/type/XP/health facts. Cell
     /// lookup is canonical here (runtime), unlike cursor-only admission.
-    fn ares_can_kill_driver(&self, id: u64, threshold: NativeF64Bits, rules: &RuleSet) -> bool {
+    pub(crate) fn ares_can_kill_driver(
+        &self,
+        id: u64,
+        threshold: NativeF64Bits,
+        rules: &RuleSet,
+    ) -> bool {
         let Some(actor) = self.substrate.entities.get(id) else {
             return false;
         };
@@ -210,7 +295,7 @@ impl Simulation {
                     })
             });
             if let Some(building) =
-                building.filter(|building| actor.radio_contacts.slot(0) == Some(*building))
+                building.filter(|building| actor.seldom.radio_contacts.slot(0) == Some(*building))
                 && self
                     .substrate
                     .entities
@@ -248,29 +333,36 @@ impl Simulation {
 
     /// TechnoExt::KillDriver100456D0: the admitted vehicle changes driver,
     /// preserving the distinct operator-death, ejection and cleanup order.
-    fn ares_replace_driver(
+    /// `invoker` is the killer (none for trigger action 147). Answers whether
+    /// the owner changed: a vehicle already owned by `owner` only takes the
+    /// DriverKilled byte (100456F1..10045708).
+    pub(crate) fn ares_replace_driver(
         &mut self,
         target: u64,
-        invoker: u64,
+        invoker: Option<u64>,
         owner: crate::sim::intern::InternedId,
         remove_veterancy: bool,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
-    ) {
+        effects: &mut FrameEffects<'_>,
+    ) -> bool {
         let Some(passive) = self.houses.get(&owner).map(|house| {
             rules.country_multiplay_passive(self.interner.resolve(house.house_type_id()))
         }) else {
-            return;
+            return false;
         };
         let Some(actor) = self.substrate.entities.get_mut(target) else {
-            return;
+            return false;
         };
-        actor.vehicle_driver.set_killed_from_owner(passive);
+        actor
+            .seldom
+            .ares
+            .vehicle_driver
+            .set_killed_from_owner(passive);
         if actor.owner() == owner {
-            return;
+            return false;
         }
-        let context = UninitContext::new(rules, registry).with_effects(effects);
+        let mut context = UninitContext::new(rules).with_effects(effects);
         let operator = self
             .substrate
             .entities
@@ -282,7 +374,7 @@ impl Simulation {
             .substrate
             .entities
             .get(target)
-            .and_then(|actor| actor.passenger_role.cargo())
+            .and_then(|actor| actor.passenger_role().cargo())
             .map(|cargo| cargo.passengers().to_vec())
             .unwrap_or_default();
         match operator {
@@ -291,14 +383,17 @@ impl Simulation {
                 let _ = depart_cargo_head(
                     self,
                     rules,
-                    registry,
                     target,
                     DepartureRoute::DeathEscape,
-                    |sim, id| {
-                        sim.record_kill_and_uninit(id, Some(invoker), context);
+                    |sim, id, effects| {
+                        sim.record_kill_and_uninit(
+                            id,
+                            invoker,
+                            UninitContext::new(rules).with_effects(effects),
+                        );
                         Ok(())
                     },
-                    effects,
+                    context.effects(),
                 );
             }
             crate::rules::ares_driver::OperatorRequirement::Types(types) => {
@@ -315,8 +410,13 @@ impl Simulation {
                             })
                         })
                     {
-                        self.remove_cargo_passenger(target, Some(passenger), rules, effects);
-                        self.record_kill_and_uninit(passenger, Some(invoker), context);
+                        self.remove_cargo_passenger(
+                            target,
+                            Some(passenger),
+                            rules,
+                            context.effects(),
+                        );
+                        self.record_kill_and_uninit(passenger, invoker, context.reborrow());
                         //100457D0 falls through to100457D6 after the first
                         //matching operator; only nonmatches advance the list.
                         break;
@@ -329,15 +429,14 @@ impl Simulation {
             .substrate
             .entities
             .get(target)
-            .map_or(0, |actor| actor.passenger_role.passenger_count());
+            .map_or(0, |actor| actor.passenger_role().passenger_count());
         for _ in 0..count {
             let result = depart_cargo_head(
                 self,
                 rules,
-                registry,
                 target,
                 DepartureRoute::DeathEscape,
-                |sim, id| {
+                |sim, id, effects| {
                     let point = sim
                         .substrate
                         .entities
@@ -346,20 +445,24 @@ impl Simulation {
                     if point.is_none_or(|point| {
                         !sim.place_ares_survivor(rules, registry, id, point, 128, false, effects)
                     }) {
-                        sim.record_kill_and_uninit(id, None, context);
+                        sim.record_kill_and_uninit(
+                            id,
+                            None,
+                            UninitContext::new(rules).with_effects(effects),
+                        );
                     }
                     // Shared placement owns successful carrier/+82 clearing
                     // (native100448A0 ->7104A0), including parachutes.
                     Ok(())
                 },
-                effects,
+                context.effects(),
             );
             if result.is_err() {
                 break;
             }
         }
         if let Some(actor) = self.substrate.entities.get_mut(target) {
-            actor.capture_infantry_type_index.record(-1);
+            actor.seldom.capture_infantry_type_index.record(-1);
             if remove_veterancy {
                 actor.veterancy.inherit_raw(NativeF32Bits::from_bits(0));
             }
@@ -368,20 +471,27 @@ impl Simulation {
             .substrate
             .entities
             .get(target)
-            .and_then(|actor| actor.mind_control.controller())
+            .and_then(|actor| actor.seldom.mind_control.controller())
         {
-            self.free_unit(controller, target, rules, registry, effects);
+            self.free_unit(controller, target, rules, registry, context.effects());
         }
         self.clear_permanent_control_and_ring(target, rules);
         if let Some(actor) = self.substrate.entities.get_mut(target) {
-            actor.mind_control.clear_house_controller();
+            actor.seldom.mind_control.clear_house_controller();
         }
-        self.free_all_captures(target, rules, registry, effects);
-        self.leave_team(target, false, rules, effects);
-        crate::sim::spawn_manager::kill_all_spawns_with_context(self, target, context);
-        crate::sim::spawn_manager::clear_all_spawn_targets(self, target, rules, registry, effects);
-        self.free_slaves_for_driver_change(target, invoker, passive, rules, registry, effects);
-        self.change_owner_with_rules(target, owner, rules, registry, effects);
+        self.free_all_captures(target, rules, registry, context.effects());
+        self.leave_team(target, false, rules, context.effects());
+        crate::sim::spawn_manager::kill_all_spawns_with_context(self, target, context.reborrow());
+        crate::sim::spawn_manager::clear_all_spawn_targets(self, target, rules, context.effects());
+        self.free_slaves_for_driver_change(
+            target,
+            invoker,
+            passive,
+            rules,
+            registry,
+            context.effects(),
+        );
+        self.change_owner_with_rules(target, owner, rules, registry, context.effects());
         if passive {
             let _ = self.mission_queue_exact(
                 target,
@@ -393,10 +503,10 @@ impl Simulation {
                 &crate::sim::mission::authority::LiveReadyInputProvider { rules },
             );
         }
-        let _ = self.assign_target_represented(target, None, rules, registry, effects);
+        let _ = self.assign_target_represented(target, None, rules, context.effects());
         // ReplaceDriver10045995 passes mode 0; the later AI enforcement uses 1.
-        let _ = self.assign_destination_keeping_queue(target, None, rules, registry, effects);
-        self.dispatch_object_tag_event(target, 68, Some(target), Some(invoker), context);
+        let _ = self.assign_destination_keeping_queue(target, None, rules, context.effects());
+        self.dispatch_object_tag_event(target, 68, Some(target), invoker, context.reborrow());
         if self
             .substrate
             .entities
@@ -405,10 +515,11 @@ impl Simulation {
         {
             self.dispatch_object_tag_event(target, 67, Some(target), None, context);
         }
+        true
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_t_z))]
 mod tests {
     use super::*;
     use crate::sim::combat::ReceiverCallFlags;
@@ -417,6 +528,7 @@ mod tests {
 
     #[test]
     fn driver_hit_kills_one_operator_ejects_rider_and_allows_a_new_driver() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         for operator_rule in ["_ANY_", "OP"] {
             exercise_driver_handoff(operator_rule);
         }
@@ -469,7 +581,7 @@ mod tests {
                 host,
                 BoardingArm::InfantryTransport,
                 Some(&overlays),
-                Default::default()
+                &mut Default::default()
             ));
         }
         let invoker = sim
@@ -487,16 +599,14 @@ mod tests {
             host,
             Some(crate::sim::combat::TargetKind::Entity(invoker)),
             &rules,
-            Some(&overlays),
-            Default::default(),
+            &mut Default::default(),
         )
         .unwrap();
         sim.assign_destination_represented(
             host,
             Some(crate::sim::components::NavTargetRef::cell(18, 15)),
             &rules,
-            Some(&overlays),
-            Default::default(),
+            &mut Default::default(),
         )
         .unwrap();
         assert!(
@@ -534,13 +644,13 @@ mod tests {
                 arg6: false,
             },
         );
-        sim.commit_noncombat_aoe_hits(&rules, Some(&overlays), &[hit], Default::default());
+        sim.commit_noncombat_aoe_hits(&rules, Some(&overlays), &[hit], &mut Default::default());
         let vehicle = sim.entities().get(host).unwrap();
         assert_eq!(sim.interner.resolve(vehicle.owner()), "Special");
         assert!(vehicle.driver_killed());
         assert!(vehicle.attack_target.target().is_none());
         assert!(vehicle.navigation.nav_com().is_none());
-        assert_eq!(vehicle.passenger_role.passenger_count(), 0);
+        assert_eq!(vehicle.passenger_role().passenger_count(), 0);
         assert_eq!(vehicle.veterancy.raw(), NativeF32Bits::from_bits(0));
         assert!(
             sim.entities()
@@ -550,12 +660,12 @@ mod tests {
         );
         let passenger = sim.entities().get(rider).unwrap();
         assert!(
-            !passenger.lifecycle.in_limbo() && !passenger.passenger_role.is_inside_transport(),
+            !passenger.lifecycle.in_limbo() && !passenger.passenger_role().is_inside_transport(),
             "{operator_rule} ejects the other matching passenger alive"
         );
         assert!(!sim.can_capture(controller, host, &rules));
         assert!(!sim.can_be_perma_mind_controlled(host, &rules));
-        sim.update_ares_operator_operability(host, &rules, Default::default());
+        sim.update_ares_operator_operability(host, &rules, &mut Default::default());
         assert!(sim.entities().get(host).unwrap().deactivated.is_offline());
         // A subsequent order cannot reactivate a driverless hull.
         let frame = sim.session.binary_frame();
@@ -566,7 +676,7 @@ mod tests {
             0,
         );
         assert_eq!(actor.mission.queued(), crate::sim::mission::MissionId::NONE);
-        sim.update_ares_driver_killed_mission(host, &rules, Some(&overlays), Default::default());
+        sim.update_ares_driver_killed_mission(host, &rules, &mut Default::default());
         assert_eq!(
             sim.entities().get(host).unwrap().mission.current().known(),
             Some(crate::sim::mission::MissionType::Harmless)
@@ -580,13 +690,19 @@ mod tests {
             crate::sim::radio::RadioResponse::None
         );
         let captured = sim
-            .ares_capture_vehicle(driver, host, &rules, Some(&overlays), Default::default())
+            .ares_capture_vehicle(
+                driver,
+                host,
+                &rules,
+                Some(&overlays),
+                &mut Default::default(),
+            )
             .unwrap();
         assert!(!captured.consumed);
         let vehicle = sim.entities().get(host).unwrap();
         assert_eq!(sim.interner.resolve(vehicle.owner()), "Americans");
         assert!(!vehicle.driver_killed());
-        assert_eq!(vehicle.passenger_role.passenger_count(), 1);
+        assert_eq!(vehicle.passenger_role().passenger_count(), 1);
         assert!(sim.entities().get(driver).unwrap().lifecycle.in_limbo());
         assert!(sim.can_capture(controller, host, &rules));
         assert!(sim.can_be_perma_mind_controlled(host, &rules));
@@ -594,7 +710,7 @@ mod tests {
         // A generic driver satisfies _ANY_; a named operator requirement
         // still needs its matching passenger before either recovery caller
         // may power the hull back on.
-        sim.techno_reactivate(host, &rules, Default::default());
+        sim.techno_reactivate(host, &rules, &mut Default::default());
         assert_eq!(
             sim.entities().get(host).unwrap().deactivated.is_offline(),
             operator_rule == "OP"
@@ -610,10 +726,10 @@ mod tests {
                 host,
                 BoardingArm::InfantryTransport,
                 Some(&overlays),
-                Default::default(),
+                &mut Default::default(),
             ));
         }
-        sim.update_ares_operator_operability(host, &rules, Default::default());
+        sim.update_ares_operator_operability(host, &rules, &mut Default::default());
         assert!(!sim.entities().get(host).unwrap().deactivated.is_offline());
 
         // Chance zero still spends the native single draw after all gates.
@@ -632,7 +748,7 @@ mod tests {
             1,
             &rules,
             Some(&overlays),
-            Default::default(),
+            &mut Default::default(),
         );
         assert_eq!(sim.scenario_rng.logical_state(), expected.logical_state());
         assert!(!sim.entities().get(host).unwrap().driver_killed());
@@ -640,6 +756,7 @@ mod tests {
 
     #[test]
     fn driver_eligibility_applies_aircraft_airport_and_dock_limits() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         for (airport_bound, dock, expected) in [
             ("yes", "", false),
             ("no", "CABHUT", false),
@@ -671,6 +788,7 @@ mod tests {
     /// event value.
     #[test]
     fn driver_and_takeover_events_spring_the_vehicles_tag() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
         let (mut sim, rules, _overlays) = crate::sim::world::entry_test_fixture::fixture_with_rules(
             "[Countries]\n0=Americans\n1=Russians\n[InfantryTypes]\n2=OP\n[VehicleTypes]\n0=HOST\n\
              [OP]\nStrength=100\nSpeedType=Foot\nLocomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n\
@@ -711,14 +829,14 @@ mod tests {
         sim.initialize_trigger_definitions(&map, &Default::default(), None, None, None);
         sim.attach_object_trigger_tag(host, Some("TAG"));
 
-        let context = UninitContext::new(&rules, None);
+        let mut context = UninitContext::new(&rules);
         for (kind, source) in [
             (68, Some(invoker)),
             (67, None),
             (70, Some(invoker)),
             (69, None),
         ] {
-            sim.dispatch_object_tag_event(host, kind, Some(host), source, context);
+            sim.dispatch_object_tag_event(host, kind, Some(host), source, context.reborrow());
         }
 
         assert!(sim.trigger_local_is_set_for_test(0), "67");

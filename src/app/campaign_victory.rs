@@ -32,6 +32,7 @@
 //! Saved campaigns retain their Scenario index and incoming carry-over;
 //! their wins enter this same continuation after saved-world admission.
 
+use crate::app::match_runtime::sim_host::SimWrite;
 use std::collections::VecDeque;
 
 use super::{App, AppState};
@@ -248,7 +249,10 @@ impl App {
     /// still resident. Only a won mission of an installed campaign qualifies.
     pub(super) fn take_campaign_victory(state: &mut AppState) -> Option<CampaignVictory> {
         let campaign = state.match_state.startup.installed_campaign()?;
-        let runtime = state.match_state.sim_runtime.as_mut()?;
+        let runtime = state
+            .match_state
+            .sim_runtime
+            .write_sim(SimWrite::Lifecycle)?;
         let sim = &mut runtime.simulation;
         let owner = sim.session().current_house()?;
         let won = sim.ready_outcome_for_owner(owner).is_some_and(|outcome| {
@@ -278,7 +282,7 @@ impl App {
             VictoryBranch::Credits => VictoryEnd::Credits,
             VictoryBranch::MapSelect => {
                 let mapsel = state.process_assets.manager().and_then(|assets| {
-                    crate::rules::retail_sources::select_ini(assets, "MAPSELMD.INI")
+                    crate::rules::retail_sources::select_ini(assets, assets.ini_roots().mapsel())
                         .map_err(|error| log::warn!("MapSelect: {error}"))
                         .ok()
                 });
@@ -322,26 +326,25 @@ impl App {
                         None
                     }
                 };
-                match (scenario, sim.session().campaign_mission_counter()) {
-                    (Some(scenario), Some(counter)) => {
-                        let startup = Box::new(campaign.next_mission(
-                            scenario,
-                            counter + 1,
-                            state.persistence.options_profile.difficulty,
-                            sim.session().game_options().game_speed,
-                            sim.save_campaign_carry_over(),
-                            &mut crate::app::match_bootstrap::OrdinaryMatchSeedClock,
-                        ));
-                        if init_failed {
-                            VictoryEnd::MapSelectFailed(startup)
-                        } else {
-                            VictoryEnd::NextMission {
-                                startup,
-                                rearm_initial_save: !skip,
-                            }
-                        }
-                    }
-                    _ => VictoryEnd::Shell,
+                // A name that is no map name starts nothing, as a MapSelect fault.
+                let startup = match (scenario, sim.session().campaign_mission_counter()) {
+                    (Some(scenario), Some(counter)) => campaign.next_mission(
+                        scenario,
+                        counter + 1,
+                        state.persistence.options_profile.difficulty,
+                        sim.session().game_options().game_speed,
+                        sim.save_campaign_carry_over(),
+                        &mut crate::app::match_bootstrap::OrdinaryMatchSeedClock,
+                    ),
+                    _ => None,
+                };
+                match startup.map(Box::new) {
+                    Some(startup) if init_failed => VictoryEnd::MapSelectFailed(startup),
+                    Some(startup) => VictoryEnd::NextMission {
+                        startup,
+                        rearm_initial_save: !skip,
+                    },
+                    None => VictoryEnd::Shell,
                 }
             }
         };
@@ -436,7 +439,7 @@ fn skip_map_select_destination<'a>(
     .unwrap_or("")
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
 
@@ -749,14 +752,16 @@ Scenario=ALL03umd.MAP
                             next.eq_ignore_ascii_case(&format!("{}.MAP", pair[1])),
                             "{current} -> {next}"
                         );
-                        startup = startup.next_mission(
-                            next,
-                            startup.mission_counter() + 1,
-                            1,
-                            3,
-                            crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
-                            &mut clock,
-                        );
+                        startup = startup
+                            .next_mission(
+                                next,
+                                startup.mission_counter() + 1,
+                                1,
+                                3,
+                                crate::sim::campaign_carry_over::CampaignCarryOver::CLEARED,
+                                &mut clock,
+                            )
+                            .expect("a retail mission name");
                         let mut metadata =
                             crate::rules::campaign_loading::CampaignLoadingMetadata::default();
                         metadata.apply_ini(&mission.ini, startup.scenario());

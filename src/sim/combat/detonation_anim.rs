@@ -106,7 +106,10 @@ fn damage_band<'a>(list: &'a [impl AsRef<str>], damage: i32, step: i32) -> Optio
 pub(crate) struct SelectedAnim {
     pub name: InternedId,
     /// Only the Phobos Bullet tail reads this.
-    #[cfg_attr(not(feature = "phobos"), allow(dead_code))]
+    #[cfg_attr(
+        not(feature = "phobos"),
+        expect(dead_code, reason = "the Phobos tail reads it")
+    )]
     pub splashed: bool,
 }
 
@@ -144,10 +147,10 @@ pub(crate) fn select_with_context(
     if damage == 0 && !create_zero_damage {
         return None;
     }
-    // Phobos `SelectDamageAnimation_NegativeZeroDamage` (`0x48A4F3`): a
-    // negative packet selects by its magnitude.
-    #[cfg(feature = "phobos")]
-    let damage = if damage < 0 {
+    // Phobos `SelectDamageAnimation_NegativeZeroDamage` (`0x48A4F3`) and
+    // Ares 3.0 SelectDamageAnimation_FixNegatives (1005D070, hook 0x48A4F9):
+    // a negative packet selects by its magnitude (`std::abs`, wrapping).
+    let damage = if (rules.ares() || crate::rules::PHOBOS_ENABLED) && damage < 0 {
         damage.wrapping_neg()
     } else {
         damage
@@ -172,12 +175,7 @@ pub(crate) fn select_with_context(
             #[cfg(feature = "phobos")]
             let splash_names = warhead.phobos_anim.splash_list_names(rules);
             #[cfg(not(feature = "phobos"))]
-            let splash_names: Vec<&str> = rules
-                .combat_damage
-                .splash_list
-                .iter()
-                .map(String::as_str)
-                .collect();
+            let splash_names = rules.combat_damage.splash_list.as_slice();
             #[cfg(feature = "phobos")]
             let pick_random = warhead.phobos_anim.splash_list_pick_random;
             #[cfg(not(feature = "phobos"))]
@@ -195,8 +193,8 @@ pub(crate) fn select_with_context(
             if splash_names.is_empty() {
                 return None;
             }
-            let name = match random_index {
-                Some(index) => splash_names[index as usize],
+            let name: &str = match random_index {
+                Some(index) => splash_names[index as usize].as_ref(),
                 None => damage_band(&splash_names, damage, 35)?,
             };
             return Some(SelectedAnim {
@@ -204,6 +202,16 @@ pub(crate) fn select_with_context(
                 splashed: true,
             });
         }
+    }
+    // Ares hook 48A59A (100377E0): a current Ares storm's own warhead and
+    // bolt explosion come first; no Ares storm is current without Ares.
+    if let Some(name) =
+        crate::sim::superweapon::lightning_storm::ares_bolt_explosion(world, rules, warhead)
+    {
+        return Some(SelectedAnim {
+            name: world.interner.intern(name),
+            splashed: false,
+        });
     }
     // 48A594..48A5A6 compares the retained LightningWarhead pointer, then
     // returns WeatherConBoltExplosion (including its null default).
@@ -395,6 +403,7 @@ pub(crate) fn bullet_effects(
         && let Some(source) = world.substrate.entities.get_mut(source_id)
     {
         source
+            .seldom
             .wh_anim_remaining_creation_interval
             .interval_allows(interval)
     } else {
@@ -541,7 +550,7 @@ pub(crate) fn projectile_impact_cell(
     (rx, ry, sub_x, sub_y, impact.z)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod tests {
     use super::*;
     use crate::sim::rng::SimRng;
@@ -872,7 +881,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "phobos"))]
+#[cfg(all(test, tests_sim_combat_d_z, feature = "phobos"))]
 mod phobos_enhancement_tests {
     use super::*;
     use crate::map::entities::EntityCategory;
@@ -1395,6 +1404,7 @@ CreateUnit.Owner=special
                     effect.world_z,
                     effect.z_adjust,
                     effect.owner_house,
+                    false,
                 )
                 .unwrap()
         };
@@ -1573,6 +1583,7 @@ CreateUnit.Owner=special
                 .entities
                 .get(1)
                 .unwrap()
+                .seldom
                 .wh_anim_remaining_creation_interval
                 .remaining(),
             2

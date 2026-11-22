@@ -1,15 +1,17 @@
 //! Shared saved-file browser records, caret-only description edit, and actions.
-//! File identities stay opaque; SED callers retain the NativeFileName default.
+//! SED identities carry the save folder and native filename.
 //! Native driver558DD0 and list rebuild5596A0 keep filenames separate from text.
 
 use super::super::layout::{SavedSeedControl, SavedSeedMode};
-use crate::map::rmg::{SeedDescription, saved_seeds::SavedSeed};
-use crate::util::native_file_name::NativeFileName;
+use crate::map::rmg::{
+    SeedDescription,
+    saved_seeds::{SavedSeed, SavedSeedFile},
+};
 
 pub const SAVED_SEED_DESCRIPTION_MAX_UNITS: usize = 79;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SavedSeedOutcome<I = NativeFileName> {
+pub enum SavedSeedOutcome<I = SavedSeedFile> {
     Load(I),
     Save {
         file_name: Option<I>,
@@ -20,7 +22,7 @@ pub enum SavedSeedOutcome<I = NativeFileName> {
 }
 
 #[derive(Debug, Clone)]
-pub enum SavedSeedPromptPurpose<I = NativeFileName> {
+pub enum SavedSeedPromptPurpose<I = SavedSeedFile> {
     EmptyDescription,
     /// Acknowledge an operation failure without changing the selected row.
     Error,
@@ -35,7 +37,7 @@ pub enum SavedSeedPromptPurpose<I = NativeFileName> {
 }
 
 #[derive(Debug, Clone)]
-pub struct SavedSeedPrompt<I = NativeFileName> {
+pub struct SavedSeedPrompt<I = SavedSeedFile> {
     pub purpose: SavedSeedPromptPurpose<I>,
     pub body: String,
     pub affirmative: String,
@@ -77,13 +79,17 @@ impl<I> SavedSeedPrompt<I> {
 
 /// A visible or not-yet-filtered native metadata row. None identifies New.
 #[derive(Debug, Clone)]
-pub struct SavedSeedBrowserRow<I = NativeFileName> {
+pub struct SavedSeedBrowserRow<I = SavedSeedFile> {
     pub file_name: Option<I>,
     pub description: SeedDescription,
     pub last_write_time: u64,
     /// Metadata admission belongs to the file format. SED uses nonempty
     /// descriptions; a valid game header can admit an empty description.
     pub visible: bool,
+    /// Whether Load may open this row. VERA-only: a saved game another build
+    /// wrote stays listed in Load and Delete (gamemd hides it at
+    /// `0x005599DF`), so the player can see why it is gone and delete it.
+    pub loadable: bool,
 }
 
 impl<I> SavedSeedBrowserRow<I> {
@@ -280,7 +286,7 @@ impl SavedSeedDescriptionEdit {
 }
 
 #[derive(Debug, Clone)]
-pub struct SavedSeedBrowserState<I = NativeFileName> {
+pub struct SavedSeedBrowserState<I = SavedSeedFile> {
     pub mode: SavedSeedMode,
     pub entries: Vec<SavedSeedBrowserRow<I>>,
     pub selected: Option<usize>,
@@ -294,7 +300,7 @@ pub struct SavedSeedBrowserState<I = NativeFileName> {
     current_description: SeedDescription,
 }
 
-impl SavedSeedBrowserState<NativeFileName> {
+impl SavedSeedBrowserState<SavedSeedFile> {
     pub fn open(
         mode: SavedSeedMode,
         entries: Vec<SavedSeed>,
@@ -310,6 +316,7 @@ impl SavedSeedBrowserState<NativeFileName> {
                 .map(|entry| SavedSeedBrowserRow {
                     file_name: Some(entry.file_name),
                     visible: !entry.description.is_empty(),
+                    loadable: true,
                     description: entry.description,
                     last_write_time: entry.last_write_time,
                 })
@@ -365,6 +372,7 @@ impl<I: Clone + PartialEq> SavedSeedBrowserState<I> {
                 description: empty_slot_label,
                 last_write_time: new_slot_time,
                 visible: true,
+                loadable: true,
             });
         }
         rows.extend(entries);
@@ -452,6 +460,22 @@ impl<I: Clone + PartialEq> SavedSeedBrowserState<I> {
         }
     }
 
+    /// VERA's Setups page: Load and Delete act on the selected saved row,
+    /// never the new one.
+    pub fn selected_saved(&self) -> Option<&I> {
+        self.selected_entry()?.file_name.as_ref()
+    }
+
+    /// VERA's Setups page: what its Load or Delete does.
+    pub fn setup_outcome(&self, control: SavedSeedControl) -> Option<SavedSeedOutcome<I>> {
+        let saved = self.selected_saved()?.clone();
+        match control {
+            SavedSeedControl::Load => Some(SavedSeedOutcome::Load(saved)),
+            SavedSeedControl::Delete => Some(SavedSeedOutcome::Delete(saved)),
+            _ => None,
+        }
+    }
+
     pub fn remove_entry(&mut self, file_name: &I, visible_rows: usize) {
         self.entries
             .retain(|row| row.file_name.as_ref() != Some(file_name));
@@ -462,13 +486,13 @@ impl<I: Clone + PartialEq> SavedSeedBrowserState<I> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
 
     fn seed(name: &str, time: u64, valid: bool) -> SavedSeed {
         SavedSeed {
-            file_name: format!("{name}.SED").into(),
+            file_name: SavedSeedFile::in_random_maps(format!("{name}.SED").into()),
             description: if valid {
                 name.into()
             } else {
@@ -494,7 +518,7 @@ mod tests {
         let mut state = open(SavedSeedMode::Save, vec![seed("Future", 110, true)]);
         assert_eq!(
             state.entries[0].file_name.as_ref(),
-            Some(&"Future.SED".into())
+            Some(&SavedSeedFile::in_random_maps("Future.SED".into()))
         );
         assert_eq!(state.description_edit.description(), "Future");
         state.select(1);
@@ -520,7 +544,7 @@ mod tests {
         );
         assert_eq!(
             wrong.selected_entry().unwrap().file_name.as_ref(),
-            Some(&"B.SED".into())
+            Some(&SavedSeedFile::in_random_maps("B.SED".into()))
         );
         let no_selection = open(
             SavedSeedMode::Load,
@@ -537,7 +561,10 @@ mod tests {
                 seed("B", 10, true),
             ],
         );
-        assert_eq!(ties.entries[0].file_name.as_ref(), Some(&"A.SED".into()));
+        assert_eq!(
+            ties.entries[0].file_name.as_ref(),
+            Some(&SavedSeedFile::in_random_maps("A.SED".into()))
+        );
     }
 
     #[test]
@@ -599,6 +626,7 @@ mod tests {
                 description: "Saved description".into(),
                 last_write_time: 110,
                 visible: true,
+                loadable: true,
             }],
             "Working".into(),
             "[EMPTY SLOT]".into(),
@@ -640,6 +668,7 @@ mod tests {
                 description: SeedDescription::default(),
                 last_write_time: 1,
                 visible: true,
+                loadable: true,
             }],
             SeedDescription::default(),
             "[EMPTY SLOT]".into(),
@@ -660,10 +689,10 @@ mod tests {
             ],
         );
         state.select(1);
-        state.remove_entry(&"B.SED".into(), 2);
+        state.remove_entry(&SavedSeedFile::in_random_maps("B.SED".into()), 2);
         assert_eq!(state.selected, Some(0));
-        state.remove_entry(&"A.SED".into(), 2);
-        state.remove_entry(&"C.SED".into(), 2);
+        state.remove_entry(&SavedSeedFile::in_random_maps("A.SED".into()), 2);
+        state.remove_entry(&SavedSeedFile::in_random_maps("C.SED".into()), 2);
         assert!(state.entries.is_empty());
         assert!(!state.action_enabled());
     }

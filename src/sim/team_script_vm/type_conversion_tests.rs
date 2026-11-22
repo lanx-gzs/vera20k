@@ -20,8 +20,9 @@ fn scene() -> (Simulation, RuleSet, u64, Vec<u64>) {
          [FOOT2]\nStrength=120\nSpeed=4\nROT=6\nHasSpotlight=yes\n\
          Locomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n",
     );
-    #[cfg(feature = "ares")]
-    let ini = {
+    // The scene is an Ares game exactly when its thread reads Rules the Ares
+    // way.
+    let ini = if crate::rules::ares_switch::ares_way() {
         let mut ini = ini;
         ini.merge(&crate::rules::ini_parser::IniFile::from_str(
             "[Tiberiums]\n0=CONVERT_ORE\n[CONVERT_ORE]\nValue=25\nImage=1\n\
@@ -29,6 +30,8 @@ fn scene() -> (Simulation, RuleSet, u64, Vec<u64>) {
              [FOOT2]\nAttachEffect.Duration=3\nAttachEffect.InitialDelay=2\nAttachEffect.FirepowerMultiplier=3\n\
              Spotlight.StartHeight=650\nSpotlight.DisableGreen=yes\n",
         ));
+        crate::rules::tiberium_type::with_tiberium_image_slots(&ini)
+    } else {
         ini
     };
     let rules = RuleSet::from_ini(&ini).unwrap();
@@ -75,11 +78,11 @@ fn scene() -> (Simulation, RuleSet, u64, Vec<u64>) {
     (sim, rules, team, members)
 }
 
-#[cfg(feature = "ares")]
 #[test]
 fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_and_locomotor() {
     use crate::rules::locomotor_type::LocomotorKind;
     use crate::util::native_x87::NativeF64Bits;
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let (mut sim, rules, team, members) = scene();
     let cargo = vec![
         crate::sim::miner::CargoBale::of_type(
@@ -102,24 +105,15 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
         sim.entities()
             .get(members[1])
             .unwrap()
-            .crate_multipliers
-            .firepower(),
+            .firepower_multiplier(),
         NativeF64Bits::from_bits(2.0_f64.to_bits()),
     );
     let count = sim.entities().len();
-    sim.take_lifecycle_outputs_for_test();
-    sim.team_step_script(team, &rules, None, FrameEffects::empty());
-    let changed: Vec<_> = sim
-        .take_lifecycle_outputs_for_test()
-        .into_iter()
-        .filter_map(|output| match output {
-            crate::sim::world::LifecycleOutput::ObjectTypeChanged { stable_id } => Some(stable_id),
-            _ => None,
-        })
-        .collect();
+    sim.take_looks();
+    sim.team_step_script(team, &rules, None, &mut FrameEffects::empty());
     assert_eq!(
-        changed,
-        members[..2],
+        sim.take_looks().entities,
+        crate::sim::Touched::Ids(members[..2].to_vec()),
         "new models must reach atlas refresh without an entity spawn"
     );
     assert_eq!(
@@ -171,14 +165,13 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
         "not Infantry constructor ROT127"
     );
     assert!(foot.barrel_facing.is_none(), "no phantom turret");
-    assert_eq!(foot.crate_multipliers.firepower(), NativeF64Bits::ONE);
+    assert_eq!(foot.firepower_multiplier(), NativeF64Bits::ONE);
     sim.update_ares_attach_effects(members[1], &rules);
     assert_eq!(
         sim.entities()
             .get(members[1])
             .unwrap()
-            .crate_multipliers
-            .firepower(),
+            .firepower_multiplier(),
         NativeF64Bits::ONE,
         "conversion retains the initial-delay sentinel until the new type's first visit",
     );
@@ -188,8 +181,7 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
         sim.entities()
             .get(members[1])
             .unwrap()
-            .crate_multipliers
-            .firepower(),
+            .firepower_multiplier(),
         NativeF64Bits::from_bits(3.0_f64.to_bits()),
     );
     assert_eq!(
@@ -202,16 +194,21 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
         .entities()
         .get(foot_id)
         .unwrap()
+        .building
         .building_light
         .light()
         .unwrap();
     let visit = |sim: &mut Simulation, id| {
-        sim.object_ai_visit_one(id, Some(&rules), crate::sim::world::ObjectAiCtx::default());
+        sim.object_ai_visit_one(
+            id,
+            Some(&rules),
+            &mut crate::sim::world::ObjectAiCtx::default(),
+        );
     };
     visit(&mut sim, light_id);
     let before_turn = sim.building_spotlight(light_id, None, &rules).unwrap();
     assert_eq!(before_turn.glow_flags, 4);
-    sim.detach_all_pointer_expired(foot_id, &rules, None, FrameEffects::empty());
+    sim.detach_all_pointer_expired(foot_id, &rules, &mut FrameEffects::empty());
     assert!(
         sim.building_spotlight(light_id, None, &rules).is_some(),
         "cloak-style detach retains the light's parent"
@@ -226,7 +223,7 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
         .take();
     let mut cloaked = crate::sim::cloak_disguise::CloakRuntime::new(frame as i32);
     cloaked.establish_unlimbo_fully_cloaked();
-    sim.substrate.entities.get_mut(foot_id).unwrap().cloak = Some(cloaked);
+    sim.substrate.entities.get_mut(foot_id).unwrap().cloak = Some(Box::new(cloaked));
     assert!(
         sim.building_spotlight(light_id, None, &rules).is_none(),
         "cloaked parent suppresses drawing without deleting its light"
@@ -284,6 +281,7 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
             .entities()
             .get(foot_id)
             .unwrap()
+            .building
             .building_light
             .light(),
         Some(light_id)
@@ -293,12 +291,13 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
             .building_spotlight(light_id, None, &rules)
             .is_some()
     );
-    restored.techno_deactivate(foot_id, &rules, FrameEffects::empty());
+    restored.techno_deactivate(foot_id, &rules, &mut FrameEffects::empty());
     assert!(
         restored
             .entities()
             .get(foot_id)
             .unwrap()
+            .building
             .building_light
             .light()
             .is_none()
@@ -308,16 +307,17 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
             .building_spotlight(light_id, None, &rules)
             .is_none()
     );
-    restored.techno_reactivate(foot_id, &rules, FrameEffects::empty());
+    restored.techno_reactivate(foot_id, &rules, &mut FrameEffects::empty());
     let recreated = restored
         .entities()
         .get(foot_id)
         .unwrap()
+        .building
         .building_light
         .light()
         .unwrap();
     assert_ne!(recreated, light_id);
-    restored.team_step_script(team, &rules, None, FrameEffects::empty());
+    restored.team_step_script(team, &rules, None, &mut FrameEffects::empty());
     assert_eq!(restored.team_script_vm.team(team).unwrap().cursor(), 1);
     assert_eq!(
         restored
@@ -332,7 +332,7 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
             .resolve(restored.entities().get(members[0]).unwrap().type_ref()),
         "NEW"
     );
-    restored.techno_limbo_with_rules(foot_id, &rules, None);
+    restored.techno_limbo_with_rules(foot_id, &rules);
     assert!(
         restored
             .building_spotlight(recreated, None, &rules)
@@ -346,6 +346,7 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
             .entities()
             .get(fresh)
             .unwrap()
+            .building
             .building_light
             .light()
             .is_some(),
@@ -353,11 +354,10 @@ fn script68_converts_in_place_keeps_team_and_updates_native_counts_health_ammo_a
     );
 }
 
-#[cfg(not(feature = "ares"))]
 #[test]
-fn default_build_keeps_script68_inert_without_type_or_count_writes() {
+fn a_stock_game_keeps_script68_inert_without_type_or_count_writes() {
     let (mut sim, rules, team, members) = scene();
-    sim.team_step_script(team, &rules, None, FrameEffects::empty());
+    sim.team_step_script(team, &rules, None, &mut FrameEffects::empty());
     assert_eq!(
         sim.interner
             .resolve(sim.entities().get(members[0]).unwrap().type_ref()),
@@ -383,6 +383,7 @@ fn default_build_keeps_script68_inert_without_type_or_count_writes() {
         sim.entities()
             .get(foot)
             .unwrap()
+            .building
             .building_light
             .light()
             .is_none(),

@@ -8,8 +8,10 @@
 mod authored_health;
 mod construction;
 mod wall_unlimbo;
+pub(in crate::sim) use construction::TypeProjectionWrite;
 pub(crate) use construction::{CrushableFacts, MoverFacts, TypeFacts};
 
+use crate::sim::house_tracking::HouseTracking;
 use crate::sim::world::FrameEffects;
 use std::collections::BTreeMap;
 use std::fmt;
@@ -30,8 +32,8 @@ use crate::sim::combat::veterancy::{has_weapon_ability, rank_from_u16};
 use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
 use crate::sim::game_entity::{GameEntity, GeneratedTechnoInit, TechnoConstructorInit};
 use crate::sim::houses::Houses;
-use crate::sim::intern::InternedId;
 use crate::sim::intern::StringInterner;
+use crate::sim::intern::{InternKey, InternedId};
 use crate::sim::production;
 use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::vision::MAX_SIGHT_RANGE;
@@ -245,7 +247,7 @@ impl Simulation {
         let Some(entity) = self.substrate.entities.get_mut(stable_id) else {
             return false;
         };
-        if entity.in_logic_vector.is_member() {
+        if entity.seldom.in_logic_vector.is_member() {
             return false;
         }
         entity.position.put_location(coord);
@@ -336,7 +338,7 @@ impl Simulation {
             entities,
             rules,
             resolved_terrain,
-            None,
+            Some(rules.overlay_registry()),
             Some(constructor_inits),
         )
     }
@@ -572,7 +574,7 @@ impl Simulation {
                     // separately from this exact caller coordinate.
                     ge.position.put_location(requested);
                 }
-                ge.base_defense_response
+                ge.seldom.base_defense_response
                     .author_recruitable(map_ent.recruitable_a, map_ent.recruitable_b);
                 // gamemd.exe Unit7434CA/Aircraft41B33D/Infantry51FD89, before Unlimbo.
                 ge.assign_object_group(map_ent.group);
@@ -599,7 +601,7 @@ impl Simulation {
                 // constructor and before the Unlimbo (`BuildingClass::ReadFromINI`
                 // `0x0044FB5B`, `0x0044FB70`).
                 if map_ent.category == EntityCategory::Structure {
-                    ge.ai_sell_repair.read_map_line(
+                    ge.seldom.ai_sell_repair.read_map_line(
                         map_ent.structure_ai_sellable,
                         map_ent.structure_ai_repairable,
                     );
@@ -620,12 +622,11 @@ impl Simulation {
                 let (stable_id, outcome) =
                     sim.unlimbo_authored_techno(ge, map_ent.health, rules, overlay_registry);
                 if !matches!(outcome, RevealOutcome::Revealed { .. } | RevealOutcome::Consumed) {
-                    sim.discard_constructed_limbo(stable_id, rules, FrameEffects::default());
+                    sim.discard_constructed_limbo(stable_id, rules, &mut FrameEffects::default());
                     continue;
                 }
                 if matches!(outcome, RevealOutcome::Revealed { .. }) {
                     Self::initialize_cloak_after_unlimbo(&sim.interner, &sim.session, &mut sim.substrate, stable_id, rules);
-                    sim.add_unit_sensor_after_unlimbo(stable_id, rules, overlay_registry);
                     // ReadScenarioBuildings (0x0044F820) makes no sensor call:
                     // a map building stamps only if the first opening its
                     // Unlimbo already ran (0x00440D61 / 0x00440E76) passed
@@ -642,7 +643,7 @@ impl Simulation {
                         .substrate
                         .entities
                         .get(stable_id)
-                        .and_then(|entity| entity.building_light.light())
+                        .and_then(|entity| entity.building.building_light.light())
                     {
                         sim.set_spotlight_behavior(
                             light,
@@ -650,9 +651,9 @@ impl Simulation {
                         );
                     }
                     if map_ent.structure_online {
-                        sim.go_building_online(stable_id, rules, FrameEffects::default());
+                        sim.go_building_online(stable_id, rules, &mut FrameEffects::default());
                     } else {
-                        sim.go_building_offline(stable_id, rules, FrameEffects::default());
+                        sim.go_building_offline(stable_id, rules, &mut FrameEffects::default());
                     }
                 }
                 sim.finish_authored_building_enable(stable_id, rules);
@@ -660,9 +661,9 @@ impl Simulation {
 
                 if map_ent.category == EntityCategory::Structure {
                     // ReadBuildings44FC31 retains the row's resolved House for
-                    // upgrade constructors even if a shared callback changed
-                    // the parent owner. The raw authored name is not a key.
-                    let original_owner = sim.interner.resolve(owner_id).to_owned();
+                    // upgrade constructors (`owner_id`) even if a shared
+                    // callback changed the parent owner. The raw authored
+                    // name is not a key.
                     // `0x0044FD50..0x0044FDC3` walks `count` slots from the
                     // first and skips -1. A count above three reads past
                     // native's slot array into its coordinate locals; Rust
@@ -677,7 +678,7 @@ impl Simulation {
                         if sim
                             .spawn_authored_building_upgrade(
                                 upgrade_type,
-                                &original_owner,
+                                owner_id,
                                 map_ent.cell_x,
                                 map_ent.cell_y,
                                 z,
@@ -756,8 +757,11 @@ impl Simulation {
             // player, as HasOccurred53 does. No retail map gives a human one.
             let owner = Self::scenario_house_named(&self.houses, &map_ent.owner)?;
             if map_ent.category == EntityCategory::Structure
-                && self.session.game_mode_nonzero()
-                && !self.session.game_mode().is_network()
+                && self
+                    .session
+                    .rule_policy()
+                    .skips_local_player_authored_buildings()
+                && !self.session.execution_topology().is_lockstep()
                 && self.session.current_house() == Some(owner)
             {
                 return None;
@@ -818,8 +822,7 @@ impl Simulation {
         temporary: u64,
         position: RevealPosition,
         rules: &RuleSet,
-        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
         game_active: bool,
     ) -> Option<RevealOutcome> {
         let entity = self.substrate.entities.get(temporary)?;
@@ -841,7 +844,6 @@ impl Simulation {
             let _ = super::object_entry::classify_object(
                 self,
                 rules,
-                registry,
                 crate::sim::occupancy::CellObjectMember::Entity(temporary),
                 cells.lookup_world(x, y),
                 crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
@@ -854,7 +856,7 @@ impl Simulation {
                 temporary,
                 host,
                 rules,
-                super::lifecycle::UninitContext::new(rules, registry).with_effects(effects),
+                super::lifecycle::UninitContext::new(rules).with_effects(effects),
             )
         });
         Some(if installed {
@@ -867,7 +869,7 @@ impl Simulation {
     fn spawn_authored_building_upgrade(
         &mut self,
         type_id: &str,
-        owner: &str,
+        owner: InternedId,
         rx: u16,
         ry: u16,
         z: u8,
@@ -882,7 +884,7 @@ impl Simulation {
             facing,
             z,
             rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         )?;
         // ReadBuildings44FD93..44FDB9 passes the host pose to the usual
         // Building Unlimbo, without assigning a forced slot/level. Successful
@@ -899,15 +901,15 @@ impl Simulation {
             stable_id,
             position,
             rules,
-            None,
+            Some(rules.overlay_registry()),
             true,
-            FrameEffects::default(),
+            &mut FrameEffects::default(),
         );
         if !matches!(
             outcome,
             RevealOutcome::Revealed { .. } | RevealOutcome::Consumed
         ) {
-            self.discard_constructed_limbo(stable_id, rules, FrameEffects::default());
+            self.discard_constructed_limbo(stable_id, rules, &mut FrameEffects::default());
             return None;
         }
         Some(stable_id)
@@ -1000,10 +1002,10 @@ impl Simulation {
     /// Spawn one object instance, standing finished (tests, tools, debug
     /// spawns).
     /// Returns the stable_id on success.
-    pub fn spawn_object(
+    pub fn spawn_object<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
@@ -1013,13 +1015,36 @@ impl Simulation {
         self.spawn_object_at_height(type_id, owner, rx, ry, facing, z, rules)
     }
 
-    /// Immediate construction with the match's live OverlayTypeClass table.
-    /// Production callers use this boundary whenever the constructed type may
-    /// be a Unit, so its virtual Unlimbo sees the same overlay facts as native.
-    pub fn spawn_object_with_overlay_registry(
+    /// Spawn a finished object on the current map, using these rules' overlay
+    /// types for class placement and the building's GrandOpening.
+    pub fn spawn_object_with_map_overlays<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
+        rx: u16,
+        ry: u16,
+        facing: u8,
+        rules: &RuleSet,
+    ) -> Option<u64> {
+        let z = self.terrain_cell_level(rx, ry).unwrap_or(0);
+        self.spawn_object_at_height_with_overlay_context(
+            type_id,
+            owner,
+            rx,
+            ry,
+            facing,
+            z,
+            rules,
+            Some(rules.overlay_registry()),
+        )
+    }
+
+    /// Place a fixture using its independently supplied overlay-type table.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_object_with_overlay_registry<'k>(
+        &mut self,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
@@ -1039,10 +1064,10 @@ impl Simulation {
         )
     }
 
-    pub fn spawn_object_at_height(
+    pub fn spawn_object_at_height<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
@@ -1050,14 +1075,21 @@ impl Simulation {
         rules: &RuleSet,
     ) -> Option<u64> {
         self.spawn_object_at_height_with_overlay_context(
-            type_id, owner, rx, ry, facing, z, rules, None,
+            type_id,
+            owner,
+            rx,
+            ry,
+            facing,
+            z,
+            rules,
+            Some(rules.overlay_registry()),
         )
     }
 
-    pub(crate) fn spawn_object_at_height_with_overlay_context(
+    pub(crate) fn spawn_object_at_height_with_overlay_context<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
@@ -1065,7 +1097,12 @@ impl Simulation {
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     ) -> Option<u64> {
-        self.spawn_object_at_height_with_init(
+        let type_id = type_id.into();
+        let object = self.interner.key_object_type(type_id, rules)?;
+        let owner = self.interner.intern_key(owner.into());
+        let type_id = self.interner.intern_key(type_id);
+        self.spawn_resolved_object_at_height(
+            object,
             type_id,
             owner,
             rx,
@@ -1074,15 +1111,15 @@ impl Simulation {
             z,
             rules,
             overlay_registry,
-            TechnoConstructorInit::FreshScenario,
         )
-        .expect("fresh Techno constructor initialization cannot fail")
     }
 
-    pub fn spawn_object_at_height_with_overlay_registry(
+    /// Place a fixture at an explicit height using its own overlay-type table.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn spawn_object_at_height_with_overlay_registry<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
@@ -1102,23 +1139,32 @@ impl Simulation {
         )
     }
 
-    fn spawn_object_at_height_with_init(
+    /// Place the selected class's object, even when another class shares its ID.
+    pub(crate) fn spawn_resolved_object_at_height(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        object: &ObjectType,
+        type_id: InternedId,
+        owner: InternedId,
         rx: u16,
         ry: u16,
         facing: u8,
         z: u8,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        init: TechnoConstructorInit,
-    ) -> Result<Option<u64>, GeneratedTechnoInitError> {
-        let Some(ge) =
-            self.construct_runtime_techno(type_id, owner, rx, ry, facing, z, rules, init)?
-        else {
-            return Ok(None);
-        };
+    ) -> Option<u64> {
+        let ge = self
+            .construct_resolved_runtime_techno(
+                object,
+                type_id,
+                owner,
+                rx,
+                ry,
+                facing,
+                z,
+                rules,
+                TechnoConstructorInit::FreshScenario,
+            )
+            .expect("fresh Techno constructor initialization cannot fail")?;
         // This explicit adapter stands finished; authored map placement
         // uses only native discovery and animation readiness.
         let (stable_id, outcome) = self.with_buildup_bypass(|sim| {
@@ -1126,7 +1172,7 @@ impl Simulation {
                 ge,
                 rules,
                 overlay_registry,
-                FrameEffects::default(),
+                &mut FrameEffects::default(),
             );
             if matches!(outcome, RevealOutcome::Revealed { .. }) {
                 // This tests/tools/debug adapter explicitly promises a finished
@@ -1135,7 +1181,7 @@ impl Simulation {
                     entity.category() == EntityCategory::Structure
                         && !entity.building_up()
                         && sim.houses.get(&entity.owner()).is_some_and(|house| {
-                            house.is_controlled_by_human(sim.session.game_mode_nonzero())
+                            house.is_controlled_by_human(sim.session.rule_policy())
                         })
                 }) {
                     sim.grand_opening(
@@ -1144,20 +1190,20 @@ impl Simulation {
                         false,
                         rules,
                         overlay_registry,
-                        FrameEffects::default(),
+                        &mut FrameEffects::default(),
                     );
                 }
             }
             (stable_id, outcome)
         });
         if outcome == RevealOutcome::Consumed {
-            return Ok(Some(stable_id));
+            return Some(stable_id);
         }
         if !matches!(outcome, RevealOutcome::Revealed { .. }) {
             // This convenience path owns its transient constructor result.
             // Held production objects use the separate limbo/retry boundary.
-            self.discard_constructed_limbo(stable_id, rules, FrameEffects::default());
-            return Ok(None);
+            self.discard_constructed_limbo(stable_id, rules, &mut FrameEffects::default());
+            return None;
         }
         Self::initialize_cloak_after_unlimbo(
             &self.interner,
@@ -1166,9 +1212,8 @@ impl Simulation {
             stable_id,
             rules,
         );
-        self.add_unit_sensor_after_unlimbo(stable_id, rules, overlay_registry);
         self.substrate.ready_finished_spawn_adapter(stable_id);
-        Ok(Some(stable_id))
+        Some(stable_id)
     }
 
     /// Create an object in limbo: stored in EntityStore and tracked by its
@@ -1176,10 +1221,10 @@ impl Simulation {
     /// paradrop cargo loading, where gamemd creates passengers directly into
     /// CargoClass without Unlimbo.
     #[cfg(any(test, feature = "test-support"))]
-    pub fn spawn_object_limbo_at_height(
+    pub fn spawn_object_limbo_at_height<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
@@ -1195,26 +1240,29 @@ impl Simulation {
             z,
             rules,
             TechnoConstructorInit::FreshScenario,
-            FrameEffects::default(),
+            &mut FrameEffects::default(),
         )
         .expect("fresh Techno constructor initialization cannot fail")
     }
 
-    fn spawn_object_limbo_at_height_with_init(
+    fn spawn_object_limbo_at_height_with_init<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
         z: u8,
         rules: &RuleSet,
         init: TechnoConstructorInit,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Result<Option<u64>, GeneratedTechnoInitError> {
-        let Some(obj) = rules.object(type_id) else {
+        let type_id = type_id.into();
+        let Some(obj) = self.interner.key_object_type(type_id, rules) else {
             return Ok(None);
         };
+        let owner = self.interner.intern_key(owner.into());
+        let type_id = self.interner.intern_key(type_id);
         self.spawn_resolved_object_limbo_at_height_with_init(
             obj,
             type_id,
@@ -1232,15 +1280,15 @@ impl Simulation {
     fn spawn_resolved_object_limbo_at_height_with_init(
         &mut self,
         obj: &ObjectType,
-        type_id: &str,
-        owner: &str,
+        type_id: InternedId,
+        owner: InternedId,
         rx: u16,
         ry: u16,
         facing: u8,
         z: u8,
         rules: &RuleSet,
         init: TechnoConstructorInit,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Result<Option<u64>, GeneratedTechnoInitError> {
         let Some(ge) = self.construct_resolved_runtime_techno(
             obj, type_id, owner, rx, ry, facing, z, rules, init,
@@ -1266,10 +1314,10 @@ impl Simulation {
     /// Production and other limbo constructors share the same manager/child
     /// transaction; later delivery only Unlimbos this retained identity.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn create_production_object_limbo_at_height(
+    pub(crate) fn create_production_object_limbo_at_height<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
@@ -1284,23 +1332,23 @@ impl Simulation {
             facing,
             z,
             rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         )
     }
 
     /// Construct one fully initialized runtime Techno and retain it in limbo
     /// for one or more placement attempts. Starting-force creation and held
     /// production both use this identity-preserving boundary.
-    pub fn construct_object_limbo_at_height(
+    pub fn construct_object_limbo_at_height<'k>(
         &mut self,
-        type_id: &str,
-        owner: &str,
+        type_id: impl Into<InternKey<'k>>,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
         z: u8,
         rules: &RuleSet,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
         self.spawn_object_limbo_at_height_with_init(
             type_id,
@@ -1318,20 +1366,22 @@ impl Simulation {
 
     /// Retain the already selected Type::CreateInstance pointer through the
     /// same constructor/store/children/tracking transaction (Factory4C9C70).
-    pub(crate) fn construct_resolved_object_limbo_at_height(
+    pub(crate) fn construct_resolved_object_limbo_at_height<'k>(
         &mut self,
         obj: &ObjectType,
-        owner: &str,
+        owner: impl Into<InternKey<'k>>,
         rx: u16,
         ry: u16,
         facing: u8,
         z: u8,
         rules: &RuleSet,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
+        let owner = self.interner.intern_key(owner.into());
+        let type_id = self.interner.intern(&obj.id);
         self.spawn_resolved_object_limbo_at_height_with_init(
             obj,
-            &obj.id,
+            type_id,
             owner,
             rx,
             ry,
@@ -1357,7 +1407,7 @@ impl Simulation {
         z: u8,
         placement: PlacementEvidence,
         rules: &RuleSet,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
         self.reveal_constructed_object_at_height_with_overlay_context(
             stable_id,
@@ -1367,7 +1417,7 @@ impl Simulation {
             z,
             placement,
             rules,
-            None,
+            Some(rules.overlay_registry()),
             frame_effects,
         )
     }
@@ -1384,7 +1434,7 @@ impl Simulation {
         placement: PlacementEvidence,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
         let position = self
             .substrate
@@ -1413,7 +1463,7 @@ impl Simulation {
         placement: PlacementEvidence,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
         let requested_position = RevealPosition::new(
             rx,
@@ -1436,97 +1486,56 @@ impl Simulation {
         )
     }
 
-    /// Ground-delivery search for an already-constructed object. Aircraft
-    /// first need ground suitability; their own +1AC only checks shroud.
-    /// Ares 4f1d9299, UnitDeliveryStateMachine::PlaceUnits uses Track/Normal
-    /// for this search, then the usual class admission at Put. Final Unlimbo
-    /// still performs fresh admission.
-    #[cfg(feature = "ares")]
-    pub(crate) fn constructed_object_can_enter_at(
-        &self,
-        stable_id: u64,
-        cell: (u16, u16),
-        rules: &RuleSet,
-        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-    ) -> bool {
-        if self
-            .substrate
-            .entities
-            .get(stable_id)
-            .is_some_and(|entity| entity.category() == EntityCategory::Aircraft)
-        {
-            use crate::rules::locomotor_type::{MovementZone, SpeedType};
-            use crate::sim::cell_rect::{CellPassabilityArgs, CellRef, check_cell_passability};
-
-            let Some(target) = self
-                .resolved_terrain
-                .as_ref()
-                .and_then(|terrain| terrain.cell(cell.0, cell.1))
-            else {
-                return false;
-            };
-            if !check_cell_passability(
-                &CellRef::Real(target),
-                CellPassabilityArgs {
-                    speed_type: SpeedType::Track,
-                    ignore_infantry: false,
-                    ignore_vehicles: false,
-                    zone: None,
-                    movement_zone: MovementZone::Normal,
-                    level: None,
-                    is_bridge: false,
-                },
-                &self.cell_passability_map(),
-            )
-            .admits()
-            {
-                return false;
-            }
-        }
-        let position = RevealPosition::new(
-            cell.0,
-            cell.1,
-            self.terrain_cell_level(cell.0, cell.1).unwrap_or(0),
-            None,
-            SimFixed::from_num(128),
-            SimFixed::from_num(128),
-        );
-        self.constructor_unlimbo_placement(stable_id, position, rules, registry)
-            != PlacementEvidence::RejectedEarly
-    }
-
-    /// Place a delivered object standing complete, retaining the normal entry,
-    /// Unlimbo, sensor, tracking and discovery owners. A delivery is not paid
-    /// construction and must not leave a building waiting on a buildup.
-    /// Ares PlaceUnits supplies GetCoordsWithBridge and explicitly sets
-    /// OnBridge before Put; the class query's local plane is not that store.
-    #[cfg(feature = "ares")]
-    pub(crate) fn reveal_finished_object_at_coord(
+    /// Put a UnitDelivery payload (Ares PlaceUnits `10075A60`), retaining the
+    /// normal entry, Unlimbo, sensor, tracking and discovery owners. Ares
+    /// supplies GetCoordsWithBridge and sets OnBridge before Put; the class
+    /// query's local plane is not that store. `facing` is the DirType Put
+    /// receives. 3.0 reads no `Deliver.Buildups` (SW+0x4A8, default true), so a
+    /// building, which the caller has given a queued Construction, builds up
+    /// through the ordinary Unlimbo and is then DiscoveredBy its owner with
+    /// its ready byte (`+0x6DD`) set.
+    pub(crate) fn reveal_delivered_object_at_coord(
         &mut self,
         stable_id: u64,
         coord: crate::sim::components::DriveCoord,
+        facing: u8,
         on_bridge: bool,
         rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
         let entity = self.substrate.entities.get_mut(stable_id)?;
         entity.on_bridge.store(on_bridge);
         if let Some(locomotor) = entity.locomotor.as_mut() {
             locomotor.store_ground_layer(on_bridge);
         }
-        let result = self.with_buildup_bypass(|sim| {
-            sim.reveal_constructed_object_at_coord_with_overlay_context(
-                stable_id,
-                coord,
-                0,
-                PlacementEvidence::EvaluateMark,
-                rules,
-                registry,
-                effects,
+        let result = self.reveal_constructed_object_at_coord_with_overlay_context(
+            stable_id,
+            coord,
+            facing,
+            PlacementEvidence::EvaluateMark,
+            rules,
+            registry,
+            effects,
+        )?;
+        let Some((owner, building)) = self.substrate.entities.get(result).map(|entity| {
+            (
+                entity.owner(),
+                entity.category() == EntityCategory::Structure,
             )
-        })?;
-        self.substrate.ready_finished_spawn_adapter(result);
+        }) else {
+            return Some(result);
+        };
+        if building {
+            self.discover_techno(
+                result,
+                owner,
+                super::lifecycle::UninitContext::new(rules).with_effects(effects),
+            );
+            if let Some(entity) = self.substrate.entities.get_mut(result) {
+                entity.mission_leaf.set_building_ready_latch(1);
+            }
+        }
         Some(result)
     }
 
@@ -1541,13 +1550,12 @@ impl Simulation {
         placement: PlacementEvidence,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
         if let Some(outcome) = self.unlimbo_constructed_upgrade(
             stable_id,
             requested_position,
             rules,
-            overlay_registry,
             frame_effects,
             true,
         ) {
@@ -1559,6 +1567,7 @@ impl Simulation {
             rules,
             overlay_registry,
             frame_effects,
+            true,
         ) {
             return (outcome == RevealOutcome::Consumed).then_some(stable_id);
         }
@@ -1567,13 +1576,8 @@ impl Simulation {
             .entities
             .get(stable_id)
             .is_some_and(|entity| entity.category() == EntityCategory::Infantry);
-        let (requested_position, placement) = self.unlimbo_class_entry(
-            stable_id,
-            requested_position,
-            placement,
-            rules,
-            overlay_registry,
-        )?;
+        let (requested_position, placement) =
+            self.unlimbo_class_entry(stable_id, requested_position, placement, rules)?;
         if placement == PlacementEvidence::RejectedEarly {
             let _ = self.try_reveal_entity_with_context(
                 stable_id,
@@ -1582,8 +1586,7 @@ impl Simulation {
                     placement,
                     logic_eligible: true,
                 },
-                super::lifecycle::UninitContext::new(rules, overlay_registry)
-                    .with_effects(frame_effects),
+                super::lifecycle::UninitContext::new(rules).with_effects(frame_effects),
             );
             return None;
         }
@@ -1595,7 +1598,7 @@ impl Simulation {
                 placement,
                 logic_eligible: true,
             },
-            super::lifecycle::UninitContext::new(rules, overlay_registry)
+            super::lifecycle::UninitContext::new(rules)
                 .with_effects(frame_effects)
                 .with_unlimbo_facing(Some(facing)),
         );
@@ -1615,7 +1618,6 @@ impl Simulation {
             stable_id,
             rules,
         );
-        self.add_unit_sensor_after_unlimbo(stable_id, rules, overlay_registry);
         Some(stable_id)
     }
 
@@ -1632,21 +1634,26 @@ impl Simulation {
         facing: u8,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
         use crate::map::cell_index::NativeCellIdentity;
         let building = self.substrate.entities.get(stable_id)?;
         if building.category() != EntityCategory::Structure {
             return None;
         }
-        //458A92 reads Object5F5B90 -> Type45EC20's sentinel list once.
-        let foundation = building.type_facts.foundation().cell_offsets();
+        //458A92 reads Object5F5B90 -> Type45EC20's sentinel list once. The
+        // walk changes the world, so the list is copied out of the building.
+        let foundation: Vec<_> = building
+            .seldom
+            .type_facts
+            .foundation()
+            .cell_offsets()
+            .collect();
         let origin = (
             crate::util::lepton::lepton_to_cell_packed(coord.x),
             crate::util::lepton::lepton_to_cell_packed(coord.y),
         );
-        let context = super::lifecycle::UninitContext::new(rules, overlay_registry)
-            .with_effects(frame_effects);
+        let mut context = super::lifecycle::UninitContext::new(rules).with_effects(frame_effects);
         let mut displaced = Vec::new();
         for (dx, dy) in foundation {
             let terrain = self.resolved_terrain.as_ref()?;
@@ -1670,7 +1677,7 @@ impl Simulation {
                     }
                 }
             }
-            if !self.clear_mobile_placement_cell(cell, &mut displaced, context) {
+            if !self.clear_mobile_placement_cell(cell, &mut displaced, context.reborrow()) {
                 self.restore_displaced_placement_technos(
                     displaced,
                     false,
@@ -1689,7 +1696,7 @@ impl Simulation {
             PlacementEvidence::EvaluateMark,
             rules,
             overlay_registry,
-            frame_effects,
+            context.effects(),
         );
         if placed.is_none() {
             //458C3A internally uninitializes the new Building before rollback.
@@ -1718,7 +1725,7 @@ impl Simulation {
         facing: u8,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Option<u64> {
         let foot = self.substrate.entities.get(stable_id)?;
         if !matches!(
@@ -1732,10 +1739,9 @@ impl Simulation {
             crate::util::lepton::lepton_to_cell_packed(coord.y),
         );
         let cell = self.resolved_terrain.as_ref()?.native_cell_identity(at);
-        let context = super::lifecycle::UninitContext::new(rules, overlay_registry)
-            .with_effects(frame_effects);
+        let mut context = super::lifecycle::UninitContext::new(rules).with_effects(frame_effects);
         let mut displaced = Vec::new();
-        if !self.clear_mobile_placement_cell(cell, &mut displaced, context) {
+        if !self.clear_mobile_placement_cell(cell, &mut displaced, context.reborrow()) {
             self.restore_displaced_placement_technos(
                 displaced,
                 false,
@@ -1752,7 +1758,7 @@ impl Simulation {
             PlacementEvidence::EvaluateMark,
             rules,
             overlay_registry,
-            frame_effects,
+            context.effects(),
         );
         if placed.is_none() {
             //4DF674: this failure already UnInits the new Foot;50D507 may
@@ -1777,7 +1783,7 @@ impl Simulation {
         &mut self,
         cell: crate::map::cell_index::NativeCellIdentity,
         displaced: &mut Vec<u64>,
-        context: super::lifecycle::UninitContext<'_>,
+        mut context: super::lifecycle::UninitContext<'_>,
     ) -> bool {
         use crate::map::cell_index::NativeCellIdentity;
         use crate::sim::movement::locomotor::MovementLayer;
@@ -1816,7 +1822,7 @@ impl Simulation {
                 return false;
             };
             displaced.push(id);
-            self.techno_limbo_with_context(id, context);
+            self.techno_limbo_with_context(id, context.reborrow());
         }
     }
 
@@ -1829,7 +1835,7 @@ impl Simulation {
         nearby: bool,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         use crate::rules::locomotor_type::MovementZone;
         use crate::sim::movement::ground_pose;
@@ -1897,8 +1903,7 @@ impl Simulation {
             if placed.is_none() {
                 self.uninit_with_context(
                     id,
-                    super::lifecycle::UninitContext::new(rules, overlay_registry)
-                        .with_effects(frame_effects),
+                    super::lifecycle::UninitContext::new(rules).with_effects(frame_effects),
                 );
             }
         }
@@ -1999,8 +2004,8 @@ impl Simulation {
         // facts explicit so storage can never imply cell or logic presence.
         ge.lifecycle.reset_constructed();
         // ObjectClass's constructor clears IsInLogic (`0x005F398D`).
-        ge.in_logic_vector.mark(false);
-        ge.kill_record.reset_constructed();
+        ge.seldom.in_logic_vector.mark(false);
+        ge.seldom.kill_record.reset_constructed();
 
         substrate.entities.insert(ge);
         // Phobos TechnoExt::InitializeState, hook 0x006F42F7: every Foot
@@ -2012,12 +2017,7 @@ impl Simulation {
             houses.request_house_tech_tree_recheck(entity.owner());
         }
         // The class constructors and InitFromType call Add_Tracking.
-        Self::update_house_tracking(
-            substrate,
-            houses,
-            stable_id,
-            crate::sim::house_tracking::HouseTracking::add_tracking,
-        );
+        HouseTracking::register_object(substrate, houses, stable_id);
         stable_id
     }
 
@@ -2029,7 +2029,7 @@ impl Simulation {
         &mut self,
         stable_id: u64,
         rules: &RuleSet,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> bool {
         let Some(entity) = self.substrate.entities.get(stable_id) else {
             return false;
@@ -2061,7 +2061,7 @@ impl Simulation {
         // and delegated Techno Remove_Tracking, rather than a manual store drop.
         self.finalize_and_remove_common(
             stable_id,
-            super::lifecycle::UninitContext::new(rules, None).with_effects(frame_effects),
+            super::lifecycle::UninitContext::new(rules).with_effects(frame_effects),
             // This scalar entry belongs to the ordinary admitted match. The
             // authored-load deferred owner supplies its distinct GameState0.
             1,
@@ -2116,7 +2116,7 @@ impl Simulation {
         ge: GameEntity,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> (u64, RevealOutcome) {
         let (stable_id, position) = self.store_with_constructor_managers(ge, rules, frame_effects);
         self.unlimbo_constructed_parent(
@@ -2133,7 +2133,7 @@ impl Simulation {
         &mut self,
         ge: GameEntity,
         rules: &RuleSet,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> (u64, RevealPosition) {
         let position = ge.position;
         let stable_id = Self::store_spawned_limbo(&mut self.substrate, &mut self.houses, ge);
@@ -2155,7 +2155,7 @@ impl Simulation {
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
         scenario_initialization: bool,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> (u64, RevealOutcome) {
         // ScenarioFullInit686B4F raises A8E7AC before InfantryRead51FB00
         // at687ACB, retaining it until687C2B..687C44 after all map objects.
@@ -2177,7 +2177,6 @@ impl Simulation {
             stable_id,
             position,
             rules,
-            overlay_registry,
             frame_effects,
             !scenario_initialization,
         ) {
@@ -2189,16 +2188,13 @@ impl Simulation {
             rules,
             overlay_registry,
             frame_effects,
+            !scenario_initialization,
         ) {
             return (stable_id, outcome);
         }
-        let Some((position, placement)) = self.unlimbo_class_entry(
-            stable_id,
-            position,
-            PlacementEvidence::EvaluateMark,
-            rules,
-            overlay_registry,
-        ) else {
+        let Some((position, placement)) =
+            self.unlimbo_class_entry(stable_id, position, PlacementEvidence::EvaluateMark, rules)
+        else {
             return (
                 stable_id,
                 RevealOutcome::Failed(super::lifecycle::RevealFailure::RejectedEarly),
@@ -2216,7 +2212,7 @@ impl Simulation {
                 placement,
                 logic_eligible: true,
             },
-            super::lifecycle::UninitContext::new(rules, overlay_registry)
+            super::lifecycle::UninitContext::new(rules)
                 .with_effects(frame_effects)
                 .with_unlimbo_facing(facing),
         );
@@ -2265,7 +2261,6 @@ impl Simulation {
         requested: RevealPosition,
         placement: PlacementEvidence,
         rules: &RuleSet,
-        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     ) -> Option<(RevealPosition, PlacementEvidence)> {
         let infantry = self
             .substrate
@@ -2279,7 +2274,7 @@ impl Simulation {
         };
         let placement = match placement {
             PlacementEvidence::EvaluateMark => {
-                self.constructor_unlimbo_placement(stable_id, position, rules, overlay_registry)
+                self.constructor_unlimbo_placement(stable_id, position, rules)
             }
             _ => placement,
         };
@@ -2288,6 +2283,7 @@ impl Simulation {
             && let Some(entity) = self.substrate.entities.get_mut(stable_id)
         {
             entity
+                .seldom
                 .sub_cell
                 .hold_offset(position.sub_x(), position.sub_y());
         }
@@ -2301,7 +2297,6 @@ impl Simulation {
         stable_id: u64,
         position: RevealPosition,
         rules: &RuleSet,
-        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     ) -> PlacementEvidence {
         let Some(entity) = self.substrate.entities.get(stable_id) else {
             return PlacementEvidence::RejectedEarly;
@@ -2337,7 +2332,6 @@ impl Simulation {
             let admitted = super::object_entry::classify_object(
                 self,
                 rules,
-                overlay_registry,
                 crate::sim::occupancy::CellObjectMember::Entity(stable_id),
                 cell,
                 crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
@@ -2350,7 +2344,6 @@ impl Simulation {
                     super::object_entry::classify_object(
                         self,
                         rules,
-                        overlay_registry,
                         crate::sim::occupancy::CellObjectMember::Entity(stable_id),
                         cells.lookup_world(x, y),
                         crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
@@ -2371,7 +2364,6 @@ impl Simulation {
             cell,
             crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
             rules,
-            overlay_registry,
         ) {
             Ok(0) => PlacementEvidence::FootEntryAdmitted,
             Ok(_) => PlacementEvidence::RejectedEarly,
@@ -2391,7 +2383,7 @@ impl Simulation {
         &mut self,
         parent_id: u64,
         rules: &RuleSet,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         // InitManagers6F3F83 registers the typed parent before constructing
         // its Spawn/Slave manager children. Load/NoInit bypasses this owner.
@@ -2411,7 +2403,7 @@ impl Simulation {
         stable_id: u64,
         rules: &RuleSet,
     ) {
-        let Some((category, veterancy, in_playfield, type_ref, stealth_ability)) =
+        let Some((category, veterancy, in_playfield, type_ref, stealth_ability, attached_cloak)) =
             substrate.entities.get(stable_id).map(|entity| {
                 (
                     entity.category(),
@@ -2419,6 +2411,7 @@ impl Simulation {
                     entity.in_playfield(),
                     entity.type_ref(),
                     entity.stealth_ability,
+                    entity.cloak_attached(),
                 )
             })
         else {
@@ -2432,7 +2425,7 @@ impl Simulation {
             return;
         };
         let rank_cloak = has_weapon_ability(rank_from_u16(veterancy), object, Ability::Cloak);
-        let intrinsic_cloak = stealth_ability.active(object.cloakable);
+        let intrinsic_cloak = attached_cloak || stealth_ability.active(object.cloakable);
         if !intrinsic_cloak && !rank_cloak {
             return;
         }
@@ -2454,9 +2447,9 @@ impl Simulation {
     /// already facing it, becomes that building. False when it refuses.
     ///
     /// Not carried over to the building: the unit's AttachedTag
-    /// (`+0x34`, `0x007399EE`), its looping sound handles (`+0x4DC..+0x4F4`,
-    /// `0x00739971`), `DiscoveredBy(owner)` (vt+0x198, `0x00739848`) and the
-    /// turret facing a `+0x16CA`/`+0x16C4` type starts at (`0x007397FB`).
+    /// (`+0x34`, `0x007399EE`), `DiscoveredBy(owner)` (vt+0x198,
+    /// `0x00739848`) and the turret facing a `+0x16CA`/`+0x16C4` type starts
+    /// at (`0x007397FB`).
     /// Phobos `TechnoExt::SyncInvulnerability` (`Techno/Body.cpp:156`): a
     /// deploy or undeploy conversion carries an active curtain to the new
     /// object when the source type's `KeptOnDeploy` (else its global) allows
@@ -2490,12 +2483,88 @@ impl Simulation {
         kept.unwrap_or(fallback).then(|| state.synced())
     }
 
+    /// The AI half of a construction yard's arrival for a house no human
+    /// controls: `HouseClass::RefreshBuildOptionsAfterDeploy @ 0x00505180`
+    /// (Computer_Paranoid in a nonzero game mode, `0x005051AF`, then Recalc
+    /// for an empty plan, `0x005051C5..0x005051D1`), then node zero and the
+    /// BasePlan center (`+0x5750`) take `cell` and Production,
+    /// AITriggersActive and AutoBaseBuilding are set. `UnitClass::Deploy`
+    /// (`0x007398D9..0x00739919`) runs it with the yard's origin after its
+    /// primary center write; Ares 3.0 MPGameMode_SpawnBaseUnit_BuildConst
+    /// (1001F0B0, hook 0x5D7048) with the house's base cell, before the yard
+    /// exists. Native indexes Recalc's vectors unchecked; a plan VERA cannot
+    /// preflight stays empty.
+    pub(crate) fn refresh_ai_base_after_deploy(
+        &mut self,
+        owner_id: InternedId,
+        cell: (u16, u16),
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) {
+        let Some(house) = self.houses.get(&owner_id) else {
+            return;
+        };
+        // 0x005051AF: the computer's deploy requests Paranoid before base
+        // recalculation, independently of [AI] Paranoid.
+        if self.session.rule_policy().permits_paranoid_reactions() && !house.is_human() {
+            self.computer_paranoid(rules, registry, frame_effects);
+        }
+        let house = &self.houses[&owner_id];
+        if house.base_plan().nodes().is_empty() {
+            let country_name = house
+                .country()
+                .map(|country| self.interner.resolve(country).to_owned());
+            let (side_index, difficulty, tech_level) =
+                (house.side_index(), house.difficulty(), house.tech_level());
+            match country_name {
+                Some(country_name)
+                    if preflight_recalc(
+                        rules,
+                        &country_name,
+                        side_index,
+                        difficulty,
+                        self.session.game_options().super_weapons,
+                    )
+                    .is_ok() =>
+                {
+                    recalc_base_plan(
+                        self.houses
+                            .get_mut(&owner_id)
+                            .expect("refreshed owner remains registered")
+                            .base_plan_mut(),
+                        rules,
+                        &self.type_tech_levels,
+                        &country_name,
+                        side_index,
+                        difficulty,
+                        tech_level,
+                        self.session.game_options().super_weapons,
+                        &mut self.scenario_rng,
+                    );
+                }
+                _ => log::warn!(
+                    "AI base Recalc skipped: unusable country, difficulty tables or BuildPower/BuildRefinery lists"
+                ),
+            }
+        }
+        let house = self
+            .houses
+            .get_mut(&owner_id)
+            .expect("refreshed owner remains registered");
+        house
+            .base_plan_mut()
+            .anchor_first_node(pack_base_plan_cell(i32::from(cell.0), i32::from(cell.1)));
+        house.anchor_base_plan(cell);
+        house.enable_ai_deploy_latches();
+    }
+
     pub(crate) fn deploy_mcv(
         &mut self,
         stable_id: u64,
         rules: &RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> bool {
         // Native early exits on a NavCom (0x7393E4) or the locomotor's
         // Is_Moving (vt+0x10 at 0x00739405, 0x73940A) retain runtime +0x68C.
@@ -2510,7 +2579,7 @@ impl Simulation {
         // its refusal clears Unit+0x68C (0x00739AA7).
         if !self.can_deploy_slash_unload(stable_id, rules) {
             if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-                entity.mcv_deploy_pending.clear();
+                entity.seldom.mcv_deploy_pending.clear();
             }
             return false;
         }
@@ -2538,7 +2607,7 @@ impl Simulation {
                 yard_obj.id.clone(),
                 yard_obj.deploy_facing,
                 (
-                    entity.selection.is_selected(),
+                    entity.seldom.selection.is_selected(),
                     entity.veterancy.clone(),
                     entity.object_group_copy(),
                     entity.attack_target.target(),
@@ -2589,7 +2658,7 @@ impl Simulation {
         // back (`0x0073953B..0x00739565` / `0x0073959C..0x007395B4`) before
         // either outcome acts.
         self.foot_mark_remove(stable_id, rules, registry, frame_effects);
-        self.locomotor_mark_all_occupation_bits(stable_id, false);
+        self.locomotor_mark_all_occupation_bits(stable_id, false, rules.ares_form());
         let yard = rules.object(&yard_type);
         let placeable = yard.is_some_and(|yard| {
             crate::sim::build_site::can_place_building_at(
@@ -2614,7 +2683,7 @@ impl Simulation {
                 frame_effects,
             );
         }
-        self.locomotor_mark_all_occupation_bits(stable_id, true);
+        self.locomotor_mark_all_occupation_bits(stable_id, true, rules.ares_form());
         self.foot_mark_put(stable_id, rules, registry, frame_effects);
         if !placeable {
             log::info!("MCV deploy blocked at origin {origin:?}");
@@ -2630,6 +2699,7 @@ impl Simulation {
                 .entities
                 .get_mut(stable_id)
                 .unwrap()
+                .seldom
                 .mcv_deploy_pending
                 .clear();
             crate::sim::mcv_deploy::queue_guard(self, stable_id, rules);
@@ -2659,7 +2729,7 @@ impl Simulation {
                 frame_effects,
             );
             if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-                entity.mcv_deploy_pending.raise();
+                entity.seldom.mcv_deploy_pending.raise();
             }
             return true;
         }
@@ -2669,10 +2739,11 @@ impl Simulation {
         // calls `FUN_00505180 @ 0x00505180` only for a non-controlled
         // ConstructionYard in a nonzero game mode. VERA preflights only the
         // directly indexed Recalc vectors before the destructive MCV removal.
+        let policy = self.session.rule_policy();
         let recalc_context = self.houses.get(&owner_id).and_then(|house| {
             (is_construction_yard
-                && self.session.game_mode_nonzero()
-                && !house.is_controlled_by_human(true))
+                && policy.uses_managed_ai_base()
+                && !house.is_controlled_by_human(policy))
             .then(|| {
                 let country_name = house
                     .country()
@@ -2681,23 +2752,31 @@ impl Simulation {
                     country_name,
                     house.side_index(),
                     house.difficulty(),
-                    house.tech_level(),
                     house.base_plan().nodes().is_empty(),
                 )
             })
         });
-        if let Some((country_name, side_index, difficulty, _, true)) = &recalc_context {
+        if let Some((country_name, side_index, difficulty, true)) = &recalc_context {
             let Some(country_name) = country_name.as_deref() else {
                 // Controlled unavailable Rust prerequisite; no native
                 // constructor/placement transaction has started here.
                 if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-                    entity.mcv_deploy_pending.clear();
+                    entity.seldom.mcv_deploy_pending.clear();
                 }
                 return false;
             };
-            if preflight_recalc(rules, country_name, *side_index, *difficulty).is_err() {
+            if preflight_recalc(
+                rules,
+                country_name,
+                *side_index,
+                *difficulty,
+                self.session.game_options().super_weapons,
+            )
+            .is_err()
+            {
+                log::warn!("MCV deploy refused: no usable AI base plan for {country_name}");
                 if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-                    entity.mcv_deploy_pending.clear();
+                    entity.seldom.mcv_deploy_pending.clear();
                 }
                 return false;
             }
@@ -2714,7 +2793,7 @@ impl Simulation {
             ))
         }) else {
             if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-                entity.mcv_deploy_pending.clear();
+                entity.seldom.mcv_deploy_pending.clear();
             }
             return false;
         };
@@ -2727,12 +2806,11 @@ impl Simulation {
         // Slave Miner's DeploysInto transaction. Original Steam739660..739711
         // and failure739A6E..739AA7 are retained in mcv-placement-causality.
         self.foot_mark_remove(stable_id, rules, registry, frame_effects);
-        self.locomotor_mark_all_occupation_bits(stable_id, false);
-        let owner_str = self.interner.resolve(owner_id).to_string();
+        self.locomotor_mark_all_occupation_bits(stable_id, false, rules.ares_form());
         let Some(mut destination) = self
             .construct_runtime_techno(
                 &yard_type,
-                &owner_str,
+                owner_id,
                 rx,
                 ry,
                 0,
@@ -2743,10 +2821,10 @@ impl Simulation {
             .expect("fresh Techno constructor initialization cannot fail")
         else {
             //739A77..739AA7 restores locomotor head bits before Mark(DOWN).
-            self.locomotor_mark_all_occupation_bits(stable_id, true);
+            self.locomotor_mark_all_occupation_bits(stable_id, true, rules.ares_form());
             self.foot_mark_put(stable_id, rules, registry, frame_effects);
             if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-                entity.mcv_deploy_pending.clear();
+                entity.seldom.mcv_deploy_pending.clear();
             }
             return false;
         };
@@ -2764,7 +2842,7 @@ impl Simulation {
         // so only its discovery/IsHumanPlayer gate differs from this raw
         // flag; `techno_select` would refuse the still-limboed building here.
         if was_selected {
-            destination.selection.select();
+            destination.seldom.selection.select();
         }
         // Construction is queued before the Unlimbo (0x007396D5), so its
         // cell-put and owner discoveries leave the yard shut while that
@@ -2784,11 +2862,11 @@ impl Simulation {
             //739A6E first scalar-deletes the refused constructor-complete
             // Building; only then739A94/+124(1) restore the original Unit.
             self.discard_constructed_limbo(new_sid, rules, frame_effects);
-            self.locomotor_mark_all_occupation_bits(stable_id, true);
+            self.locomotor_mark_all_occupation_bits(stable_id, true, rules.ares_form());
             self.foot_mark_put(stable_id, rules, registry, frame_effects);
             //739AA7 clears+68C only after both original restoration calls.
             if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
-                entity.mcv_deploy_pending.clear();
+                entity.seldom.mcv_deploy_pending.clear();
             }
             return false;
         }
@@ -2830,8 +2908,7 @@ impl Simulation {
             .collect();
         for (targeter, drops) in targeters {
             let target = (!drops).then_some(TargetKind::Entity(new_sid));
-            let _ =
-                self.assign_target_represented(targeter, target, rules, registry, frame_effects);
+            let _ = self.assign_target_represented(targeter, target, rules, frame_effects);
         }
         // gamemd.exe UnitClass::Deploy7393C0 copies Techno+214 at7397CC.
         if let Some(building) = self.substrate.entities.get_mut(new_sid) {
@@ -2842,25 +2919,24 @@ impl Simulation {
         if let Some(building) = self.substrate.entities.get_mut(new_sid) {
             building.veterancy.inherit(&veterancy);
         }
-        // 0x007397E4..0x007397F4: a building deployed for a house other than
-        // the local player's (`IsHumanPlayer`, here whether a human controls
-        // it) is AI-repairable (`+0x6CB`; its AI-rebuildable `+0x6CA` has no
-        // building reader).
+        // UnitClass::Deploy 0x007397E4..0x007397F4 calls House50B6F0 before
+        // granting the repairable byte (+0x6CB). VERA uses the shared human
+        // classification so the retained byte is the same on every peer.
+        // The accompanying rebuildable byte (+0x6CA) has no building reader.
         if !self.owner_is_human(owner_id)
             && let Some(building) = self.substrate.entities.get_mut(new_sid)
         {
-            building.ai_sell_repair.make_repairable();
+            building.seldom.ai_sell_repair.make_repairable();
         }
         // 0x0073982C: the building takes the unit's target.
-        let _ =
-            self.assign_target_represented(new_sid, source_target, rules, registry, frame_effects);
+        let _ = self.assign_target_represented(new_sid, source_target, rules, frame_effects);
         // 0x00739848: DiscoveredBy(owner), which the queued Construction keeps
         // from opening it; 0x0073984E: the ready byte, so its first Update
         // commences Construction.
         self.discover_techno(
             new_sid,
             owner_id,
-            super::UninitContext::new(rules, registry).with_effects(frame_effects),
+            super::UninitContext::new(rules).with_effects(frame_effects),
         );
         if let Some(building) = self.substrate.entities.get_mut(new_sid) {
             building.mission_leaf.set_building_ready_latch(1);
@@ -2872,66 +2948,53 @@ impl Simulation {
             new_sid,
             rules,
         );
-        self.add_unit_sensor_after_unlimbo(new_sid, rules, registry);
         self.mission_spawned_entities = true;
-        if let Some((country_name, side_index, difficulty, tech_level, _)) = recalc_context {
+        if recalc_context.is_some() {
             // The new Building's committed north-west anchor is the native
             // `+0x9C/+0xA0` source. This bounded write order is load-bearing:
-            // primary center, Computer_Paranoid, optional Recalc, node zero,
-            // BasePlan center, the three independent House AI activation
-            // latches, then MoveGroundForcesToBase (`0x00739926`). The block
-            // ends before the slave transfer and UnInit below.
+            // primary center, then the shared AI half (Computer_Paranoid,
+            // optional Recalc, node zero, BasePlan center, the three
+            // independent House AI activation latches), then
+            // MoveGroundForcesToBase (`0x00739926`). The block ends before the
+            // slave transfer and UnInit below.
             self.houses
                 .get_mut(&owner_id)
                 .expect("qualifying deploy owner remains registered")
                 .set_base_center((rx, ry));
-            // `0x00505180` turns the computers paranoid for a house no human
-            // controls (`0x005051AF`) before its Recalc.
-            self.computer_paranoid(rules, registry, frame_effects);
-            let house = self
-                .houses
-                .get_mut(&owner_id)
-                .expect("qualifying deploy owner remains registered");
-            if house.base_plan().nodes().is_empty() {
-                recalc_base_plan(
-                    house.base_plan_mut(),
-                    rules,
-                    &self.type_tech_levels,
-                    country_name
-                        .as_deref()
-                        .expect("empty qualifying plan was preflighted with a country"),
-                    side_index,
-                    difficulty,
-                    tech_level,
-                    self.session.game_options().super_weapons,
-                    &mut self.scenario_rng,
-                );
-            }
-            house
-                .base_plan_mut()
-                .anchor_first_node(pack_base_plan_cell(i32::from(rx), i32::from(ry)));
-            house.anchor_base_plan((rx, ry));
-            house.enable_ai_deploy_latches();
+            self.refresh_ai_base_after_deploy(owner_id, (rx, ry), rules, registry, frame_effects);
             // Phobos `[General] GatherWhenMCVDeploy=` skips the native
             // regroup (hook at `0x739920`) while keeping every earlier write.
-            #[cfg(feature = "phobos")]
-            let gather = rules.general.gather_when_mcv_deploy;
-            #[cfg(not(feature = "phobos"))]
-            let gather = true;
-            if gather {
-                self.move_ground_forces_to_base(owner_id, rules, registry, frame_effects);
+            let gather = !rules.phobos() || rules.general.gather_when_mcv_deploy;
+            // A command-layer-driven house manages its own forces: the
+            // regroup overwrites every own ground unit's NavCom, which the
+            // external controller only observes a tick later. Every write
+            // above this gate stays.
+            if gather
+                && !self
+                    .houses
+                    .get(&owner_id)
+                    .is_some_and(|house| house.command_driven())
+            {
+                self.move_ground_forces_to_base(owner_id, rules, frame_effects);
             }
         }
 
         // 0x00739956: a Slave Miner's manager moves to its refinery (the
         // hand-off 0x006B0D10, then SetOwner 0x006AF580) before the unit
         // leaves; the refinery's own fresh slaves are freed.
-        #[cfg(feature = "ares")]
-        self.transfer_factory_country(stable_id, new_sid);
+        // Ares UnitClass_Deploy_Transfer (10048E90 -> 10045A80): the bomb,
+        // then the original owner.
+        if rules.ares() {
+            self.transfer_ivan_bomb(stable_id, new_sid);
+            self.transfer_factory_country(stable_id, new_sid);
+        }
         self.transfer_slave_manager(stable_id, new_sid, true, rules, registry, frame_effects);
+        // 0x00739971..0x007399B2: the building takes the unit's voice handle
+        // and latch, so a line the unit is speaking plays on.
+        self.move_unit_voice(stable_id, new_sid);
         self.uninit_with_context(
             stable_id,
-            super::UninitContext::new(rules, registry).with_effects(frame_effects),
+            super::UninitContext::new(rules).with_effects(frame_effects),
         );
 
         // UnitClass::Deploy 0x00739A19..0x00739A54 plays Type+0x56C
@@ -2959,19 +3022,18 @@ impl Simulation {
     pub(crate) fn undeploy_building(
         &mut self,
         stable_id: u64,
+        delegated: bool,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> bool {
-        self.can_undeploy_building_runtime(stable_id, rules)
-            && production::sell_back(
-                self,
-                rules,
-                stable_id,
-                production::SellOrder::Undeploy,
-                registry,
-                frame_effects,
-            )
+        let order = if delegated {
+            production::SellOrder::DelegatedRedeploy { explicit: true }
+        } else {
+            production::SellOrder::Undeploy
+        };
+        self.can_undeploy_building_runtime(stable_id, delegated, rules)
+            && production::sell_back(self, rules, stable_id, order, registry, frame_effects)
     }
 
     /// `BuildingClass::Mission_Selling`'s UndeploysInto conversion (`0x00449CEA`), on
@@ -2981,7 +3043,8 @@ impl Simulation {
     /// managers' children, the building's live attackers are listed
     /// (`0x00449F23..0x00449FDC`, Techno array order) and the building leaves
     /// the map (vt+0xD4, whose Detach_All clears their targets) for the
-    /// unit's Unlimbo (`0x0044A002`). After its health
+    /// unit's Unlimbo (`0x0044A002`), which faces the building type's
+    /// DeployFacing (`0x00449FED..0x00449FFA`). After its health
     /// (`0x0044A010..0x0044A039`) a building's slave manager moves to it
     /// (SetOwner `0x006AF580` at `0x0044A047`, which frees the unit's own
     /// fresh slaves), the unit takes the building's veterancy
@@ -2999,16 +3062,17 @@ impl Simulation {
         sid: u64,
         rules: &RuleSet,
         overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
-        let Some((unit_type, owner_id, rx, ry, z, was_selected)) =
+        let Some((unit_type, owner_id, rx, ry, z, was_selected, unlimbo_facing)) =
             self.substrate.entities.get(sid).and_then(|entity| {
                 let type_str = self.interner.resolve(entity.type_ref());
                 let unit_type = production::undeploy_target(rules, type_str)?;
+                let building_type = rules.object(type_str)?;
                 let (rx, ry) = undeploy_unit_cell(
                     entity.position.rx(),
                     entity.position.ry(),
-                    &rules.object(type_str)?.foundation,
+                    &building_type.foundation,
                 );
                 Some((
                     unit_type,
@@ -3016,7 +3080,10 @@ impl Simulation {
                     rx,
                     ry,
                     entity.position.z(),
-                    entity.selection.is_selected(),
+                    entity.seldom.selection.is_selected(),
+                    // Selling449FED..44A002: the unit's Unlimbo direction is
+                    // the building type's DeployFacing (+0xEDC, 0x00465D70).
+                    building_type.deploy_facing,
                 ))
             })
         else {
@@ -3044,15 +3111,13 @@ impl Simulation {
         else {
             return;
         };
-        let unit_type = self.interner.resolve(unit_type_id).to_string();
-        let owner = self.interner.resolve(owner_id).to_string();
         let Some(unit) = self
             .construct_runtime_techno(
-                &unit_type,
-                &owner,
+                unit_type_id,
+                owner_id,
                 rx,
                 ry,
-                0,
+                unlimbo_facing,
                 z,
                 rules,
                 TechnoConstructorInit::FreshScenario,
@@ -3061,7 +3126,7 @@ impl Simulation {
         else {
             self.uninit_with_context(
                 sid,
-                super::UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
+                super::UninitContext::new(rules).with_effects(frame_effects),
             );
             return;
         };
@@ -3094,14 +3159,16 @@ impl Simulation {
             .collect();
         let _ = self.techno_limbo_with_context(
             sid,
-            super::UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
+            super::UninitContext::new(rules).with_effects(frame_effects),
         );
+        // Ares 3.0 BuildingClass_Mi_Selling_PutMcv (1005C5D0, hook 0x449FF8)
+        // puts the unit with A8E7AC raised, so no Can_Enter_Cell refuses it.
         let (new_sid, outcome) = self.unlimbo_constructed_parent(
             new_sid,
             position,
             rules,
             overlay_registry,
-            false,
+            rules.ares(),
             frame_effects,
         );
         if !matches!(
@@ -3111,7 +3178,13 @@ impl Simulation {
             //44A16B..44A176 pays the cached signed amount to the live owner.
             //The following tail never deletes the new Unit: its existing
             //limbo identity/Tracking remain, including ShortGame's BaseUnit count.
-            if let Some(refund) = failed_unlimbo_refund
+            // 1005C5D0 ignores the result: no refund, and the building goes
+            // with the unit left in limbo. RESIDUAL: Ares runs the rest of
+            // the conversion (health, veterancy, archive, attackers) on that
+            // limbo unit; VERA stops here. Trigger: a forced Put that still
+            // fails (no cell under the yard). Effect: none visible.
+            if !rules.ares()
+                && let Some(refund) = failed_unlimbo_refund
                 && let Some(owner) = self
                     .substrate
                     .entities
@@ -3122,7 +3195,7 @@ impl Simulation {
             }
             self.uninit_with_context(
                 sid,
-                super::UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
+                super::UninitContext::new(rules).with_effects(frame_effects),
             );
             return;
         }
@@ -3133,7 +3206,6 @@ impl Simulation {
             new_sid,
             rules,
         );
-        self.add_unit_sensor_after_unlimbo(new_sid, rules, overlay_registry);
         if let Some(unit) = self.substrate.entities.get_mut(new_sid) {
             converted_health.apply(unit);
             // RESIDUAL: native Selects the new unit (vt+0x14C, `0x0044A137`)
@@ -3141,7 +3213,7 @@ impl Simulation {
             // skips its discovery/IsHumanPlayer gate, ObjectClass::Select and
             // tag event 0x21.
             if was_selected {
-                unit.selection.select();
+                unit.seldom.selection.select();
             }
             // gamemd.exe BuildingClass::Mission_Selling copies +214 at44A052.
             unit.assign_object_group_copy(source_group);
@@ -3149,9 +3221,20 @@ impl Simulation {
             // the unit's own.
             unit.veterancy.inherit(&veterancy);
         }
-        #[cfg(feature = "ares")]
-        self.transfer_factory_country(sid, new_sid);
+        // Ares BuildingClass_Mi_Selling_Transfer (10048E90 -> 10045A80).
+        if rules.ares() {
+            self.transfer_ivan_bomb(sid, new_sid);
+            self.transfer_factory_country(sid, new_sid);
+        }
         self.transfer_slave_manager(sid, new_sid, false, rules, overlay_registry, frame_effects);
+        // Ares hook 0x44A04C (10053D60), right after that handover: the unit
+        // takes the building's EMP counter and sparkle.
+        if rules.ares() {
+            self.copy_ares_emp_to_undeployed(sid, new_sid, rules);
+        }
+        // BuildingClass::Mission_Selling 0x0044A0D4..0x0044A115: the unit
+        // takes the building's voice handle and latch.
+        self.move_unit_voice(sid, new_sid);
         // Cell clicks, object clicks (event 0x1E) and the SlaveManager
         // relocation share ArchiveTarget; conversion sends the new Unit to
         // that existing goal, a Cell or an object: vt+0x480
@@ -3172,21 +3255,20 @@ impl Simulation {
         }
         let target = Some(TargetKind::Entity(new_sid));
         for targeter in targeters {
-            let _ = self.assign_target_represented(
-                targeter,
-                target,
-                rules,
-                overlay_registry,
-                frame_effects,
-            );
+            let _ = self.assign_target_represented(targeter, target, rules, frame_effects);
         }
         self.uninit_with_context(
             sid,
-            super::UninitContext::new(rules, overlay_registry).with_effects(frame_effects),
+            super::UninitContext::new(rules).with_effects(frame_effects),
         );
     }
 
-    pub(crate) fn can_undeploy_building_runtime(&self, stable_id: u64, rules: &RuleSet) -> bool {
+    pub(crate) fn can_undeploy_building_runtime(
+        &self,
+        stable_id: u64,
+        delegated: bool,
+        rules: &RuleSet,
+    ) -> bool {
         let Some(entity) = self.substrate.entities.get(stable_id) else {
             return false;
         };
@@ -3209,10 +3291,26 @@ impl Simulation {
         if !obj.construction_yard {
             return true;
         }
-        self.construction_yard_redeploy_core_gate(entity)
+        (!delegated
+            || self
+                .session
+                .rule_policy()
+                .allows_construction_yard_redeploy())
+            && self.construction_yard_redeploy_core_gate(
+                entity,
+                delegated
+                    || self
+                        .houses
+                        .get(&entity.owner())
+                        .is_some_and(|house| house.is_human()),
+            )
     }
 
-    pub(super) fn construction_yard_redeploy_core_gate(&self, entity: &GameEntity) -> bool {
+    pub(crate) fn construction_yard_redeploy_core_gate(
+        &self,
+        entity: &GameEntity,
+        authorized: bool,
+    ) -> bool {
         // Building44374F..443778 /44F5F3..44F61C admit existing radio
         // contacts. Selling44AB68/44A2EE notifies and breaks them later.
         if !self.session.game_options().mcv_redeploy {
@@ -3221,19 +3319,17 @@ impl Simulation {
         // `BuildingClass::CanUndeployMCV @ 0x00449C15` and
         // `ShouldShowDeployButton @ 0x0044F614`: a mind-controlled yard (+0x2C0)
         // cannot repack.
-        if entity.mind_control.controller().is_some() {
+        if entity.seldom.mind_control.controller().is_some() {
             return false;
         }
-        self.houses
-            .get(&entity.owner())
-            .is_some_and(|house| house.is_human())
+        authorized
     }
 }
 
 impl crate::sim::world::ObjectSubstrate {
-    /// The explicit finished-object adapters (diagnostic spawn and supported
-    /// Ares delivery) bypass buildup and request a ready building. This is
-    /// their retained adapter contract, not a native Unlimbo or map-reader
+    /// The explicit finished-object adapter (diagnostic spawn) bypasses
+    /// buildup and requests a ready building. This is
+    /// its retained adapter contract, not a native Unlimbo or map-reader
     /// write. Authored campaign structures never enter this adapter.
     fn ready_finished_spawn_adapter(&mut self, stable_id: u64) {
         if let Some(entity) = self
@@ -3304,10 +3400,10 @@ fn undeploy_unit_cell(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_t_z))]
 #[path = "world_spawn/tests.rs"]
 mod techno_constructor_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_t_z))]
 #[path = "failed_yard_repack_tests.rs"]
 mod failed_yard_repack_tests;

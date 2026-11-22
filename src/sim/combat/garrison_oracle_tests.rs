@@ -65,11 +65,14 @@ fn a_shot_before_an_unarmed_occupant_rearms_without_an_rng_draw() {
                 EntityCategory::Infantry,
             );
             occupant.veterancy.set_rank_for_test(rank);
-            occupant.passenger_role = PassengerRole::inside_for_test(1, false);
-            building.passenger_role.occupants_mut().add(id);
+            occupant.set_passenger_role_for_test(PassengerRole::inside_for_test(1, false));
+            building
+                .passenger_role_mut_for_test()
+                .occupants_mut()
+                .add_for_test(id);
             world.substrate.entities.insert(occupant);
         }
-        assert_eq!(building.passenger_role.occupants().ids(), [2, 3]);
+        assert_eq!(building.passenger_role().occupants().ids(), [2, 3]);
         world.substrate.entities.insert(building);
         world.interner = test_interner();
         crate::sim::arena_fixture::flat_arena(&mut world, &rules);
@@ -116,13 +119,13 @@ fn a_shot_before_an_unarmed_occupant_rearms_without_an_rng_draw() {
                 17,
                 &mut emitted,
                 None,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .is_some()
         );
         assert_eq!(emitted.fire_events.len(), 1);
         let building = world.substrate.entities.get(1).unwrap();
-        assert_eq!(building.passenger_role.occupants().fire_index(), 1);
+        assert_eq!(building.passenger_role().occupants().fire_index(), 1);
         assert!(
             get_weapon(
                 building,
@@ -134,9 +137,9 @@ fn a_shot_before_an_unarmed_occupant_rearms_without_an_rng_draw() {
             )
             .is_none()
         );
-        assert_eq!(building.rearm_timer.start_frame(), 17);
+        assert_eq!(building.seldom.rearm_timer.start_frame(), 17);
         assert_eq!(
-            i64::from(building.rearm_timer.duration()),
+            i64::from(building.seldom.rearm_timer.duration()),
             golden["output"].as_i64().unwrap(),
             "missing weapon at occupant rank {rank}"
         );
@@ -218,6 +221,7 @@ pub(super) fn for_each_native_case(
             EntityCategory::Structure,
         );
         building
+            .seldom
             .type_facts
             .set_foundation_for_test(object.foundation.clone().into());
         building
@@ -241,11 +245,14 @@ pub(super) fn for_each_native_case(
             entity
                 .veterancy
                 .set_rank_for_test((occupant["veterancy"].as_f64().unwrap() * 100.0) as u16);
-            building.passenger_role.occupants_mut().add(id);
+            building
+                .passenger_role_mut_for_test()
+                .occupants_mut()
+                .add_for_test(id);
             entities.insert(entity);
         }
         building
-            .passenger_role
+            .passenger_role_mut_for_test()
             .occupants_mut()
             .set_fire_index_for_test(input["fire_index"].as_i64().unwrap() as i32);
         check(case, &building, object, &entities, &rules, &test_interner());

@@ -36,6 +36,7 @@ fn with_activity<R>(f: impl FnOnce(&mut jni::JNIEnv, &JObject) -> R) -> Option<R
     // global reference the loader owns.
     let vm = unsafe { JavaVM::from_raw(context.vm().cast()) }.ok()?;
     let mut env = vm.attach_current_thread().ok()?;
+    // SAFETY: the activity handle is the loader's JNI global reference above.
     let activity = unsafe { JObject::from_raw(context.context().cast()) };
     Some(f(&mut env, &activity))
 }
@@ -61,6 +62,69 @@ fn cancel_import() -> bool {
             .unwrap_or(false)
     })
     .unwrap_or(false)
+}
+
+/// Launcher and app-switcher icon hook for `vera20k::util::app_icon`.
+///
+/// The choice lives in the two activity aliases, which only `PackageManager`
+/// can flip; the activity keeps that knowledge in [`VeraActivity.applyAppIcon`].
+fn apply_app_icon(vera_icon: bool) {
+    let applied = with_activity(|env, activity| {
+        env.call_method(
+            activity,
+            "applyAppIcon",
+            "(Z)V",
+            &[jni::objects::JValue::Bool(u8::from(vera_icon))],
+        )
+        .is_ok()
+    });
+    if applied != Some(true) {
+        log::warn!("Could not apply the app icon");
+    }
+}
+
+/// LAN network hooks for `vera20k::util::lan_network`.
+///
+/// Android routes a datagram by the process's default network, so the LAN visit
+/// runs bound to Wi-Fi while the lobby is open; the activity reports changes
+/// back through [`Java_org_vera20k_VeraActivity_nativeOnLanNetworkChanged`].
+fn bind_lan_network() {
+    let bound = with_activity(|env, activity| {
+        env.call_method(activity, "bindLanNetwork", "()V", &[]).is_ok()
+    });
+    if bound != Some(true) {
+        log::warn!("Could not bind the LAN visit to the Wi-Fi network");
+    }
+}
+
+fn release_lan_network() {
+    let _ = with_activity(|env, activity| {
+        env.call_method(activity, "releaseLanNetwork", "()V", &[])
+            .is_ok()
+    });
+}
+
+/// Default-handle suffix for `vera20k::util::device_identity`.
+///
+/// A LAN visit drops advertisements whose name matches the local one, and the
+/// stock default is `[New Player]` on every install. Android has no text input
+/// yet, so the engine appends the activity's Android ID suffix to the default
+/// and two fresh installs no longer hide each other's games.
+fn handle_suffix() -> Option<String> {
+    let suffix = with_activity(|env, activity| {
+        let value = env
+            .call_method(activity, "defaultHandleSuffix", "()Ljava/lang/String;", &[])
+            .ok()?
+            .l()
+            .ok()?;
+        if value.is_null() {
+            return None;
+        }
+        env.get_string(&JString::from(value))
+            .ok()
+            .map(|text| text.to_string_lossy().into_owned())
+    })?;
+    suffix.filter(|text| !text.is_empty())
 }
 
 /// The activity's folder-picker answer: the chosen tree as a `content://` URI,
@@ -172,106 +236,13 @@ pub extern "system" fn Java_org_vera20k_VeraActivity_nativeImportProgress(
     import_status::note(ImportEvent::Progress(copied_bytes.max(0) as u64));
 }
 
-/// The activity's keyboard overlay: the finished run, committed into the chat
-/// edit that currently takes keys.
-///
-/// NativeActivity has no input connection, so winit never asks for a system
-/// keyboard here. The activity shows its own `EditText` and calls this; the
-/// engine queues the run and commits it on the event thread, which is where
-/// every other `Ime::Commit` is applied.
+/// The activity reports that its Wi-Fi network appeared, left or changed.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTypeText(
-    mut env: jni::JNIEnv,
-    _activity: JObject,
-    text: JString,
-) {
-    match env.get_string(&text) {
-        Ok(text) => {
-            let text = text.to_string_lossy().into_owned();
-            log::info!("ime overlay: committing {} chars", text.chars().count());
-            vera20k::inject_ime_commit(&text);
-        }
-        Err(error) => {
-            log::error!("ime overlay: cannot read the text: {error}");
-            let _ = env.exception_clear();
-        }
-    }
-}
-
-/// Whether a chat edit takes text now. The overlay asks first: text typed while
-/// none is open would be dropped by the commit's `None` arm, so the player is
-/// told to open the chat instead of losing what they typed.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_VeraActivity_nativeImeChatOpen(
-    _env: jni::JNIEnv,
-    _activity: JObject,
-) -> jni::sys::jboolean {
-    if vera20k::ime_chat_open() { 1 } else { 0 }
-}
-
-/// Backspace from the Android keyboard. The `EditText` that hosts the
-/// keyboard never accumulates text (commits are forwarded straight to the
-/// engine), so a delete has to be replayed in the engine instead.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextBackspace(
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeOnLanNetworkChanged(
     _env: jni::JNIEnv,
     _activity: JObject,
 ) {
-    vera20k::inject_ime_backspace();
-}
-
-/// The keyboard's done/send key.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextEnter(
-    _env: jni::JNIEnv,
-    _activity: JObject,
-) {
-    vera20k::inject_ime_enter();
-}
-
-/// Whether any text field takes text now — a chat line or a save-name field.
-/// The activity polls this and raises the keyboard by itself, so no button has
-/// to be found and tapped before typing can start.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextEntryOpen(
-    _env: jni::JNIEnv,
-    _activity: JObject,
-) -> jni::sys::jboolean {
-    if vera20k::ime_chat_open() { 1 } else { 0 }
-}
-
-/// Toggle one on-screen modifier chip. Returns whether that chip is now held.
-///
-/// Touch-screen players cannot hold Ctrl while tapping a target, and a
-/// synthetic key event would be overwritten by winit's next modifier rebuild.
-/// The flag lives in the engine's input layer instead, so "force attack" stays
-/// armed until the same chip is tapped again.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_VeraActivity_nativeSetModifier(
-    mut env: jni::JNIEnv,
-    _activity: JObject,
-    name: JString,
-    down: jni::sys::jboolean,
-) -> jni::sys::jboolean {
-    let held = match env.get_string(&name) {
-        Ok(name) => vera20k::set_sticky_modifier(&name.to_string_lossy(), down != 0).unwrap_or(false),
-        Err(error) => {
-            log::error!("modifier chip: cannot read the name: {error}");
-            let _ = env.exception_clear();
-            false
-        }
-    };
-    if held { 1 } else { 0 }
-}
-
-/// Which chips are lit: 1 Ctrl, 2 Shift, 4 Alt. Read after the overlay is
-/// re-attached, so a rotation cannot leave the chips lying about the state.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_VeraActivity_nativeModifierMask(
-    _env: jni::JNIEnv,
-    _activity: JObject,
-) -> jni::sys::jint {
-    i32::from(vera20k::sticky_modifier_mask())
+    vera20k::util::lan_network::note_changed();
 }
 
 /// Bind `nativeOnFolderPicked` to this activity's class.
@@ -314,39 +285,46 @@ fn register_folder_picker_native() -> bool {
                     as *mut std::ffi::c_void,
             },
             jni::NativeMethod {
-                name: "nativeTypeText".into(),
-                sig: "(Ljava/lang/String;)V".into(),
-                fn_ptr: Java_org_vera20k_VeraActivity_nativeTypeText as *mut std::ffi::c_void,
-            },
-            jni::NativeMethod {
-                name: "nativeTextBackspace".into(),
+                name: "nativeOnLanNetworkChanged".into(),
                 sig: "()V".into(),
-                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextBackspace as *mut std::ffi::c_void,
-            },
-            jni::NativeMethod {
-                name: "nativeTextEnter".into(),
-                sig: "()V".into(),
-                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextEnter as *mut std::ffi::c_void,
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeOnLanNetworkChanged
+                    as *mut std::ffi::c_void,
             },
             jni::NativeMethod {
                 name: "nativeTextEntryOpen".into(),
                 sig: "()Z".into(),
-                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextEntryOpen as *mut std::ffi::c_void,
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextEntryOpen
+                    as *mut std::ffi::c_void,
             },
             jni::NativeMethod {
-                name: "nativeImeChatOpen".into(),
-                sig: "()Z".into(),
-                fn_ptr: Java_org_vera20k_VeraActivity_nativeImeChatOpen as *mut std::ffi::c_void,
+                name: "nativeTypeText".into(),
+                sig: "(Ljava/lang/String;)V".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeTypeText
+                    as *mut std::ffi::c_void,
             },
             jni::NativeMethod {
-                name: "nativeSetModifier".into(),
-                sig: "(Ljava/lang/String;Z)Z".into(),
-                fn_ptr: Java_org_vera20k_VeraActivity_nativeSetModifier as *mut std::ffi::c_void,
+                name: "nativeTextBackspace".into(),
+                sig: "()V".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextBackspace
+                    as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeTextEnter".into(),
+                sig: "()V".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeTextEnter
+                    as *mut std::ffi::c_void,
             },
             jni::NativeMethod {
                 name: "nativeModifierMask".into(),
                 sig: "()I".into(),
-                fn_ptr: Java_org_vera20k_VeraActivity_nativeModifierMask as *mut std::ffi::c_void,
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeModifierMask
+                    as *mut std::ffi::c_void,
+            },
+            jni::NativeMethod {
+                name: "nativeSetModifier".into(),
+                sig: "(Ljava/lang/String;Z)Z".into(),
+                fn_ptr: Java_org_vera20k_VeraActivity_nativeSetModifier
+                    as *mut std::ffi::c_void,
             },
         ];
         let registered = env.register_native_methods(class, &methods).is_ok();
@@ -385,6 +363,21 @@ fn keep_screen_on(app: &AndroidApp) {
 fn android_main(app: AndroidApp) {
     keep_screen_on(&app);
     vera20k::util::folder_picker::install(request_folder_picker, cancel_import);
+    // The launcher icon is a compiled resource, so the VERA Icon box's choice
+    // reaches the two activity aliases only through PackageManager.
+    vera20k::util::app_icon::install(apply_app_icon);
+    // LAN discovery rides the Wi-Fi network: the lobby binds this process to it
+    // and the activity reports network changes back through the JNI callback.
+    vera20k::util::lan_network::install(vera20k::util::lan_network::Hooks {
+        acquire: bind_lan_network,
+        release: release_lan_network,
+    });
+    // The stock LAN default name is the same on every install and two peers left
+    // at it never see each other, so the activity supplies an Android ID suffix
+    // for the handle until text input lands on this platform.
+    vera20k::util::device_identity::install(vera20k::util::device_identity::Hooks {
+        handle_suffix,
+    });
     // Android starts every process in "/" with no writable home. Hand the app's
     // private folder to the engine before anything opens a file: it becomes
     // both the working directory and the settings folder, so logs, config.toml,
@@ -464,263 +457,66 @@ fn claim_event_loop() -> bool {
     CLAIMED.set(()).is_ok()
 }
 
-// ---------------------------------------------------------------------------
-// MIX browsing for the Android file layer.
-//
-// `LauncherActivity` and `MixActivity` are plain Java activities that never run
-// the engine, but the archive and thumbnail readers already live in
-// `vera20k::assets` and `vera20k::map`. Exposing them over JNI keeps one
-// implementation instead of a Kotlin port of RSA, Blowfish and LZO. Everything
-// here is read-only: MIX bodies are plain bytes, and re-writing an archive needs
-// the private key Westwood never shipped, so extraction is the only direction.
-//
-// Registration happens in `JNI_OnLoad` because these methods are static on an
-// object the engine's own activity registration never sees.
-// ---------------------------------------------------------------------------
-
-use jni::objects::JClass;
-use jni::sys::{jboolean, jbyteArray, jint, JNI_ERR, JNI_FALSE, JNI_TRUE, JNI_VERSION_1_6};
-use std::ffi::c_void;
-use std::path::Path;
-
-/// Registers the MIX bridge as soon as the library is loaded.
-///
-/// Returns the JNI version even when registration fails: refusing to load the
-/// library would take the whole game down over a file browser.
+/// Text the keyboard host typed; queued for the next frame, like an OS commit.
 #[unsafe(no_mangle)]
-pub extern "system" fn JNI_OnLoad(vm: JavaVM, _reserved: *mut c_void) -> jint {
-    let Ok(mut env) = vm.get_env() else {
-        return JNI_VERSION_1_6;
-    };
-    let Ok(class) = env.find_class("org/vera20k/MixBridge") else {
-        let _ = env.exception_clear();
-        return JNI_VERSION_1_6;
-    };
-    let methods = [
-        jni::NativeMethod {
-            name: "nativeEntries".into(),
-            sig: "(Ljava/lang/String;I)Ljava/lang/String;".into(),
-            fn_ptr: Java_org_vera20k_MixBridge_nativeEntries as *mut c_void,
-        },
-        jni::NativeMethod {
-            name: "nativeExtract".into(),
-            sig: "(Ljava/lang/String;IILjava/lang/String;)Z".into(),
-            fn_ptr: Java_org_vera20k_MixBridge_nativeExtract as *mut c_void,
-        },
-        jni::NativeMethod {
-            name: "nativeMapPreview".into(),
-            sig: "(Ljava/lang/String;)[B".into(),
-            fn_ptr: Java_org_vera20k_MixBridge_nativeMapPreview as *mut c_void,
-        },
-    ];
-    if env.register_native_methods(class, &methods).is_err() {
-        let _ = env.exception_clear();
-        return JNI_ERR;
-    }
-    JNI_VERSION_1_6
-}
-
-fn open_archive(path: &str, parent: i32) -> Result<vera20k::assets::mix_archive::MixArchive, String> {
-    use vera20k::assets::mix_archive::MixArchive;
-    let top = MixArchive::load(Path::new(path)).map_err(|error| error.to_string())?;
-    if parent == 0 {
-        return Ok(top);
-    }
-    top.nested_archive_by_id(parent)
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "这个条目不是 MIX 归档".to_string())
-}
-
-/// `{"ok":true,"count":n,"bytes":n,"entries":[{id,size,offset,nested}]}`.
-///
-/// Hand-built rather than serde: the shape is three numbers per entry and adding
-/// a dependency to the Android crate would touch the lockfile the build pins.
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_MixBridge_nativeEntries(
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTypeText(
     mut env: jni::JNIEnv,
-    _class: JClass,
-    path: JString,
-    parent: jint,
-) -> jstring {
-    let path_text = match env.get_string(&path) {
-        Ok(value) => value.to_string_lossy().into_owned(),
-        Err(_) => {
-            let _ = env.exception_clear();
-            return json_reply(&mut env, "{\"ok\":false,\"error\":\"路径无效\"}");
-        }
-    };
-    let archive = match open_archive(&path_text, parent) {
-        Ok(archive) => archive,
-        Err(error) => return json_reply(&mut env, &format!("{{\"ok\":false,\"error\":{}}}", quote(&error))),
-    };
-
-    let mut out = String::from("{\"ok\":true,\"count\":");
-    out.push_str(&archive.entry_count().to_string());
-    out.push_str(",\"bytes\":");
-    out.push_str(&archive.byte_len().to_string());
-    out.push_str(",\"entries\":[");
-    for (index, entry) in archive.entries().iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        let nested = archive
-            .get_by_id(entry.id)
-            .map(vera20k::assets::mix_archive::MixArchive::looks_like_mix)
-            .unwrap_or(false);
-        out.push_str(&format!(
-            "{{\"id\":{},\"size\":{},\"offset\":{},\"nested\":{}}}",
-            entry.id, entry.size, entry.offset, nested
-        ));
+    _activity: JObject,
+    text: JString,
+) {
+    if let Ok(text) = env.get_string(&text) {
+        let text: String = text.into();
+        vera20k::inject_ime_commit(&text);
     }
-    out.push_str("]}");
-    json_reply(&mut env, &out)
 }
 
-/// Writes one entry to `out`. Returns whether the file landed.
+/// Whether a field in the engine wants text right now.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_MixBridge_nativeExtract(
-    mut env: jni::JNIEnv,
-    _class: JClass,
-    path: JString,
-    parent: jint,
-    id: jint,
-    out: JString,
-) -> jboolean {
-    let read = |env: &mut jni::JNIEnv, value: &JString| -> Option<String> {
-        env.get_string(value)
-            .ok()
-            .map(|text| text.to_string_lossy().into_owned())
-    };
-    let (Some(path_text), Some(out_text)) = (read(&mut env, &path), read(&mut env, &out)) else {
-        let _ = env.exception_clear();
-        return JNI_FALSE;
-    };
-    let Ok(archive) = open_archive(&path_text, parent) else {
-        return JNI_FALSE;
-    };
-    let Some(bytes) = archive.get_by_id(id) else {
-        return JNI_FALSE;
-    };
-    let target = Path::new(&out_text);
-    if let Some(parent) = target.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    match std::fs::write(target, bytes) {
-        Ok(()) => JNI_TRUE,
-        Err(error) => {
-            log::warn!("MIX extract to {out_text} failed: {error}");
-            JNI_FALSE
-        }
-    }
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextEntryOpen(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) -> jni::sys::jboolean {
+    jni::sys::jboolean::from(vera20k::ime_chat_open())
 }
 
-/// The map's own preview, as `[width][height][RGBA...]`, or an empty array.
-///
-/// Retail maps carry `[PreviewPack]`: base64 LZO over 8-bit palette indices, the
-/// picture the skirmish screen shows. Decoding it needs no MIX archive and no
-/// terrain tiles, which is why this is the cheap way to replace the schematic.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_org_vera20k_MixBridge_nativeMapPreview(
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextBackspace(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) {
+    vera20k::inject_ime_backspace();
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeTextEnter(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) {
+    vera20k::inject_ime_enter();
+}
+
+/// The lit chips, so the strip redraws after a re-attach.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeModifierMask(
+    _env: jni::JNIEnv,
+    _activity: JObject,
+) -> jni::sys::jint {
+    jni::sys::jint::from(vera20k::sticky_modifier_mask())
+}
+
+/// Toggles one chip; returns whether it is now held.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_vera20k_VeraActivity_nativeSetModifier(
     mut env: jni::JNIEnv,
-    _class: JClass,
-    path: JString,
-) -> jbyteArray {
-    let empty = |env: &mut jni::JNIEnv| -> jbyteArray {
-        match env.new_byte_array(0) {
-            Ok(array) => array.into_raw(),
-            Err(_) => {
-                let _ = env.exception_clear();
-                std::ptr::null_mut()
-            }
-        }
+    _activity: JObject,
+    name: JString,
+    down: jni::sys::jboolean,
+) -> jni::sys::jboolean {
+    let Ok(name) = env.get_string(&name) else {
+        return jni::sys::jboolean::from(false);
     };
-    let Ok(path_text) = env
-        .get_string(&path)
-        .map(|text| text.to_string_lossy().into_owned())
-    else {
-        let _ = env.exception_clear();
-        return empty(&mut env);
-    };
-    let Ok(bytes) = std::fs::read(&path_text) else {
-        return empty(&mut env);
-    };
-    let Some((width, height, pack)) = preview_fields(&bytes) else {
-        return empty(&mut env);
-    };
-    let Ok(decoded) = vera20k::map::preview::decode_preview_pack(&pack, width, height) else {
-        return empty(&mut env);
-    };
-
-    let mut payload = Vec::with_capacity(8 + decoded.rgba.len());
-    payload.extend_from_slice(&(decoded.width as u32).to_le_bytes());
-    payload.extend_from_slice(&(decoded.height as u32).to_le_bytes());
-    payload.extend_from_slice(&decoded.rgba);
-    match env.byte_array_from_slice(&payload) {
-        Ok(array) => array.into_raw(),
-        Err(_) => {
-            let _ = env.exception_clear();
-            std::ptr::null_mut()
-        }
-    }
-}
-
-/// `[Preview] Size` and the concatenated `[PreviewPack]` values.
-fn preview_fields(bytes: &[u8]) -> Option<(u32, u32, String)> {
-    let text = String::from_utf8_lossy(bytes);
-    let mut section = String::new();
-    let mut size: Option<(u32, u32)> = None;
-    let mut pack = String::new();
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            section = trimmed[1..trimmed.len() - 1].trim().to_ascii_lowercase();
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let key = key.trim().to_ascii_lowercase();
-        match section.as_str() {
-            // `Size` is a ReadRect: x, y, width, height.
-            "preview" if key == "size" => {
-                let numbers: Vec<i64> = value
-                    .split(',')
-                    .filter_map(|part| part.trim().parse().ok())
-                    .collect();
-                if let [_, _, width, height] = numbers.as_slice() {
-                    if *width > 0 && *height > 0 {
-                        size = Some((*width as u32, *height as u32));
-                    }
-                }
-            }
-            "previewpack" => pack.push_str(value.trim()),
-            _ => {}
-        }
-    }
-    size.map(|(width, height)| (width, height, pack))
-}
-
-fn quote(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for character in text.chars() {
-        match character {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn json_reply(env: &mut jni::JNIEnv, body: &str) -> jstring {
-    match env.new_string(body) {
-        Ok(value) => value.into_raw(),
-        Err(_) => {
-            let _ = env.exception_clear();
-            std::ptr::null_mut()
-        }
-    }
+    let name: String = name.into();
+    jni::sys::jboolean::from(
+        vera20k::set_sticky_modifier(&name, down != 0).unwrap_or(false),
+    )
 }

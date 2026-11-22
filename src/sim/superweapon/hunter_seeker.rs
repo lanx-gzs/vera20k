@@ -8,7 +8,7 @@ use crate::rules::ruleset::RuleSet;
 use crate::rules::superweapon_type::SuperWeaponType;
 use crate::sim::components::DriveCoord;
 use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
-use crate::sim::hunter_seeker::HunterSeekerOrigin;
+use crate::sim::hunter_seeker::AttachedSuper;
 use crate::sim::intern::InternedId;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::world::{FrameEffects, PlacementEvidence, Simulation};
@@ -20,7 +20,7 @@ pub(super) fn launch(
     sw_type: InternedId,
     sw: &SuperWeaponType,
     registry: Option<&OverlayTypeRegistry>,
-    effects: FrameEffects<'_>,
+    effects: &mut FrameEffects<'_>,
 ) -> bool {
     let Some(settings) = sw.hunter_seeker.as_ref() else {
         return false;
@@ -43,8 +43,10 @@ pub(super) fn launch(
     };
     // Native house Building vector order, not an entity/category scan. Failed
     // placement does not spend MaxCount: only the callback's successes count.
+    // A copy, as the launch began: each hunter's constructor, Unlimbo and
+    // target acquisition run through the whole simulation, whose callbacks
+    // can change the House's Building vector while it is walked.
     let buildings = house.base_projection().buildings().to_vec();
-    let owner_name = sim.interner.resolve(owner).to_owned();
     let mut successes = 0_i32;
     for building in buildings {
         if settings.max_count >= 0 && successes >= settings.max_count {
@@ -80,23 +82,16 @@ pub(super) fn launch(
         if (x, y) == (0, 0) || !super::targeting::on_map(sim, (x, y)) {
             continue;
         }
-        let Some(id) = sim.construct_resolved_object_limbo_at_height(
-            unit,
-            &owner_name,
-            x,
-            y,
-            64,
-            0,
-            rules,
-            effects,
-        ) else {
+        let Some(id) =
+            sim.construct_resolved_object_limbo_at_height(unit, owner, x, y, 64, 0, rules, effects)
+        else {
             continue;
         };
         sim.substrate
             .entities
             .get_mut(id)
             .expect("constructed hunter")
-            .set_hunter_seeker_origin(HunterSeekerOrigin { owner, sw_type });
+            .set_ares_super_weapon(AttachedSuper { owner, sw_type });
         // Cell2Coord, deliberately Z=0: Put owns floor/layer admission. Do not
         // replace this with UnitDelivery's finished-unit placement policy.
         if sim
@@ -114,7 +109,7 @@ pub(super) fn launch(
             sim.discard_constructed_limbo(id, rules, effects);
             continue;
         }
-        sim.acquire_hunter_seeker_target(id, rules, registry, effects);
+        sim.acquire_hunter_seeker_target(id, rules, effects);
         // 100722F5 loads Area Guard (0xB); a non-harvester (UnitType+0xE0E,
         // `Harvester=`) switches to Attack at1007230C; vt+0x1E8 at10072323.
         let mission = if unit.harvester {

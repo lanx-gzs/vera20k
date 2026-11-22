@@ -1,10 +1,13 @@
 //! The underground (`0x006F7E11..0x006F7E1E`), campaign discovery
 //! (`0x006F81BE..0x006F81F4`) and HarvesterImmune (`0x006F8009..0x006F8047`)
 //! candidate gates, through the production scan owner against retail rules
-//! and the retail `[General] HarvesterUnit=` list.
+//! and the retail `[General] HarvesterUnit=` list, plus HarvesterImmune's
+//! area-damage receiver skip (`0x00489710..0x00489759`).
 
 use super::*;
+use crate::rules::rule_policy::RulePolicy;
 use crate::sim::combat::threat_range::ScanMission;
+use crate::sim::scenario_session::ScenarioGameMode;
 use crate::sim::world::Simulation;
 
 /// A guarding MTNK on the rival arena with one enemy candidate of
@@ -47,10 +50,7 @@ fn campaign_player_scan_skips_an_enemy_the_player_has_not_discovered() {
     };
     let rules = &retail.rules;
     let (mut sim, tank, enemy) = rival_pair(rules, "MTNK", "HTNK");
-    assert!(
-        !sim.session.game_mode_nonzero(),
-        "the arena runs the campaign"
-    );
+    assert_eq!(sim.session.game_mode(), ScenarioGameMode::Campaign);
     assert_eq!(
         guard_pick(&mut sim, rules, tank),
         None,
@@ -69,13 +69,48 @@ fn campaign_player_scan_skips_an_enemy_the_player_has_not_discovered() {
     );
 
     let (mut sim, tank, enemy) = rival_pair(rules, "MTNK", "HTNK");
-    sim.session
-        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    sim.session.set_game_mode(ScenarioGameMode::Skirmish);
     assert_eq!(
         guard_pick(&mut sim, rules, tank),
         Some(enemy),
         "skirmish: no discovery gate"
     );
+
+    let rules_policy = RulePolicy::stock_multiplayer().with_uses_campaign_discovery(true);
+    sim.session
+        .install_admission(ScenarioGameMode::Skirmish, None, rules_policy);
+    assert_eq!(guard_pick(&mut sim, rules, tank), None);
+
+    sim.session
+        .install_admission(ScenarioGameMode::Lan, None, rules_policy);
+    assert_eq!(
+        guard_pick(&mut sim, rules, tank),
+        Some(enemy),
+        "lockstep targeting must not depend on the local player's discovery bytes"
+    );
+}
+
+#[test]
+fn passive_house_targets_follow_the_admitted_policy() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let (mut sim, tank, target) = guard_scene(rules, "HTNK");
+    let opponent = sim.interner.get("Russians").unwrap();
+    sim.houses
+        .get_mut(&opponent)
+        .unwrap()
+        .set_multiplay_passive_for_test(true);
+
+    assert_eq!(guard_pick(&mut sim, rules, tank), Some(target));
+    sim.session.set_game_mode(ScenarioGameMode::Skirmish);
+    assert_eq!(guard_pick(&mut sim, rules, tank), None);
+
+    let rules_policy = RulePolicy::stock_multiplayer().with_uses_campaign_discovery(true);
+    sim.session
+        .install_admission(ScenarioGameMode::Skirmish, None, rules_policy);
+    assert_eq!(guard_pick(&mut sim, rules, tank), Some(target));
 }
 
 /// The production discovery the gate reads: with the campaign player
@@ -98,6 +133,7 @@ fn campaign_discovery_prelude_admits_an_enemy_once_its_ground_is_revealed() {
             .entities
             .get(enemy)
             .unwrap()
+            .seldom
             .discovery
             .discovered_by_current_house()
     };
@@ -126,7 +162,7 @@ fn campaign_player_scan_takes_an_undiscovered_aircraft() {
     let (mut sim, ifv, plane) = rival_pair(rules, "FV", "PDPLANE");
     let actor = sim.substrate.entities.get(plane).unwrap();
     assert_eq!(actor.category(), EntityCategory::Aircraft);
-    assert!(!actor.discovery.discovered_by_current_house());
+    assert!(!actor.seldom.discovery.discovered_by_current_house());
     assert_eq!(guard_pick(&mut sim, rules, ifv), Some(plane));
 }
 
@@ -213,6 +249,45 @@ fn retail_guard_scan_skips_a_harvester_while_scenario_bit_800_is_set() {
         Some(rhino),
         "bit set: a non-harvester tank is not refused"
     );
+}
+
+/// Scenario bit `0x800` in Apply_area_damage (`0x00489710..0x00489759`): a
+/// shell landing on an enemy harvester records no hit on it while the bit is
+/// set, and does with the bit clear; a tank in its place is hit either way.
+#[test]
+fn retail_area_damage_skips_a_harvester_while_scenario_bit_800_is_set() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let warhead = rules.warhead("HE").unwrap();
+    for (target_type, immune, hit) in [
+        ("HARV", false, true),
+        ("HARV", true, false),
+        ("HTNK", true, true),
+    ] {
+        let (mut sim, _, target) = rival_pair(rules, "MTNK", target_type);
+        sim.session.set_harvester_immune_for_test(immune);
+        let he = sim.interner.intern("HE");
+        let area = crate::sim::combat::world_receiver::collect_area(
+            &mut sim,
+            rules,
+            None,
+            (18, 16),
+            100,
+            warhead,
+            false,
+            (crate::sim::combat::RAD_NO_ATTACKER, None, he),
+            None,
+            0,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
+        assert_eq!(
+            area.hits.iter().any(|event| event.target_id == target),
+            hit,
+            "{target_type}, bit 0x800 {immune}"
+        );
+    }
 }
 
 /// The underground gate (`0x006F7E11..0x006F7E1E`): a candidate whose

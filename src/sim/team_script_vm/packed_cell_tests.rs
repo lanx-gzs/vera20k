@@ -3,6 +3,7 @@
 use super::*;
 use crate::headless_scenario::{HeadlessScenario, battle_session, load_session};
 use crate::rules::ini_parser::IniFile;
+use crate::rules::rule_policy::RulePolicy;
 use crate::rules::team_ai_ini::TeamAiIniRegistry;
 use crate::sim::combat::TargetKind;
 use crate::sim::house_state::HouseState;
@@ -14,7 +15,12 @@ pub(super) fn frame(scene: &mut HeadlessScenario) {
     let commands = scene.runtime.simulation.take_due_commands();
     let result = scene
         .runtime
-        .advance_frame(&commands, 22, TickLane::Ordinary, FrameEffects::default())
+        .advance_frame(
+            &commands,
+            22,
+            TickLane::Ordinary,
+            &mut FrameEffects::default(),
+        )
         .unwrap();
     assert!(!result.outcome_waiting);
 }
@@ -35,6 +41,12 @@ pub(super) fn scene(
         assert!(!stock_ini.section_or_empty("Waypoints").is_present(index));
     }
     let mut map = super::firesale_retail_tests::scenario(stock, script);
+    // The team is made once the Computer house's MCV has deployed: a later
+    // deploy sends every ground unit of the house, the member too, to the new
+    // base over the script's destination
+    // (`HouseClass::MoveGroundForcesToBase @ 0x0050C920`). The MCV starts
+    // facing north (`0x005D708B`), turns, and deploys after frame 19.
+    map = map.replacen("F0520004=1,13,0,1\n", "F0520004=1,13,0,4\n", 1);
     // Select authored inputs before the production reader; normal recruitment
     // supplies membership and the live type remains the actor constructor's.
     map = map
@@ -88,6 +100,13 @@ pub(super) fn scene(
         {
             assert_eq!(team.members().collect::<Vec<_>>(), [member]);
             let team = team.id();
+            let sim = scene.sim();
+            assert!(
+                sim.entities().values().any(|entity| {
+                    entity.owner() == owner && sim.interner.resolve(entity.type_ref()) == "NACNST"
+                }),
+                "the Computer house's yard must stand before its team moves"
+            );
             return Some((scene, team, member));
         }
     }
@@ -116,7 +135,11 @@ pub(super) fn reload(scene: &mut HeadlessScenario) {
         rules,
     );
     loaded
-        .restore_map_authority_after_snapshot_load(rules, &runtime.resources.overlay_registry, None)
+        .restore_map_authority_after_snapshot_load(
+            rules,
+            runtime.resources.rules.overlay_registry(),
+            None,
+        )
         .unwrap();
     loaded.intern_rule_type_ids(rules);
     loaded.resolve_type_handles(rules);
@@ -124,7 +147,8 @@ pub(super) fn reload(scene: &mut HeadlessScenario) {
     let dummy = sim.effective_shared_cell_dummy();
     dummy.adopt_prepared_load_state(&loaded.effective_shared_cell_dummy());
     loaded.bind_shared_cell_dummy(dummy);
-    loaded.install_fresh_process_main(sim.main_rng());
+    // No app process cell here: the install writes a stand-in nothing reads.
+    loaded.install_fresh_process_main(&crate::sim::rng::MainRng::new(0));
     loaded.publish_scenario_started();
     runtime.replace_simulation(loaded);
 }
@@ -226,14 +250,13 @@ fn packed_cell_dummy_keeps_its_pointer_across_restamps_and_reload() {
         sim.team_script_vm.team(team).unwrap().mission_target,
         Some(target)
     );
-    sim.team_member_assign_target(member, target, rules, None, FrameEffects::default());
+    sim.team_member_assign_target(member, target, rules, &mut FrameEffects::default());
     let changed_token = sim.canonical_team_cell((-2, 0));
     sim.team_assign_mission_target(
         team,
         Some(changed_token),
         rules,
-        None,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     );
     assert_eq!(
         sim.entities().get(member).unwrap().attack_target.target(),
@@ -256,12 +279,13 @@ fn a_team_only_dummy_target_makes_its_live_coordinate_part_of_the_hash() {
     let map = IniFile::from_str(
         "[TeamTypes]\n0=TEAM\n[TEAM]\nScript=SCRIPT\nTaskForce=FORCE\n[ScriptTypes]\n0=SCRIPT\n[SCRIPT]\n0=2,0\n[TaskForces]\n0=FORCE\n[FORCE]\n0=1,E2\n",
     );
-    let registry = TeamAiIniRegistry::from_sources(&IniFile::empty(), &map, false);
-    sim.install_team_ai_registry(&registry, &rules).unwrap();
+    let registry =
+        TeamAiIniRegistry::from_sources(&IniFile::empty(), &map, RulePolicy::stock_campaign());
+    sim.install_team_ai_registry(&registry, &rules);
     let team_type = sim.interner.get("TEAM").unwrap();
     let team = sim.create_team(team_type, Some(owner), &rules).unwrap();
     let target = sim.canonical_team_cell((-1, 0));
-    sim.team_assign_mission_target(team, Some(target), &rules, None, FrameEffects::default());
+    sim.team_assign_mission_target(team, Some(target), &rules, &mut FrameEffects::default());
     let before = sim.state_hash();
     let _ = sim.canonical_team_cell((-2, 0));
     assert_ne!(

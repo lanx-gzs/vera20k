@@ -104,7 +104,7 @@ impl Simulation {
         mut coord: DriveCoord,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<bool, String> {
         let actor = self
             .substrate
@@ -138,7 +138,7 @@ impl Simulation {
         // skips Limbo. His Limbo cleared it already, so this only matters if
         // another infantryman took that spot: a later placement may stack.
         if infantry {
-            self.locomotor_mark_all_occupation_bits(id, false);
+            self.locomotor_mark_all_occupation_bits(id, false, rules.ares_form());
             Self::object_raw_receiver_at(
                 &mut self.substrate,
                 &self.path_grid,
@@ -146,6 +146,7 @@ impl Simulation {
                 id,
                 coord,
                 false,
+                rules.ares_form(),
             );
             let Some(actor) = self.substrate.entities.get_mut(id) else {
                 return Ok(false);
@@ -158,7 +159,6 @@ impl Simulation {
                     cell.1 as u16,
                 )),
                 rules,
-                registry,
                 effects,
             )
             .map_err(|error| error.to_string())?;
@@ -175,7 +175,7 @@ impl Simulation {
                 .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
         }
         if category == EntityCategory::Unit {
-            self.locomotor_mark_all_occupation_bits(id, false);
+            self.locomotor_mark_all_occupation_bits(id, false, rules.ares_form());
             self.force_track(id, -1, coord, rules, registry, effects);
             Self::object_raw_receiver_at(
                 &mut self.substrate,
@@ -184,6 +184,7 @@ impl Simulation {
                 id,
                 coord,
                 false,
+                rules.ares_form(),
             );
             let Some(actor) = self.substrate.entities.get_mut(id) else {
                 return Ok(false);
@@ -196,11 +197,10 @@ impl Simulation {
                     cell.1 as u16,
                 )),
                 rules,
-                registry,
                 effects,
             )
             .map_err(|error| error.to_string())?;
-            self.assign_destination_represented(id, None, rules, registry, effects)
+            self.assign_destination_represented(id, None, rules, effects)
                 .map_err(|error| error.to_string())?;
         }
         let frame = self.session.binary_frame();
@@ -224,12 +224,11 @@ impl Simulation {
                 cell.1 as u16,
             )),
             rules,
-            registry,
             effects,
         )
         .map_err(|error| error.to_string())?;
         if infantry {
-            self.locomotor_mark_all_occupation_bits(id, false);
+            self.locomotor_mark_all_occupation_bits(id, false, rules.ares_form());
         }
         Ok(true)
     }
@@ -261,7 +260,7 @@ impl Simulation {
         &mut self,
         id: u64,
         rules: &RuleSet,
-        ctx: ObjectAiCtx<'_>,
+        ctx: &mut ObjectAiCtx<'_>,
     ) -> Result<bool, FrameAdvanceError> {
         let registry = ctx.overlay_registry;
         let mut bridge_state_changed = false;
@@ -301,7 +300,7 @@ impl Simulation {
             }
             2 => {
                 self.teleport_warp_out(id, rules);
-                self.foot_mark_remove(id, rules, registry, ctx.effects);
+                self.foot_mark_remove(id, rules, registry, &mut ctx.effects);
                 Self::teleport_warp_sound(
                     &mut self.interner,
                     &self.substrate,
@@ -327,7 +326,7 @@ impl Simulation {
                     false,
                     rules,
                     registry,
-                    ctx.effects,
+                    &mut ctx.effects,
                 );
                 if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_state(if landed { 4 } else { 3 });
@@ -340,13 +339,16 @@ impl Simulation {
                     false,
                     rules,
                     registry,
-                    ctx.effects,
+                    &mut ctx.effects,
                 );
                 if landed && let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_state(4);
                 }
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
-                    entity.chrono_warp_delay.store(rules.general.chrono_delay);
+                    entity
+                        .seldom
+                        .chrono_warp_delay
+                        .store(rules.general.chrono_delay);
                 }
             }
             4 => {
@@ -356,15 +358,15 @@ impl Simulation {
                     true,
                     rules,
                     registry,
-                    ctx.effects,
+                    &mut ctx.effects,
                 );
-                self.chrono_settle(id, rules, registry, ctx.effects);
+                self.chrono_settle(id, rules, registry, &mut ctx.effects);
                 if let Some(warp) = self.substrate.chrono_warp_mut(id) {
                     warp.set_state(5);
                 }
             }
             5 => {
-                let marked = self.chrono_settle(id, rules, registry, ctx.effects);
+                let marked = self.chrono_settle(id, rules, registry, &mut ctx.effects);
                 Self::teleport_warp_sound(
                     &mut self.interner,
                     &self.substrate,
@@ -378,7 +380,7 @@ impl Simulation {
                 //719AA3..719AC9: a newly reinforced member skips the
                 //Chronosphere's terrain kill/sink/transform validation.
                 if warp.pending_state() == 0 {
-                    self.chrono_post_warp_validation(id, marked, rules, registry, ctx.effects);
+                    self.chrono_post_warp_validation(id, marked, rules, registry, &mut ctx.effects);
                 }
                 if !self.chrono_owner_alive(id) {
                     return Ok(bridge_state_changed);
@@ -388,15 +390,15 @@ impl Simulation {
                     super::PerCellReason::Arrival,
                     rules,
                     registry,
-                    ctx.effects,
+                    &mut ctx.effects,
                 )?;
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
                     super::teleport_movement::teleport_stop_moving(entity);
                     // `0x00719AEE`/`0x00719AF7`: the drop and warp credits go.
-                    entity.drop_credit.forget();
+                    entity.seldom.drop_credit.forget();
                     entity.set_archive_target(None);
                 }
-                self.assign_null_destination(id, rules, registry, ctx.effects);
+                self.assign_null_destination(id, rules, registry, &mut ctx.effects);
                 let delay = self
                     .substrate
                     .entities
@@ -417,7 +419,7 @@ impl Simulation {
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
                     entity.set_archive_target(None);
                 }
-                self.assign_null_destination(id, rules, registry, ctx.effects);
+                self.assign_null_destination(id, rules, registry, &mut ctx.effects);
                 if let Some(runtime) = self
                     .substrate
                     .entities
@@ -441,7 +443,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> DriveCoord {
         let marked = self
             .substrate
@@ -452,7 +454,7 @@ impl Simulation {
             .and_then(|runtime| runtime.resolved_destination())
             .unwrap_or(DriveCoord { x: 0, y: 0, z: 0 });
         self.foot_set_location_marked(id, marked, rules, registry, effects);
-        self.set_object_height(id, 0, rules, registry, effects);
+        self.set_object_height(id, 0, rules, effects);
         self.foot_mark_put(id, rules, registry, effects);
         marked
     }
@@ -515,7 +517,7 @@ impl Simulation {
         place: bool,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) -> bool {
         let Some(entity) = self.substrate.entities.get(id) else {
             return false;
@@ -535,6 +537,7 @@ impl Simulation {
                 id,
                 marked,
                 false,
+                rules.ares_form(),
             );
             let (ground, bridge) = self
                 .resolved_terrain
@@ -574,6 +577,7 @@ impl Simulation {
                 id,
                 marked,
                 true,
+                rules.ares_form(),
             );
             Self::object_raw_receiver_at(
                 &mut self.substrate,
@@ -582,6 +586,7 @@ impl Simulation {
                 id,
                 marked,
                 true,
+                rules.ares_form(),
             );
             return true;
         }
@@ -595,16 +600,31 @@ impl Simulation {
         ) {
             let mut next = self.cell_objects(cell, layer).next();
             while let Some(member) = next {
-                self.chrono_telefrag(
-                    id,
-                    owner_infantry,
-                    member,
-                    coord,
-                    &mut blocked,
-                    rules,
-                    registry,
-                    effects,
-                );
+                // Ares 3.0 1004B980 (hook 0x718275) replaces the walk; it reads
+                // each successor before the kill, as the vanilla loop does.
+                if rules.ares() {
+                    self.ares_chrono_make_room(
+                        id,
+                        owner_infantry,
+                        member,
+                        coord,
+                        &mut blocked,
+                        rules,
+                        registry,
+                        effects,
+                    );
+                } else {
+                    self.chrono_telefrag(
+                        id,
+                        owner_infantry,
+                        member,
+                        coord,
+                        &mut blocked,
+                        rules,
+                        registry,
+                        effects,
+                    );
+                }
                 next = self.next_cell_object(member);
             }
         }
@@ -626,8 +646,75 @@ impl Simulation {
             id,
             marked,
             true,
+            rules.ares_form(),
         );
         true
+    }
+
+    /// TeleportLocomotionClass_MakeRoom (Ares 3.0 `1004B980`, hook
+    /// `0x718275`, resuming at `0x7184CE`) for one object of the destination
+    /// cell's list: an object is protected while under the Iron Curtain or
+    /// when its TechnoTypeExt `Chronoshift.Crushable` is off. With RulesExt
+    /// `ChronoInfantryCrush=no` arriving infantry dies on anything but
+    /// infantry; infantry on infantry kills only the unprotected one at
+    /// exactly `coord`; a protected object kills the arriving one, an
+    /// unprotected Foot dies, and anything else sends the arrival to
+    /// another cell. Every kill is the victim's Strength as `C4Warhead=`,
+    /// ignoring defenses, with no attacker or house.
+    fn ares_chrono_make_room(
+        &mut self,
+        id: u64,
+        owner_infantry: bool,
+        member: CellObjectMember,
+        coord: DriveCoord,
+        blocked: &mut bool,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        effects: &mut FrameEffects<'_>,
+    ) {
+        let crush_infantry = rules.ares_chrono_infantry_crush();
+        // A TerrainClass is no infantry, no Techno and never curtained.
+        let (other, object_infantry, protected, object_foot) = match member {
+            CellObjectMember::Entity(other) => {
+                let frame = self.session.binary_frame();
+                let Some(entity) = self.substrate.entities.get(other) else {
+                    return;
+                };
+                let crushable = self
+                    .object_type(entity.type_ref(), rules)
+                    .is_none_or(|object| object.ares_chronoshift().crushable);
+                (
+                    Some(other),
+                    entity.category() == EntityCategory::Infantry,
+                    crate::sim::superweapon::invulnerability::is_invulnerable(
+                        entity.invulnerability.as_ref(),
+                        frame,
+                    ) || !crushable,
+                    foot(entity.category()),
+                )
+            }
+            _ => (None, false, false, false),
+        };
+        let victim = if !crush_infantry && owner_infantry && !object_infantry {
+            Some(id)
+        } else if !protected && object_infantry && owner_infantry {
+            other.filter(|&other| {
+                self.substrate.entities.get(other).is_some_and(|entity| {
+                    super::ground_pose::object_get_coords(entity, self.resolved_terrain.as_ref())
+                        == coord
+                })
+            })
+        } else if protected {
+            Some(id)
+        } else if object_foot {
+            other
+        } else {
+            *blocked = true;
+            None
+        };
+        if let Some(victim) = victim {
+            self.chrono_c4_kill(victim, rules, registry, effects);
+        }
     }
 
     /// One object of Update_Position's walk (`0x007182DC..0x0071842A`).
@@ -640,7 +727,7 @@ impl Simulation {
         blocked: &mut bool,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let CellObjectMember::Entity(other) = member else {
             // A TerrainClass is no Foot and never under the Iron Curtain.
@@ -677,7 +764,7 @@ impl Simulation {
         victim: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(strength) = self
             .substrate
@@ -797,7 +884,7 @@ impl Simulation {
         coord: DriveCoord,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(terrain) = self.resolved_terrain.as_ref() else {
             return;
@@ -814,7 +901,10 @@ impl Simulation {
                 .cell_objects((cx as u16, cy as u16), MovementLayer::Ground)
                 .next();
             while let Some(member) = next {
+                // Ares 3.0 TeleportLocomotionClass_Unwarp_PreventSelfCrush
+                // (10037BC0, hook 0x7187DA) skips the warper itself.
                 if let CellObjectMember::Entity(other) = member
+                    && !(rules.ares() && other == id)
                     && self.substrate.entities.get(other).is_some_and(|entity| {
                         crate::sim::superweapon::invulnerability::is_invulnerable(
                             entity.invulnerability.as_ref(),
@@ -832,12 +922,48 @@ impl Simulation {
                 (
                     entity.category(),
                     object.naval,
-                    object.speed_type == SpeedType::Hover
-                        && !(object.powered_unit && !self.has_powered_center(entity.owner())),
+                    // Ares 3.0 TeleportLocomotionClass_UnfreezeObject_SinkOrSwim
+                    // (1005D420, hook 0x718871): an Amphibious,
+                    // AmphibiousCrusher, AmphibiousDestroyer or WaterBeach
+                    // MovementZone floats too, powered or not.
+                    rules.ares()
+                        && matches!(
+                            object.movement_zone,
+                            MovementZone::Amphibious
+                                | MovementZone::AmphibiousCrusher
+                                | MovementZone::AmphibiousDestroyer
+                                | MovementZone::WaterBeach
+                        )
+                        || object.speed_type == SpeedType::Hover
+                            && !(object.powered_unit && !self.has_powered_center(entity.owner())),
                 )
             })
         }) else {
             return;
+        };
+        // Ares 3.0 TeleportLocomotionClass_Unwarp_SinkJumpJets (10037BE0,
+        // hook 0x7188F2): on a water tile (`0x004865D0`) a Unit offline for
+        // want of power (`+0x1C8`) does not float, and a `SpeedType=Hover`
+        // `JumpJet=` Unit goes straight to `0x00718A66`, whose water-tile,
+        // non-infantry arm sinks it with no kill booked.
+        let hover = if rules.ares() {
+            let unit = (water_tile && category == EntityCategory::Unit)
+                .then(|| {
+                    let entity = self.substrate.entities.get(id)?;
+                    let object = self.object_type(entity.type_ref(), rules)?;
+                    Some((
+                        entity.deactivated.is_offline(),
+                        object.speed_type == SpeedType::Hover && object.jumpjet,
+                    ))
+                })
+                .flatten();
+            if unit.is_some_and(|(_, jumpjet)| jumpjet) {
+                self.chrono_warp_sink(id, rules, registry, effects);
+                return;
+            }
+            hover && !unit.is_some_and(|(offline, _)| offline)
+        } else {
+            hover
         };
         let road = land == LandType::Road.as_index() as i32;
         let bridge = flags & CELL_FLAG_BRIDGE != 0;
@@ -850,7 +976,7 @@ impl Simulation {
             self.record_manipulated_kill(
                 id,
                 id,
-                crate::sim::world::UninitContext::new(rules, registry).with_effects(effects),
+                crate::sim::world::UninitContext::new(rules).with_effects(effects),
             );
             return;
         }
@@ -865,7 +991,6 @@ impl Simulation {
                 },
                 EntryQueryMode::CheckLocomotor,
                 rules,
-                registry,
             )
             .unwrap_or_else(|error| {
                 log::debug!("chrono warp {id} entry at ({cx}, {cy}): {error}");
@@ -889,7 +1014,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         self.begin_living_ship_sinking(
             id,
@@ -899,8 +1024,8 @@ impl Simulation {
         );
         let Some((killer, house)) = self.substrate.entities.get(id).map(|entity| {
             (
-                entity.drop_credit.manipulated_by(),
-                entity.drop_credit.warped_by_house(),
+                entity.seldom.drop_credit.manipulated_by(),
+                entity.seldom.drop_credit.warped_by_house(),
             )
         }) else {
             return;

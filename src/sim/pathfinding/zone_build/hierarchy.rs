@@ -8,7 +8,7 @@
 
 use super::{
     BaseZoneTopology, HierarchyBlock, HierarchyEdgeBuckets, HierarchyTempEdge, base_record_index,
-    native_zone_grid_position,
+    level_gap, native_zone_grid_position,
 };
 use crate::map::resolved_terrain::{ResolvedTerrainGrid, zone_class};
 use crate::sim::bridge_state::BridgeEndpointRecord;
@@ -59,6 +59,25 @@ pub(super) struct HierarchyCells<'a> {
     pub(super) width: u16,
     pub(super) height: u16,
     pub(super) native_scan_offset: Option<i32>,
+    /// Read Levels signed: terrain deformation is on ([`level_gap`]).
+    pub(super) signed_levels: bool,
+}
+
+impl<'a> HierarchyCells<'a> {
+    fn new(
+        base: &'a BaseZoneTopology,
+        terrain: Option<&ResolvedTerrainGrid>,
+        width: u16,
+        height: u16,
+    ) -> Self {
+        Self {
+            base,
+            width,
+            height,
+            native_scan_offset: None,
+            signed_levels: terrain.is_some_and(ResolvedTerrainGrid::terrain_deformation),
+        }
+    }
 }
 
 impl HierarchyCells<'_> {
@@ -126,6 +145,10 @@ impl HierarchyCells<'_> {
         self.cell(x, y).map_or(0, |cell| cell.level)
     }
 
+    fn level_gap(self, a: u8, b: u8) -> u8 {
+        level_gap(a, b, self.signed_levels)
+    }
+
     fn base_id(self, x: i32, y: i32) -> ZoneId {
         self.cell(x, y).map_or(0, |cell| cell.base_id)
     }
@@ -155,12 +178,7 @@ pub(crate) fn build_zone_hierarchy(
     width: u16,
     height: u16,
 ) -> ZoneHierarchy {
-    let cells = HierarchyCells {
-        base,
-        width,
-        height,
-        native_scan_offset: None,
-    };
+    let cells = HierarchyCells::new(base, terrain, width, height);
     build_zone_hierarchy_with_query(base, terrain, records, width, height, &mut |x, y| {
         cells.class(x, y) != zone_class::OUTSIDE
     })
@@ -174,12 +192,7 @@ pub(crate) fn build_zone_hierarchy_with_query(
     height: u16,
     query: &mut impl FnMut(i32, i32) -> bool,
 ) -> ZoneHierarchy {
-    let cells = HierarchyCells {
-        base,
-        width,
-        height,
-        native_scan_offset: None,
-    };
+    let cells = HierarchyCells::new(base, terrain, width, height);
     let level2 = build_hierarchy_level(cells, terrain, records, 2, None, query);
     let level1 = build_hierarchy_level(cells, terrain, records, 1, Some(&level2), query);
     let level0 = build_hierarchy_level(cells, terrain, records, 0, Some(&level1), query);
@@ -205,12 +218,7 @@ pub(crate) fn incremental_rebuild_zone_hierarchy_around_cell(
     width: u16,
     height: u16,
 ) -> LocalHierarchyPatchResult {
-    let cells = HierarchyCells {
-        base,
-        width,
-        height,
-        native_scan_offset: None,
-    };
+    let cells = HierarchyCells::new(base, Some(terrain), width, height);
     patch_zone_hierarchy_with_query(
         hierarchy,
         base,
@@ -238,12 +246,7 @@ pub(crate) fn patch_zone_hierarchy_with_query(
     if !query(x, y) {
         return LocalHierarchyPatchResult::Outside;
     }
-    let cells = HierarchyCells {
-        base,
-        width,
-        height,
-        native_scan_offset: None,
-    };
+    let cells = HierarchyCells::new(base, Some(terrain), width, height);
     for level in (0..3).rev() {
         let size = 1i32 << (level + 1);
         let block = HierarchyBlock {
@@ -532,9 +535,11 @@ pub(super) fn register_bridge_hierarchy_edges_with_lookup(
         let (Some(side_tube), Some(opposite_tube)) = (side_tube, opposite_tube) else {
             return;
         };
-        let far =
-            hierarchy_walk_tube_path(terrain, side, &side_tube.path_steps).and_then(|far_side| {
-                hierarchy_walk_tube_path(terrain, opposite, &opposite_tube.path_steps)
+        let far = terrain
+            .walk_native_path(side, &side_tube.path_steps)
+            .and_then(|far_side| {
+                terrain
+                    .walk_native_path(opposite, &opposite_tube.path_steps)
                     .map(|far_opposite| (far_side, far_opposite))
             });
         let (far_side, far_opposite) = match far {
@@ -561,61 +566,6 @@ fn hierarchy_side_coord(coord: (u16, u16), direction: i32) -> (u16, u16) {
         coord.0.wrapping_add(dx as u16),
         coord.1.wrapping_add(dy as u16),
     )
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum HierarchyPathReadError {
-    DirectionData { raw_token: i32, native_address: u32 },
-    TubeIndex(i16),
-}
-
-pub(super) fn hierarchy_walk_tube_path(
-    terrain: &ResolvedTerrainGrid,
-    mut coord: (u16, u16),
-    steps: &[i32],
-) -> Result<(u16, u16), HierarchyPathReadError> {
-    for &step in steps {
-        if step == 8 {
-            let index = terrain.raw_tube_index_at_native_coord(coord);
-            coord = if index == -1 {
-                (0, 0)
-            } else {
-                terrain
-                    .tube(crate::map::tube_facts::TubeId(index as u16))
-                    .filter(|_| index >= 0)
-                    .ok_or(HierarchyPathReadError::TubeIndex(index))?
-                    .exit
-            };
-        } else {
-            // x86 effective address89F688 + step*4 wraps in32 bits. Exact8
-            // above is special; address aliases of slot8 are ordinary reads.
-            let slot = step as u32 & 0x3fff_ffff;
-            let (dx, dy) = match slot {
-                0..=7 => crate::util::direction::DIRECTION_DELTAS[slot as usize],
-                // Original49F2D0/49F280 initialize slots8..12 to0; slot13
-                // is zero BSS with no direct xrefs in the examined image.
-                8..=13 => (0, 0),
-                // Original startup49F0E0/49F190 at captured FPCW0xE7F.
-                // Their initialized bytes match the unpatched process capture
-                // (tube_startup_capture.json); arbitrary neighboring data stays open.
-                14 => (0, 0x6000),
-                15 => (-24418, 16502),
-                0x3fff_fffe => (11544, 21572),
-                0x3fff_ffff => (8699, 16377),
-                _ => {
-                    return Err(HierarchyPathReadError::DirectionData {
-                        raw_token: step,
-                        native_address: 0x0089_f688u32.wrapping_add((step as u32).wrapping_mul(4)),
-                    });
-                }
-            };
-            coord = (
-                coord.0.wrapping_add(dx as u16),
-                coord.1.wrapping_add(dy as u16),
-            );
-        }
-    }
-    Ok(coord)
 }
 
 pub(super) fn register_native_hierarchy_pair(
@@ -666,7 +616,7 @@ pub(super) fn flood_fill_hierarchy_scanline(
     while block.contains(left, sy)
         && let Some(cell) = cells.cell(left, sy)
         && cell.base_id == base_id
-        && cell.level.abs_diff(previous) < 2
+        && cells.level_gap(cell.level, previous) < 2
     {
         cell.index.set_zone(graph, zone);
         previous = cell.level;
@@ -687,7 +637,7 @@ pub(super) fn flood_fill_hierarchy_scanline(
     while block.contains(right, sy)
         && let Some(cell) = cells.cell(right, sy)
         && cell.base_id == base_id
-        && cell.level.abs_diff(previous) < 2
+        && cells.level_gap(cell.level, previous) < 2
     {
         cell.index.set_zone(graph, zone);
         previous = cell.level;
@@ -708,7 +658,7 @@ pub(super) fn flood_fill_hierarchy_scanline(
             let rx = cx.clamp(left + 1, right - 1);
             let cell = cells.cell(cx, cy);
             let level = cell.map_or(0, |cell| cell.level);
-            let height_allowed = level.abs_diff(cells.level(rx, sy)) < 2;
+            let height_allowed = cells.level_gap(level, cells.level(rx, sy)) < 2;
             if let Some(cell) = cell
                 && cell.index.zone(graph) == 0
                 && block.contains(cx, cy)
@@ -766,10 +716,10 @@ fn register_hierarchy_horizontal_edge(
         };
     if positive
         && *last_neighbor != Some(existing)
-        && cells
-            .level(candidate.0, candidate.1)
-            .abs_diff(cells.level(reference.0, reference.1))
-            < 2
+        && cells.level_gap(
+            cells.level(candidate.0, candidate.1),
+            cells.level(reference.0, reference.1),
+        ) < 2
         && query(candidate.0, candidate.1)
         && query(reference.0, reference.1)
     {

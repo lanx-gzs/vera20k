@@ -1,7 +1,8 @@
 //! Overlay and terrain object parsing from RA2 map files.
 //!
 //! RA2 maps have three overlay-related sections:
-//! - `[OverlayPack]`: base64 → LCW compressed → 262,144 bytes (512×512 grid).
+//! - `[OverlayPack]`: base64 → LCW compressed → 262,144 bytes (512×512 grid),
+//!   or 1024×1024 on VERA's extended sizes (`docs/map-format.md`).
 //!   Each byte is an overlay type ID (0xFF = no overlay).
 //! - `[OverlayDataPack]`: same format. Each byte is a frame/value for the overlay
 //!   (e.g., ore density 0-11, wall connection frame).
@@ -11,6 +12,17 @@
 //!
 //! ## Dependency rules
 //! - Part of map/ — depends on util/ (base64, lcw), rules/ (ini_parser).
+
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 
 use crate::map::cell_index::CellGrid;
 use crate::rules::ini_parser::IniFile;
@@ -68,7 +80,7 @@ fn read_pack_byte(bytes: &[u8], grid: CellGrid, rx: u16, ry: u16) -> Option<u8> 
 ///
 /// Overlays include ore, gems, walls, fences, bridges, rocks, and other
 /// decorative or gameplay objects that sit on top of terrain tiles.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct OverlayEntry {
     /// Isometric X coordinate.
     pub rx: u16,
@@ -310,7 +322,7 @@ fn decode_pack_section(ini: &IniFile, section_name: &str, grid: CellGrid) -> Opt
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
@@ -404,7 +416,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod large_map_tests {
     use super::*;
     #[test]

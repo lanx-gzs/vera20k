@@ -55,6 +55,7 @@ fn scene(extra: &str, late: &str) -> (RuleSet, Simulation, InternedId, InternedI
 
 #[test]
 fn ares_refusal_view_obeys_native_readiness_money_and_constraint_priority() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let (rules, mut sim, owner, sw, _, target) = scene("[Strike]\nMoney.Amount=-1\n", "");
     crate::sim::credit_income::add_credits(&mut sim.houses, owner, 1);
     let view = |sim: &Simulation| {
@@ -87,11 +88,12 @@ fn ares_refusal_view_obeys_native_readiness_money_and_constraint_priority() {
         target_ry: 0,
     };
     assert!(!sim.apply_command_with_overlays(
+        None,
         "Americans",
         &command,
         &rules,
         None,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     ));
     assert!(
         matches!(sim.sound_events.iter().collect::<Vec<_>>().as_slice(),
@@ -106,8 +108,8 @@ fn ares_refusal_view_obeys_native_readiness_money_and_constraint_priority() {
         .is_ready = false;
     assert_eq!(
         view(&sim).ares_refusal,
-        None,
-        "unready returns before warnings"
+        Some(AresCameoRefusal::NotReady),
+        "unready plays EVA.Impatient before the money and constraint warnings"
     );
     // Ares AutoFire10038373 returns native Fire_SW's1 after finding a
     // target, even when the previously queued click is no longer ready.
@@ -119,11 +121,12 @@ fn ares_refusal_view_obeys_native_readiness_money_and_constraint_priority() {
     sim.sound_events.clear_for_test();
     let health = sim.entities().get(target).unwrap().health.current();
     assert!(sim.apply_command_with_overlays(
+        None,
         "Americans",
         &command,
         &rules,
         None,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     ));
     assert!(sim.sound_events.is_empty());
     assert!(!sim.super_weapons[&owner][&sw].is_ready());
@@ -166,6 +169,7 @@ fn ares_refusal_view_obeys_native_readiness_money_and_constraint_priority() {
 
 #[test]
 fn use_ai_place_ignores_click_and_keeps_first_eligible_maximum_after_invalid_later_rules() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let (rules, mut sim, owner, sw, _, first) = scene(
         "",
         "[Strike]\n\
@@ -198,6 +202,7 @@ fn use_ai_place_ignores_click_and_keeps_first_eligible_maximum_after_invalid_lat
     );
     let rng = sim.scenario_rng.logical_state();
     assert!(sim.apply_command_with_overlays(
+        None,
         "Americans",
         &Command::LaunchSuperWeapon {
             sw_type_id: sw,
@@ -206,7 +211,7 @@ fn use_ai_place_ignores_click_and_keeps_first_eligible_maximum_after_invalid_lat
         },
         &rules,
         None,
-        FrameEffects::default()
+        &mut FrameEffects::default()
     ));
     assert_eq!(sim.entities().get(first).unwrap().health.current(), 75);
     assert_eq!(sim.entities().get(second).unwrap().health.current(), 100);
@@ -220,6 +225,7 @@ fn use_ai_place_ignores_click_and_keeps_first_eligible_maximum_after_invalid_lat
 
 #[test]
 fn human_auto_fire_uses_house_strategy_hook_and_manual_switch_requires_auto_fire() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     for automatic in [false, true] {
         let (rules, mut sim, owner, sw, _, target) = scene(
             &format!(
@@ -237,7 +243,7 @@ fn human_auto_fire_uses_house_strategy_hook_and_manual_switch_requires_auto_fire
             &rules,
             owner,
             None,
-            FrameEffects::default(),
+            &mut FrameEffects::default(),
         );
         assert_eq!(
             sim.entities().get(target).unwrap().health.current(),
@@ -249,6 +255,7 @@ fn human_auto_fire_uses_house_strategy_hook_and_manual_switch_requires_auto_fire
 
 #[test]
 fn no_target_selector_bypasses_designators_and_uses_empty_cell() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let (rules, mut sim, owner, sw, _, _) = scene(
         "[Strike]\nSW.AITargeting=NoTarget\nSW.Designators=TARGET\n",
         "",
@@ -258,6 +265,7 @@ fn no_target_selector_bypasses_designators_and_uses_empty_cell() {
         Err(TargetReject::NoEligibleDesignator)
     );
     assert!(sim.apply_command_with_overlays(
+        None,
         "Americans",
         &Command::LaunchSuperWeapon {
             sw_type_id: sw,
@@ -266,7 +274,7 @@ fn no_target_selector_bypasses_designators_and_uses_empty_cell() {
         },
         &rules,
         None,
-        FrameEffects::default()
+        &mut FrameEffects::default()
     ));
     assert!(sim.sound_events.iter().any(|event| matches!(event,
         SimSoundEvent::SuperWeaponLaunched { world, .. } if world.to_cell_sub_z().0 == 0 && world.to_cell_sub_z().1 == 0)));

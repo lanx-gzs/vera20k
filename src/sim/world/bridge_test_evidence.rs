@@ -113,13 +113,13 @@ pub(super) fn restored_retail(
     restored.restore_after_snapshot_load().unwrap();
     restored.rebuild_caches_after_load(
         pristine.clone(),
-        live.terrain_speed_config.clone(),
+        live.terrain_speed_config,
         &resources.rules,
     );
     restored
         .restore_map_authority_after_snapshot_load(
             &resources.rules,
-            &resources.overlay_registry,
+            resources.rules.overlay_registry(),
             None,
         )
         .unwrap();
@@ -247,7 +247,11 @@ pub fn visit_starting_mtnk_concrete_attack(
     let mut guarding = false;
     let mut shots = 0;
     let mut dispatched = 0;
-    for step in 1..=profile["ticks"].as_u64().unwrap() {
+    // Each AP hit damages the bridge only when the Scenario draw falls under
+    // its 65 damage out of BridgeStrength=1500, and every House's play draws
+    // the same stream, so the second success comes at no fixed shot. Four
+    // profiles' frames bound a run that never collapses the bridge.
+    for step in 1..=4 * profile["ticks"].as_u64().unwrap() {
         let due: Vec<_> = orders
             .iter()
             .filter(|order| order.execute_tick == step - 1)
@@ -267,7 +271,7 @@ pub fn visit_starting_mtnk_concrete_attack(
         dispatched += due.len();
         let output = scene
             .runtime
-            .advance_frame(&due, 22, TickLane::Ordinary, FrameEffects::default())
+            .advance_frame(&due, 22, TickLane::Ordinary, &mut FrameEffects::default())
             .unwrap();
         assert!(output.tick.frame_committed);
         let fired = output
@@ -351,7 +355,7 @@ pub fn visit_starting_mtnk_concrete_attack(
         visit(label, &mut scene, Some(&output));
     }
     panic!(
-        "normal starting MTNK must reach damage, collapse and settled Guard within the profile bound"
+        "normal starting MTNK must reach damage, collapse and settled Guard within four profiles' frames"
     );
 }
 
@@ -419,8 +423,7 @@ fn damage_bridge(
         &mut runtime.simulation,
         &runtime.resources.rules,
         &[event],
-        Some(&runtime.resources.overlay_registry),
-        crate::sim::world::FrameEffects::default(),
+        &mut crate::sim::world::FrameEffects::default(),
     )
 }
 
@@ -706,7 +709,7 @@ fn repair_ordinary_bridge(
             start.1,
             0,
             &runtime.resources.rules,
-            &runtime.resources.overlay_registry,
+            runtime.resources.rules.overlay_registry(),
         )
         .expect("ordinary Engineer bank placement");
     let orders = producer(&runtime.simulation, &runtime.resources.rules, engineer, hut);
@@ -725,7 +728,7 @@ fn repair_ordinary_bridge(
                 &due,
                 SIM_TICK_MS,
                 crate::sim::world::TickLane::Ordinary,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         published |= output.tick.bridge_state_changed;

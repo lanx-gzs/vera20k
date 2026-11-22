@@ -303,7 +303,7 @@ impl Simulation {
         z: i32,
         rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let marked = self
             .substrate
@@ -367,6 +367,28 @@ pub(crate) fn terrain_projection_differs(cells: &NativeCellQuery<'_>, [x, y]: [i
     crate::sim::find_nearby_cell::project_world_coordinate_with_lookup(x, y, |cx, cy| {
         cells.projection_view(cx, cy)
     }) != cell
+}
+
+/// The terrain exit that the Event IDLE (`0x004C752A..0x004C7577`) and
+/// DEPLOY (`0x004C7719..0x004C775C`) arms share. Off a bridge (`+0x8C`), the
+/// cell at the actor's Location (`0x00565730`) is flat (slope byte `+0x11C`
+/// is 0) and [`terrain_projection_differs`] (vt+0x2B0) finds its screen
+/// projection in another cell: the event then ends at `0x004C8109` with no
+/// effect.
+pub(crate) fn event_hidden_flat_cell(sim: &Simulation, id: u64) -> bool {
+    let (Some(terrain), Some(actor)) = (
+        sim.resolved_terrain.as_ref(),
+        sim.substrate.entities.get(id),
+    ) else {
+        return false;
+    };
+    if actor.on_bridge() {
+        return false;
+    }
+    let cells = NativeCellQuery::canonical(terrain);
+    let [x, y] = position_world_xy(&actor.position);
+    cells.ground_fields(cells.lookup_world(x, y)).1 == 0
+        && terrain_projection_differs(&cells, [x, y])
 }
 
 /// Foot+BC4DDC40(false) -> Object5F6A70. The navigation coordinate can be a
@@ -457,6 +479,14 @@ pub(crate) fn foot_set_location(
     let changed = position_world_coord(&entity.position) != coord;
     entity.position.put_location(coord);
     if changed {
+        // Ares 3.0 FootClass_SetLocation_Parasite (1005CA50, hook 0x4DB87E),
+        // ahead of the riders: the parasite eating this Foot takes the new
+        // Location through its own SetLocation.
+        if rules.ares_form()
+            && let Some(eater) = entities.get(id).and_then(|victim| victim.parasite.eater())
+        {
+            foot_set_location(entities, eater, coord, rules, interner);
+        }
         crate::sim::passenger::open_topped_riders_follow(entities, id, rules, interner);
     }
 }
@@ -555,7 +585,7 @@ fn foundation_center_xy(
 pub fn object_center_xy(entity: &crate::sim::game_entity::GameEntity) -> [i32; 2] {
     let location = position_world_xy(&entity.position);
     if entity.category() == crate::map::entities::EntityCategory::Structure {
-        foundation_center_xy(location, entity.type_facts.foundation())
+        foundation_center_xy(location, entity.seldom.type_facts.foundation())
     } else {
         location
     }
@@ -636,8 +666,18 @@ pub fn target_get_coords(
                 ))
             } else {
                 // Terrain7F522C+48 inherits Object5F65A0: its constructor's
-                // retained Location survives ground changes and expiry.
-                let coord = world.terrain_objects.objects().get(&id)?.world_coord();
+                // retained Location survives ground changes and expiry. So
+                // does VoxelAnim7F6318+48, an AttachedSystem's owner
+                // (`0x007498A5`): only its flight tail moves Location.
+                if let Some(terrain) = world.terrain_objects.objects().get(&id) {
+                    let coord = terrain.world_coord();
+                    return Some(DriveCoord {
+                        x: coord.x,
+                        y: coord.y,
+                        z: coord.z,
+                    });
+                }
+                let coord = world.substrate.voxel_anims.get(id)?.world_coord();
                 Some(DriveCoord {
                     x: coord.x,
                     y: coord.y,
@@ -725,7 +765,7 @@ impl Simulation {
                     entity.category() == crate::map::entities::EntityCategory::Structure
                 })
                 .map(|building| {
-                    let (width, height) = building.type_facts.foundation().dimensions();
+                    let (width, height) = building.seldom.type_facts.foundation().dimensions();
                     (i32::from(width), i32::from(height))
                 }),
             crate::sim::combat::TargetKind::Cell(..) => None,
@@ -821,7 +861,7 @@ impl Simulation {
         coord: DriveCoord,
         rules: &crate::rules::ruleset::RuleSet,
         registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let marked = self
             .substrate
@@ -856,17 +896,16 @@ impl Simulation {
         id: u64,
         height: i32,
         rules: &crate::rules::ruleset::RuleSet,
-        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
-        effects: FrameEffects<'_>,
+        effects: &mut FrameEffects<'_>,
     ) {
-        let context = crate::sim::world::UninitContext::new(rules, registry).with_effects(effects);
+        let mut context = crate::sim::world::UninitContext::new(rules).with_effects(effects);
         let marked = self
             .substrate
             .entities
             .get(id)
             .is_some_and(|entity| entity.lifecycle.cell_marked());
         if marked {
-            self.unmark_entity_remove(id, context);
+            self.unmark_entity_remove(id, context.reborrow());
         }
         Self::set_object_height_unmarked(&mut self.substrate, &self.resolved_terrain, id, height);
         if marked {

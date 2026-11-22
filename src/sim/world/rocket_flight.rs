@@ -11,7 +11,6 @@
 use super::Simulation;
 use super::lifecycle::UninitContext;
 use crate::map::resolved_terrain::NativeCellQuery;
-use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::anim_class::AnimWorldCoord;
 use crate::sim::components::DriveCoord;
@@ -28,7 +27,6 @@ use crate::util::retail_trig::TrigTable;
 struct RocketProcessHost<'a> {
     sim: &'a mut Simulation,
     rules: &'a RuleSet,
-    registry: Option<&'a OverlayTypeRegistry>,
     trig: &'a TrigTable,
     id: u64,
     frame: u32,
@@ -72,6 +70,7 @@ impl RocketHost for RocketProcessHost<'_> {
     }
     fn spawn_owner_is_elite(&self) -> bool {
         self.owner()
+            .seldom
             .spawn_owner_id
             .owner()
             .and_then(|spawner| self.sim.substrate.entities.get(spawner))
@@ -88,8 +87,8 @@ impl RocketHost for RocketProcessHost<'_> {
             self.id,
             DriveCoord { x, y, z },
             self.rules,
-            self.registry,
-            self.frame_effects,
+            Some(self.rules.overlay_registry()),
+            &mut self.frame_effects,
         );
     }
     fn height(&self) -> i32 {
@@ -112,17 +111,24 @@ impl RocketHost for RocketProcessHost<'_> {
     }
     fn mark(&mut self, put: bool) {
         if put {
-            self.sim
-                .foot_mark_put(self.id, self.rules, self.registry, self.frame_effects);
+            self.sim.foot_mark_put(
+                self.id,
+                self.rules,
+                Some(self.rules.overlay_registry()),
+                &mut self.frame_effects,
+            );
         } else {
-            self.sim
-                .foot_mark_remove(self.id, self.rules, self.registry, self.frame_effects);
+            self.sim.foot_mark_remove(
+                self.id,
+                self.rules,
+                Some(self.rules.overlay_registry()),
+                &mut self.frame_effects,
+            );
         }
     }
     fn submit_display(&mut self) {
         Simulation::submit_entity_display(
             &self.sim.interner,
-            &self.sim.terrain_objects,
             &mut self.sim.substrate,
             &self.sim.resolved_terrain,
             self.id,
@@ -160,7 +166,7 @@ impl RocketHost for RocketProcessHost<'_> {
         let frame = self.frame;
         self.owner_mut().body_facing.set(facing, frame);
     }
-    fn anim(&mut self, name: &'static str, coord: [i32; 3], delay: i32, z_adjust: i32) {
+    fn anim(&mut self, name: &str, coord: [i32; 3], delay: i32, z_adjust: i32) {
         let [x, y, z] = coord;
         self.sim.spawn_named_anim(
             self.rules,
@@ -179,11 +185,11 @@ impl RocketHost for RocketProcessHost<'_> {
             .sim
             .interner
             .object_type(owner.type_ref(), self.rules)
-            .and_then(|object| object.aux_sound1.clone())
+            .and_then(|object| object.aux_sound1.as_deref())
         else {
             return;
         };
-        let event = super::SimSoundEvent::voc_at(sound, &owner.position);
+        let event = super::SimSoundEvent::voc_at(self.rules.sound_name(sound), &owner.position);
         self.sim.sound_events.emit(event);
     }
     fn structural_bridge_floor(&self) -> Option<i32> {
@@ -232,20 +238,71 @@ impl RocketHost for RocketProcessHost<'_> {
         self.bridge_state_changed |= crate::sim::combat::world_receiver::apply_area_damage(
             self.sim,
             self.rules,
-            self.registry,
+            Some(self.rules.overlay_registry()),
             ProjectileCoord::new(coord[0], coord[1], coord[2]),
             damage,
             warhead_type,
             true,
             (self.id, None, warhead_ref),
-            self.frame_effects,
+            &mut self.frame_effects,
         )
         .bridge_state_changed;
+    }
+    fn weapon_detonation(&mut self, weapon: &str, coord: [i32; 3]) {
+        use crate::sim::projectile::{
+            ProjectileDetonation, ProjectileDetonationReason, ProjectilePayload, ProjectileTarget,
+        };
+        let rules = self.rules;
+        let Some(kind) = rules.weapon(weapon) else {
+            return;
+        };
+        let Some(warhead) = kind.warhead.as_deref() else {
+            return;
+        };
+        let interner = &mut self.sim.interner;
+        let payload = ProjectilePayload::new(
+            kind.damage,
+            interner.intern(warhead),
+            kind.projectile.as_deref().map(|name| interner.intern(name)),
+            kind.bright,
+        )
+        .with_installed_weapon(Some(interner.intern(&kind.id)));
+        // CreateBullet(owner, owner, ...) without Fire, then Remove: the
+        // Bullet stays at its constructor coordinate and detonates once at
+        // the impact, without the cluster loop.
+        let bullet_id = self.sim.construct_projectile(
+            self.id,
+            ProjectileTarget::Entity(self.id),
+            payload,
+            self.rules,
+        );
+        let bullet = self
+            .sim
+            .projectiles
+            .get(bullet_id)
+            .expect("constructed Missile.Weapon Bullet");
+        let detonation = ProjectileDetonation {
+            projectile_id: bullet_id,
+            source_id: bullet.source_id(),
+            target: bullet.target(),
+            impact: ProjectileCoord::new(coord[0], coord[1], coord[2]),
+            payload: bullet.payload(),
+            reason: ProjectileDetonationReason::DeathWeapon,
+        };
+        self.bridge_state_changed |= self.sim.commit_logic_projectile_detonations(
+            self.rules,
+            Some(self.rules.overlay_registry()),
+            &[detonation],
+            &mut self.frame_effects,
+        );
+        // UnInit (vtable +0xF8) of the never-Fired Bullet.
+        self.sim
+            .destroy_unfired_projectile(bullet_id, self.rules, &mut self.frame_effects);
     }
     fn uninit(&mut self) {
         self.sim.uninit_with_context(
             self.id,
-            UninitContext::new(self.rules, self.registry).with_effects(self.frame_effects),
+            UninitContext::new(self.rules).with_effects(&mut self.frame_effects),
         );
     }
 }
@@ -272,9 +329,7 @@ impl Simulation {
         let Some(entity) = substrate.entities.get_mut(id) else {
             return;
         };
-        let (block, _) = rules
-            .missile_spawn
-            .rocket_block(interner.resolve(entity.type_ref()));
+        let (block, _) = rules.rocket_block(interner.resolve(entity.type_ref()));
         if let Some(rocket) = entity
             .locomotor
             .as_mut()
@@ -290,12 +345,16 @@ impl Simulation {
         &mut self,
         id: u64,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> RocketProcessOutcome {
         let Some(entity) = self.substrate.entities.get(id) else {
             return RocketProcessOutcome::default();
         };
+        // A working copy, as Jumpjet keeps one: the host's callbacks run
+        // through the whole simulation and read the installed instance
+        // (motion queries, the collision and cell-neighbour paths) while the
+        // flight steps, so it must not be taken out. The copy is written back
+        // unless a callback removed the owner or replaced its locomotor.
         let Some(mut rocket) = entity
             .locomotor
             .as_ref()
@@ -304,22 +363,21 @@ impl Simulation {
         else {
             return RocketProcessOutcome::default();
         };
-        let (block, cmisl) = rules
-            .missile_spawn
-            .rocket_block(self.interner.resolve(entity.type_ref()));
+        let type_name = self.interner.resolve(entity.type_ref());
+        let (block, cmisl) = rules.rocket_block(type_name);
+        let ext = rules.rocket_type_ext(type_name);
         let trig = TrigTable::embedded();
         let frame = self.session.binary_frame();
         let mut host = RocketProcessHost {
             sim: self,
             rules,
-            registry,
             trig,
             id,
             frame,
             bridge_state_changed: false,
-            frame_effects,
+            frame_effects: frame_effects.reborrow(),
         };
-        rocket_movement::process(&mut rocket, block, cmisl, &mut host);
+        rocket_movement::process(&mut rocket, block, cmisl, &ext, &mut host);
         let outcome = RocketProcessOutcome {
             bridge_state_changed: host.bridge_state_changed,
         };
@@ -336,7 +394,7 @@ impl Simulation {
     }
 }
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 pub(super) mod retail_tests {
     //! Production composition witnesses: a stock V3 Launcher on retail Hills
     //! and a Dreadnought on retail Lost Lake force-attack a target through an
@@ -1138,8 +1196,7 @@ pub(super) mod retail_tests {
             v3,
             Some(crate::sim::combat::TargetKind::Entity(target)),
             rules,
-            None,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .expect("the V3 takes the tank as its target");
         let now = sim.session.binary_frame();

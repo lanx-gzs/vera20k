@@ -1,11 +1,12 @@
-//! VERA: the online login page's popups (docs/lobby-protocol.md
-//! "Accounts"): Login's username and password, Play as Guest's username,
-//! Create Account and the mailed code that confirms it, Forgot Password's
-//! username and then its code and new password, and Delete Account's
-//! username and password. gamemd has no such dialog; they use the online
-//! Create Game box's art, field column, checkbox rows and buttons.
+//! VERA: the online login page's forms (docs/lobby-protocol.md "Accounts"):
+//! account sign-in and the account popups:
+//! Create Account and the mailed code that confirms it, Forgot
+//! Password's username and then its code and new password, and Delete
+//! Account's username or email and password. gamemd has no such dialog; the popups
+//! use the online Create Game box's art, field column, checkbox rows and
+//! buttons.
 
-use crate::i18n::{tr, tr_fill};
+use crate::i18n::tr_fill;
 use crate::ui::shell::button::ShellButtonInteraction;
 use crate::ui::shell::modal::WolAccountFormLayout;
 use crate::ui::skirmish_shell::SavedSeedDescriptionEdit;
@@ -14,7 +15,7 @@ use crate::util::time::Instant;
 
 pub(crate) const FORM_OK: u16 = 1;
 pub(crate) const FORM_CANCEL: u16 = 2;
-/// Login's Remember password box.
+/// The sign-in form's Remember password box.
 pub(crate) const FORM_REMEMBER: u16 = 3;
 /// The first field's control id; the others follow. Not gamemd controls:
 /// the ids only name their rects.
@@ -30,6 +31,23 @@ const CODE_LENGTH: usize = 6;
 /// of the typed username: masked, it shows that Login needs no password.
 const REMEMBERED_PLACEHOLDER: [u16; 8] = [b'*' as u16; 8];
 
+/// The temporary display name of an in-game guest. Presentation randomness
+/// lives outside the simulation. Keep the five digits on hosts without an
+/// OS random source too, including when two attempts occur in one clock tick.
+pub(crate) fn guest_nickname() -> String {
+    let number = getrandom::u32().unwrap_or_else(|_| {
+        use crate::util::time::{SystemTime, UNIX_EPOCH};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        time.subsec_nanos()
+            .wrapping_add(NEXT.fetch_add(1, Ordering::Relaxed))
+    });
+    format!("Guest{:05}", number % 100_000)
+}
+
 /// A lobby player name: 1 to 24 letters, digits, `_` or `-`. The one
 /// owner of the rule: names also become persona INI section names.
 pub(crate) fn valid_name(name: &str) -> bool {
@@ -42,19 +60,25 @@ pub(crate) fn valid_password(password: &str) -> bool {
         && password.bytes().all(|byte| (0x20..=0x7E).contains(&byte))
 }
 
-/// The lobby's email shape: `x@y.z`, at most 254 characters, no spaces.
+/// The online account service's email rule, for the printable ASCII its edit accepts.
 pub(crate) fn valid_email(email: &str) -> bool {
     let Some((local, domain)) = email.split_once('@') else {
         return false;
     };
     email.len() <= EMAIL_LIMIT
-        && email.bytes().all(email_byte)
-        && !local.is_empty()
-        && !domain.contains('@')
-        && domain
-            .split_once('.')
-            .is_some_and(|(host, top)| !host.is_empty() && !top.is_empty())
-        && !domain.ends_with('.')
+        && (1..=64).contains(&local.len())
+        && local
+            .bytes()
+            .all(|byte| email_byte(byte) && !br#""<>(),;:\[]"#.contains(&byte))
+        && domain.contains('.')
+        && domain.split('.').all(|label| {
+            let bytes = label.as_bytes();
+            bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+                && bytes
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
 }
 
 fn name_byte(byte: u8) -> bool {
@@ -91,12 +115,12 @@ pub(crate) enum AccountRequest {
         password: String,
     },
     Delete {
-        name: String,
+        identifier: String,
         password: String,
     },
 }
 
-/// Never shows a password or code.
+/// Never shows an email, password or code.
 impl std::fmt::Debug for AccountRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (kind, name) = match self {
@@ -104,7 +128,7 @@ impl std::fmt::Debug for AccountRequest {
             Self::Verify { name, .. } => ("Verify", name),
             Self::Forgot { name } => ("Forgot", name),
             Self::Reset { name, .. } => ("Reset", name),
-            Self::Delete { name, .. } => ("Delete", name),
+            Self::Delete { .. } => return f.write_str("AccountRequest::Delete { .. }"),
         };
         f.debug_struct("AccountRequest")
             .field("kind", &kind)
@@ -116,6 +140,7 @@ impl std::fmt::Debug for AccountRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FieldKind {
     Name,
+    NameOrEmail,
     Email,
     Password,
     Confirm,
@@ -126,7 +151,7 @@ impl FieldKind {
     fn limit(self) -> usize {
         match self {
             Self::Name => NAME_LIMIT,
-            Self::Email => EMAIL_LIMIT,
+            Self::Email | Self::NameOrEmail => EMAIL_LIMIT,
             Self::Password | Self::Confirm => PASSWORD_LIMIT,
             Self::Code => CODE_LENGTH,
         }
@@ -138,7 +163,7 @@ impl FieldKind {
         };
         match self {
             Self::Name => name_byte(byte),
-            Self::Email => email_byte(byte),
+            Self::Email | Self::NameOrEmail => email_byte(byte),
             Self::Password | Self::Confirm => (0x20..=0x7E).contains(&byte),
             Self::Code => byte.is_ascii_digit(),
         }
@@ -147,11 +172,8 @@ impl FieldKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FormKind {
-    /// Login: an account's username and password, or this computer's
-    /// remembered sign-in, and Remember password.
+    /// An account password or this computer's remembered sign-in.
     SignIn,
-    /// Play as Guest: a username alone.
-    Guest,
     Register,
     Verify,
     /// Forgot Password's first step: the account whose email gets a code.
@@ -200,8 +222,8 @@ impl AccountField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AccountFormAction {
     Send(AccountRequest),
-    /// Login or Play as Guest: sign in to the lobby. The password is empty
-    /// for a guest and for this computer's remembered sign-in.
+    /// Sign in to the lobby. The password is empty for a guest and for
+    /// this computer's remembered sign-in.
     SignIn {
         sign_in: AccountSignIn,
         remember: bool,
@@ -212,14 +234,12 @@ pub(crate) enum AccountFormAction {
     Close,
 }
 
-/// What a request the lobby accepted gives the form's owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum AccountDone {
-    SignIn(AccountSignIn),
-    /// The account is deleted; the form stays open to say so.
-    Deleted {
-        name: String,
-    },
+/// A successful account operation. Deletion identifies which local sign-in to forget
+/// even if the player has closed the form that sent the request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AccountSuccess {
+    Accepted,
+    Deleted(String),
 }
 
 /// Sign in to this account with this password.
@@ -251,14 +271,20 @@ pub(crate) struct WolAccountForm {
     /// The status line: what to do, what the form waits for or the lobby's
     /// refusal.
     pub(crate) status: String,
+    /// The VERA text `status` was drawn from, so a language reload resolves it
+    /// again; `None` when the lobby supplied the message itself.
+    status_text: Option<StatusText>,
     /// A request is out; OK waits for its answer.
     pub(crate) busy: bool,
-    /// Login's Remember password box: whether it is ticked.
+    /// The sign-in form's Remember password box: whether it is ticked.
     pub(crate) remember: Option<bool>,
-    /// Login: the password field holds [`REMEMBERED_PLACEHOLDER`] for this
-    /// computer's remembered sign-in of the typed username, and OK signs in
-    /// with it.
+    /// The sign-in form: the password field holds [`REMEMBERED_PLACEHOLDER`]
+    /// for this computer's remembered sign-in of the typed username, and OK
+    /// signs in with it.
     pub(crate) remembered: bool,
+    /// The sign-in form: the account this computer signs in to without its
+    /// password, until Remember password is unticked on it.
+    remembered_name: Option<String>,
     focus_started_at: Instant,
 }
 
@@ -272,8 +298,47 @@ impl std::fmt::Debug for WolAccountForm {
     }
 }
 
+/// One status line VERA draws itself: its language-file key and the values
+/// filled into it. Kept beside the resolved text so a language reload can
+/// resolve it again without losing a lobby message, which is stored as
+/// written instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusText {
+    key: &'static str,
+    values: Vec<(&'static str, String)>,
+}
+
+impl StatusText {
+    fn new(key: &'static str) -> Self {
+        Self {
+            key,
+            values: Vec::new(),
+        }
+    }
+
+    fn with(key: &'static str, values: &[(&'static str, &str)]) -> Self {
+        Self {
+            key,
+            values: values
+                .iter()
+                .map(|(name, value)| (*name, (*value).to_owned()))
+                .collect(),
+        }
+    }
+
+    fn resolve(&self) -> String {
+        let values: Vec<(&str, &dyn std::fmt::Display)> = self
+            .values
+            .iter()
+            .map(|(name, value)| (*name, value as &dyn std::fmt::Display))
+            .collect();
+        tr_fill(self.key, &values)
+    }
+}
+
 impl WolAccountForm {
-    fn with_fields(kind: FormKind, fields: Vec<AccountField>, status: String) -> Self {
+    fn with_fields(kind: FormKind, fields: Vec<AccountField>, status: StatusText) -> Self {
+        let resolved = status.resolve();
         let mut form = Self {
             kind,
             fields,
@@ -282,10 +347,12 @@ impl WolAccountForm {
             name: String::new(),
             email: String::new(),
             password: String::new(),
-            status,
+            status: resolved,
+            status_text: Some(status),
             busy: false,
             remember: None,
             remembered: false,
+            remembered_name: None,
             focus_started_at: Instant::now(),
         };
         form.focus(0);
@@ -303,9 +370,10 @@ impl WolAccountForm {
         }
     }
 
-    /// Login, its username prefilled. When that is `remembered`, the account
-    /// this computer signs in to without its password, the password field
-    /// holds the placeholder and Remember password is ticked.
+    /// The sign-in form, its username prefilled. While the username is
+    /// `remembered`, the account this computer signs in to without its
+    /// password, and no password is typed, the password field holds the
+    /// placeholder and Remember password is ticked.
     pub(crate) fn sign_in(name: &str, remembered: Option<&str>) -> Self {
         let mut form = Self::with_fields(
             FormKind::SignIn,
@@ -313,38 +381,77 @@ impl WolAccountForm {
                 AccountField::new(FieldKind::Name, "VERA:Username"),
                 AccountField::new(FieldKind::Password, "VERA:Password"),
             ],
-            String::new(),
+            StatusText::new("VERA:AccountSignInPrompt"),
         );
         form.remember = Some(false);
+        form.remembered_name = remembered.map(str::to_owned);
         form.prefill_name(name);
-        if valid_name(name) && remembered.is_some_and(|known| known.eq_ignore_ascii_case(name)) {
-            form.fields[1]
-                .edit
-                .set_units_limited(REMEMBERED_PLACEHOLDER, PASSWORD_LIMIT);
-            form.remembered = true;
-            form.remember = Some(true);
-        }
-        form.status = form.sign_in_status();
+        form.sync_remembered();
         form
     }
 
-    fn sign_in_status(&self) -> String {
-        tr(if self.remembered {
+    /// The sign-in form after its username or password changed: the
+    /// remembered account's name over an empty password brings the
+    /// placeholder, with Remember password ticked, and another name takes it
+    /// away. So a remembered sign-in a slip of the keys dropped comes back.
+    fn sync_remembered(&mut self) {
+        let named = self
+            .remembered_name
+            .as_deref()
+            .is_some_and(|known| known.eq_ignore_ascii_case(&self.text(FieldKind::Name)));
+        if !named {
+            self.drop_placeholder();
+        } else if !self.remembered && self.text(FieldKind::Password).is_empty() {
+            self.fields[1]
+                .edit
+                .set_units_limited(REMEMBERED_PLACEHOLDER, PASSWORD_LIMIT);
+            self.remembered = true;
+            self.remember = Some(true);
+            let status = self.sign_in_status();
+            self.set_status(status);
+        }
+    }
+
+    pub(crate) fn forget_deleted_sign_in(&mut self, name: &str) {
+        if self.kind != FormKind::SignIn {
+            return;
+        }
+        self.remembered_name
+            .take_if(|known| known.eq_ignore_ascii_case(name));
+        if self.text(FieldKind::Name).eq_ignore_ascii_case(name) {
+            *self = Self::sign_in("", self.remembered_name.as_deref());
+        }
+    }
+
+    fn sign_in_status(&self) -> StatusText {
+        StatusText::new(if self.remembered {
             "VERA:SignInRemembered"
         } else {
-            "VERA:SignInPrompt"
+            "VERA:AccountSignInPrompt"
         })
     }
 
-    /// Play as Guest, its username prefilled.
-    pub(crate) fn guest(name: &str) -> Self {
-        let mut form = Self::with_fields(
-            FormKind::Guest,
-            vec![AccountField::new(FieldKind::Name, "VERA:Username")],
-            tr("VERA:GuestPrompt"),
-        );
-        form.prefill_name(name);
-        form
+    /// Set VERA's own status text, keeping its key so a language reload can
+    /// resolve it again.
+    fn set_status(&mut self, status: StatusText) {
+        self.status = status.resolve();
+        self.status_text = Some(status);
+    }
+
+    /// Set a message another owner supplied, such as the lobby's refusal: it
+    /// stands as written and no language reload rewrites it.
+    fn set_message(&mut self, message: String) {
+        self.status = message;
+        self.status_text = None;
+    }
+
+    /// Resolve the status line from the language files in use again, unless
+    /// the lobby supplied its message. The other texts this form draws are
+    /// resolved every frame.
+    pub(crate) fn refresh_text(&mut self) {
+        if let Some(status) = &self.status_text {
+            self.status = status.resolve();
+        }
     }
 
     /// Create Account, its username prefilled.
@@ -357,7 +464,7 @@ impl WolAccountForm {
                 AccountField::new(FieldKind::Password, "VERA:Password"),
                 AccountField::new(FieldKind::Confirm, "VERA:ConfirmPassword"),
             ],
-            tr("VERA:RegisterPrompt"),
+            StatusText::new("VERA:RegisterPrompt"),
         );
         form.prefill_name(name);
         form
@@ -368,7 +475,7 @@ impl WolAccountForm {
         let mut form = Self::with_fields(
             FormKind::Verify,
             vec![AccountField::new(FieldKind::Code, "VERA:Code")],
-            tr_fill("VERA:VerifyPrompt", &[("email", &email)]),
+            StatusText::with("VERA:VerifyPrompt", &[("email", &email)]),
         );
         form.name = name;
         form.email = email;
@@ -381,7 +488,7 @@ impl WolAccountForm {
         let mut form = Self::with_fields(
             FormKind::Forgot,
             vec![AccountField::new(FieldKind::Name, "VERA:Username")],
-            tr("VERA:ForgotPrompt"),
+            StatusText::new("VERA:ForgotPrompt"),
         );
         form.prefill_name(name);
         form
@@ -396,7 +503,7 @@ impl WolAccountForm {
                 AccountField::new(FieldKind::Password, "VERA:NewPassword"),
                 AccountField::new(FieldKind::Confirm, "VERA:ConfirmPassword"),
             ],
-            tr_fill("VERA:ResetPrompt", &[("name", &name)]),
+            StatusText::with("VERA:ResetPrompt", &[("name", &name)]),
         );
         form.name = name;
         form
@@ -407,10 +514,10 @@ impl WolAccountForm {
         let mut form = Self::with_fields(
             FormKind::Delete,
             vec![
-                AccountField::new(FieldKind::Name, "VERA:Username"),
+                AccountField::new(FieldKind::NameOrEmail, "VERA:UsernameOrEmail"),
                 AccountField::new(FieldKind::Password, "VERA:Password"),
             ],
-            tr("VERA:DeletePrompt"),
+            StatusText::new("VERA:DeletePrompt"),
         );
         form.prefill_name(name);
         form
@@ -420,17 +527,14 @@ impl WolAccountForm {
         FIRST_FIELD + index as u16
     }
 
-    /// The control under a point of `layout`: OK, Cancel, Remember password
-    /// or a field.
+    /// The control under a point of a popup's `layout`: OK, Cancel or a
+    /// field.
     pub(crate) fn control_at(layout: &WolAccountFormLayout, x: i32, y: i32) -> Option<u16> {
         if layout.ok.contains(x, y) {
             return Some(FORM_OK);
         }
         if layout.cancel.contains(x, y) {
             return Some(FORM_CANCEL);
-        }
-        if layout.remember.is_some_and(|rect| rect.contains(x, y)) {
-            return Some(FORM_REMEMBER);
         }
         layout
             .fields
@@ -497,33 +601,37 @@ impl WolAccountForm {
                     password,
                 })
             }
-            FormKind::Delete => (valid_name(&name) && valid_password(&password))
-                .then_some(AccountRequest::Delete { name, password }),
-            FormKind::SignIn | FormKind::Guest | FormKind::Deleted => None,
+            FormKind::Delete => {
+                let identifier = self.text(FieldKind::NameOrEmail);
+                ((valid_name(&identifier) || valid_email(&identifier)) && valid_password(&password))
+                    .then_some(AccountRequest::Delete {
+                        identifier,
+                        password,
+                    })
+            }
+            FormKind::SignIn | FormKind::Deleted => None,
         }
     }
 
-    /// Login's or Play as Guest's sign-in, when its fields are right.
     fn sign_in_action(&self) -> Option<AccountFormAction> {
         let name = self.text(FieldKind::Name);
-        let password = match self.kind {
-            FormKind::SignIn if self.remembered => String::new(),
-            FormKind::SignIn => {
-                Some(self.text(FieldKind::Password)).filter(|p| valid_password(p))?
-            }
-            FormKind::Guest => String::new(),
-            _ => return None,
+        let password = if self.remembered {
+            String::new()
+        } else {
+            self.text(FieldKind::Password)
         };
-        valid_name(&name).then(|| AccountFormAction::SignIn {
-            sign_in: AccountSignIn { name, password },
-            remember: self.remember == Some(true),
+        (valid_name(&name) && (self.remembered || valid_password(&password))).then(|| {
+            AccountFormAction::SignIn {
+                sign_in: AccountSignIn { name, password },
+                remember: self.remember == Some(true),
+            }
         })
     }
 
     pub(crate) fn ok_enabled(&self) -> bool {
         match self.kind {
             FormKind::Deleted => true,
-            FormKind::SignIn | FormKind::Guest => self.sign_in_action().is_some(),
+            FormKind::SignIn => self.sign_in_action().is_some(),
             _ => !self.busy && self.request().is_some(),
         }
     }
@@ -553,7 +661,7 @@ impl WolAccountForm {
     }
 
     /// The remembered sign-in's placeholder gives way to a typed password,
-    /// or to another username.
+    /// to another username or to an unticked Remember password.
     fn drop_placeholder(&mut self) {
         if !self.remembered {
             return;
@@ -566,20 +674,22 @@ impl WolAccountForm {
         {
             field.edit.set_units_limited([], PASSWORD_LIMIT);
         }
-        self.status = self.sign_in_status();
+        let status = self.sign_in_status();
+        self.set_status(status);
     }
 
     /// Remember password's click. Unticked on the remembered sign-in, this
-    /// computer forgets it at once, and Login needs the password.
+    /// computer forgets it at once, and the account needs its password.
     pub(crate) fn toggle_remember(&mut self) -> Option<AccountFormAction> {
         let ticked = self.remember.as_mut()?;
         *ticked = !*ticked;
         if *ticked || !self.remembered {
             return None;
         }
+        self.remembered_name = None;
         self.drop_placeholder();
         self.focus(1);
-        self.status = tr("VERA:SignInForgotten");
+        self.set_status(StatusText::new("VERA:SignInForgotten"));
         Some(AccountFormAction::ForgetSignIn)
     }
 
@@ -588,9 +698,7 @@ impl WolAccountForm {
     pub(crate) fn activate(&mut self, control: u16) -> Option<AccountFormAction> {
         match control {
             FORM_OK if self.kind == FormKind::Deleted => Some(AccountFormAction::Close),
-            FORM_OK if matches!(self.kind, FormKind::SignIn | FormKind::Guest) => {
-                self.sign_in_action()
-            }
+            FORM_OK if self.kind == FormKind::SignIn => self.sign_in_action(),
             FORM_OK => {
                 let request = self.request().filter(|_| !self.busy)?;
                 match &request {
@@ -604,13 +712,13 @@ impl WolAccountForm {
                         self.password = password.clone();
                     }
                     AccountRequest::Reset { password, .. } => self.password = password.clone(),
-                    AccountRequest::Forgot { name } | AccountRequest::Delete { name, .. } => {
+                    AccountRequest::Forgot { name } => {
                         self.name = name.clone();
                     }
-                    AccountRequest::Verify { .. } => {}
+                    AccountRequest::Verify { .. } | AccountRequest::Delete { .. } => {}
                 }
                 self.busy = true;
-                self.status = tr("VERA:ContactingOnline");
+                self.set_status(StatusText::new("VERA:ContactingOnline"));
                 Some(AccountFormAction::Send(request))
             }
             FORM_CANCEL => Some(AccountFormAction::Close),
@@ -632,7 +740,7 @@ impl WolAccountForm {
             }
             let edit = &mut self.fields[self.focused].edit;
             if edit.insert_unit_filtered(unit, kind.limit(), true, &[]) && kind == FieldKind::Name {
-                self.drop_placeholder();
+                self.sync_remembered();
             }
         }
     }
@@ -652,11 +760,8 @@ impl WolAccountForm {
             });
             return None;
         }
-        if self.remembered
-            && kind == FieldKind::Password
-            && matches!(key, WolEditKey::Backspace | WolEditKey::Delete)
-        {
-            self.drop_placeholder();
+        // The placeholder is no text to edit: a typed password replaces it.
+        if self.remembered && kind == FieldKind::Password {
             return None;
         }
         let edit = &mut self.fields[self.focused].edit;
@@ -670,8 +775,8 @@ impl WolAccountForm {
             WolEditKey::End => edit.end(),
             WolEditKey::Tab { .. } | WolEditKey::Enter => {}
         }
-        if kind == FieldKind::Name && edit.units != before {
-            self.drop_placeholder();
+        if edit.units != before && self.kind == FormKind::SignIn {
+            self.sync_remembered();
         }
         None
     }
@@ -680,13 +785,19 @@ impl WolAccountForm {
     /// form into the code's, and Forgot's into the code and new password's;
     /// a confirmed code or reset gives the sign-in; a deletion leaves the
     /// form saying so; a refusal shows the lobby's message.
-    pub(crate) fn answered(&mut self, answer: Result<(), String>) -> Option<AccountDone> {
+    pub(crate) fn answered(
+        &mut self,
+        answer: Result<AccountSuccess, String>,
+    ) -> Option<AccountSignIn> {
         self.busy = false;
         self.buttons = ShellButtonInteraction::default();
-        if let Err(message) = answer {
-            self.status = message;
-            return None;
-        }
+        let success = match answer {
+            Ok(success) => success,
+            Err(message) => {
+                self.set_message(message);
+                return None;
+            }
+        };
         match self.kind {
             FormKind::Register => {
                 *self = Self::verify(
@@ -700,24 +811,24 @@ impl WolAccountForm {
                 *self = Self::reset(std::mem::take(&mut self.name));
                 None
             }
-            FormKind::Verify | FormKind::Reset => Some(AccountDone::SignIn(AccountSignIn {
+            FormKind::Verify | FormKind::Reset => Some(AccountSignIn {
                 name: self.name.clone(),
                 password: std::mem::take(&mut self.password),
-            })),
+            }),
             FormKind::Delete => {
-                self.kind = FormKind::Deleted;
-                self.fields.clear();
-                self.status = tr_fill("VERA:AccountDeleted", &[("name", &self.name)]);
-                Some(AccountDone::Deleted {
-                    name: self.name.clone(),
-                })
+                if let AccountSuccess::Deleted(name) = success {
+                    self.kind = FormKind::Deleted;
+                    self.fields.clear();
+                    self.set_status(StatusText::with("VERA:AccountDeleted", &[("name", &name)]));
+                }
+                None
             }
-            FormKind::SignIn | FormKind::Guest | FormKind::Deleted => None,
+            FormKind::SignIn | FormKind::Deleted => None,
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
 
@@ -726,6 +837,26 @@ mod tests {
             form.focus(index);
             form.insert_text(value);
         }
+    }
+
+    /// The status line keeps the VERA key it came from, so a language reload
+    /// can resolve it again; a lobby message stays as written.
+    #[test]
+    fn the_status_line_remembers_its_key() {
+        let mut form = WolAccountForm::sign_in("Tanya", Some("Tanya"));
+        assert!(form.remembered);
+        assert_eq!(
+            form.status_text.as_ref().map(|status| status.key),
+            Some("VERA:SignInRemembered")
+        );
+        assert_eq!(form.status, crate::i18n::tr("VERA:SignInRemembered"));
+        let status = form.status.clone();
+        form.refresh_text();
+        assert_eq!(form.status, status);
+
+        form.answered(Err("Lobby said no".into()));
+        assert_eq!(form.status, "Lobby said no");
+        assert!(form.status_text.is_none());
     }
 
     #[test]
@@ -768,7 +899,7 @@ mod tests {
         };
         assert_eq!(name, "Tanya");
         assert!(!form.ok_enabled(), "OK waits for the answer");
-        assert_eq!(form.answered(Ok(())), None);
+        assert_eq!(form.answered(Ok(AccountSuccess::Accepted)), None);
         assert_eq!(form.kind, FormKind::Verify);
         form.insert_text("12a345");
         assert!(!form.ok_enabled(), "a code has six digits");
@@ -784,11 +915,11 @@ mod tests {
         assert_eq!(form.status, "Wrong code.");
         form.activate(FORM_OK);
         assert_eq!(
-            form.answered(Ok(())),
-            Some(AccountDone::SignIn(AccountSignIn {
+            form.answered(Ok(AccountSuccess::Accepted)),
+            Some(AccountSignIn {
                 name: "Tanya".into(),
                 password: "s3cret-pw".into(),
-            }))
+            })
         );
     }
 
@@ -803,7 +934,7 @@ mod tests {
                 name: "Tanya".into()
             }))
         );
-        assert_eq!(form.answered(Ok(())), None);
+        assert_eq!(form.answered(Ok(AccountSuccess::Accepted)), None);
         assert_eq!(form.kind, FormKind::Reset);
         type_into(&mut form, &["123456", "n3w-password", "n3w-password"]);
         assert!(matches!(
@@ -811,12 +942,25 @@ mod tests {
             Some(AccountFormAction::Send(AccountRequest::Reset { .. }))
         ));
         assert_eq!(
-            form.answered(Ok(())),
-            Some(AccountDone::SignIn(AccountSignIn {
+            form.answered(Ok(AccountSuccess::Accepted)),
+            Some(AccountSignIn {
                 name: "Tanya".into(),
                 password: "n3w-password".into(),
-            }))
+            })
         );
+    }
+
+    #[test]
+    fn delete_accepts_a_long_registration_email_and_keeps_it_out_of_debug_output() {
+        assert!(!valid_email("x@-invalid.example"));
+        assert!(!valid_email(&format!("{}@example.com", "x".repeat(65))));
+        let email = format!("{}+alias@example.com", "a".repeat(50));
+        let mut form = WolAccountForm::delete("");
+        type_into(&mut form, &[&email, "correct-password"]);
+        assert_eq!(form.fields[0].text(), email);
+        let action = form.activate(FORM_OK).expect("valid email and password");
+        assert!(!format!("{action:?} {form:?}").contains(&email));
+        assert!(!format!("{action:?} {form:?}").contains("correct-password"));
     }
 
     #[test]
@@ -832,7 +976,7 @@ mod tests {
         assert_eq!(
             form.edit_key(WolEditKey::Enter),
             Some(AccountFormAction::Send(AccountRequest::Delete {
-                name: "Tanya".into(),
+                identifier: "Tanya".into(),
                 password: "short-pw".into(),
             }))
         );
@@ -843,10 +987,8 @@ mod tests {
         );
         form.activate(FORM_OK);
         assert_eq!(
-            form.answered(Ok(())),
-            Some(AccountDone::Deleted {
-                name: "Tanya".into()
-            })
+            form.answered(Ok(AccountSuccess::Deleted("Tanya".into()))),
+            None
         );
         assert!(form.fields.is_empty() && form.ok_enabled());
         // No field takes the keys; OK closes.
@@ -879,27 +1021,58 @@ mod tests {
             Some(AccountFormAction::ForgetSignIn)
         );
         assert!(!form.remembered && form.fields[1].text().is_empty());
-        assert!(!form.ok_enabled(), "now it needs the password");
-        form.insert_text("s3cret-pw");
+        assert_eq!(form.clone().activate(FORM_OK), None);
+        assert!(!form.ok_enabled(), "account sign-in requires its password");
+        form.insert_text("s3cret");
+        assert!(!form.ok_enabled(), "six characters are no account password");
+        form.insert_text("-pw");
         assert_eq!(form.activate(FORM_OK), sign_in("tanya", "s3cret-pw", false));
         // Another username is another account: the placeholder goes.
         let mut form = WolAccountForm::sign_in("Tanya", Some("Tanya"));
         form.focus(0);
         form.edit_key(WolEditKey::Backspace);
-        assert!(!form.remembered && !form.ok_enabled());
+        assert!(!form.remembered && form.fields[1].text().is_empty());
         assert_eq!(
             form.activate(FORM_REMEMBER),
             None,
             "nothing remembered to forget"
         );
         assert_eq!(form.remember, Some(false));
-        // A guest signs in by name alone.
-        let mut guest = WolAccountForm::guest("");
-        guest.insert_text("Boris");
+    }
+
+    #[test]
+    fn the_remembered_sign_in_comes_back_with_its_name_and_an_empty_password() {
+        let remembered = Some(AccountFormAction::SignIn {
+            sign_in: AccountSignIn {
+                name: "Tanya".into(),
+                password: String::new(),
+            },
+            remember: true,
+        });
+        let mut form = WolAccountForm::sign_in("Tanya", Some("Tanya"));
+        // A slip of Backspace in the password leaves it standing.
+        form.edit_key(WolEditKey::Backspace);
+        assert_eq!(form.clone().activate(FORM_OK), remembered);
+        // A typed password replaces it; deleted again, it is back.
+        form.insert_text("x");
+        assert!(!form.remembered && form.fields[1].text() == "x");
+        form.edit_key(WolEditKey::Backspace);
+        assert_eq!(form.clone().activate(FORM_OK), remembered);
+        // Editing the username drops the placeholder until its name returns.
+        form.focus(0);
+        form.edit_key(WolEditKey::Backspace);
+        assert!(!form.remembered && form.fields[1].text().is_empty());
+        form.insert_text("a");
+        assert_eq!(form.clone().activate(FORM_OK), remembered);
+        // Unticking Remember password forgets it for good.
         assert_eq!(
-            guest.edit_key(WolEditKey::Enter),
-            sign_in("Boris", "", false)
+            form.activate(FORM_REMEMBER),
+            Some(AccountFormAction::ForgetSignIn)
         );
+        form.focus(0);
+        form.edit_key(WolEditKey::Backspace);
+        form.insert_text("a");
+        assert!(!form.remembered && form.fields[1].text().is_empty());
     }
 
     #[test]

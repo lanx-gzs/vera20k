@@ -25,6 +25,7 @@ use crate::ui::tooltips::{TipRect, TipRegion, TooltipService};
 /// In-game tip ids mirror the gamemd id space: button ids as-is, cameo slots
 /// at 1000+.
 pub(crate) const CAMEO_TIP_ID_BASE: u32 = 1000;
+const ID_TACTICAL_TIP: u32 = 500;
 
 /// Phobos left superweapon sidebar cameo tips, one id per visible slot. Kept
 /// clear of the right sidebar's cameo range.
@@ -68,7 +69,11 @@ const TIP_LABEL_SHADOW: &str = "TXT_SHADOW";
 /// leave the region. Both halves are VERA-local: the native placement branches
 /// on a descriptor byte and its math is undecoded (plan deferred item), so this
 /// offset is a tuned constant, not a gamemd value.
-pub(crate) const TIP_CURSOR_OFFSET: [i32; 2] = [12, 16];
+#[cfg(test)]
+pub(crate) const TIP_CURSOR_OFFSET: [i32; 2] = [
+    crate::ui::field_layout::TooltipPlace::ORIGINAL.x,
+    crate::ui::field_layout::TooltipPlace::ORIGINAL.y,
+];
 /// Popup outline weight. gamemd draws the tip as a 1 px frame in the tip's own
 /// text colour around the black fill; captured from the retail client at the
 /// cameo tooltip (frame RGB equals the glyph RGB, one pixel wide on all four
@@ -234,17 +239,17 @@ fn tactical_world_tip_text(
     world: (f32, f32),
     cursor_coordinates: bool,
 ) -> String {
-    tactical_world_tip_text_sampled(view, rules, csf, world, cursor_coordinates, None, None)
+    tactical_world_tip_text_for_viewer(view, rules, csf, world, cursor_coordinates, None, None)
 }
 
-fn tactical_world_tip_text_sampled(
+fn tactical_world_tip_text_for_viewer(
     view: crate::sim::runtime::SimView<'_>,
     rules: &crate::rules::ruleset::RuleSet,
     csf: Option<&crate::assets::csf_file::CsfFile>,
     world: (f32, f32),
     cursor_coordinates: bool,
-    interpolation: Option<&crate::app::presentation::interpolation::RenderInterpolation>,
     translucent_viewer: Option<crate::sim::intern::InternedId>,
+    frame: Option<&crate::app::presentation::frame::PresentationFrame>,
 ) -> String {
     let Some((terrain, viewer)) = view.resolved_terrain().zip(view.session().current_house())
     else {
@@ -263,20 +268,26 @@ fn tactical_world_tip_text_sampled(
     ) {
         return text;
     }
-    // ProcessClickCoords692300 uses TacticalPick6DA380's retained Display
-    // registrations. Share the normal click owner, including live admission
-    // and foundation fallback, instead of keeping a tooltip object pointer.
+    // ProcessClickCoords692300 uses TacticalPick6DA380's Display
+    // registrations, in the frame's draw order. Share the normal click owner,
+    // including live admission and foundation fallback, instead of keeping a
+    // tooltip object pointer.
     let sim = view.simulation();
-    let order = crate::app::presentation::instances::tactical_entity_encounter_order(sim);
-    let native = crate::app::presentation::interpolation::RenderInterpolation::new(false);
+    let own_order;
+    let order = match frame {
+        Some(frame) => frame.display_order(sim).ordered(),
+        None => {
+            own_order = sim.display_draw_order(Some(rules));
+            &own_order
+        }
+    };
     let picked = crate::app::input::entity_pick::pick_entity_at_point(
         crate::app::input::entity_pick::PresentedWorld {
             sim,
             rules: Some(rules),
-            interpolation: interpolation.unwrap_or(&native),
             translucent_viewer,
         },
-        &order,
+        order.iter().map(|(_, id)| id),
         Some(view.fog()),
         Some(view.interner().resolve(viewer)),
         world.0,
@@ -284,6 +295,12 @@ fn tactical_world_tip_text_sampled(
         Some(view.interner()),
         Some(terrain),
     );
+    // RESIDUAL (dormant: retail Tiberiums set no UIName): a non-Techno pick,
+    // a tree, sends Display::GetTooltipText 0x004AE4F0 to CellClass::GetUIName
+    // 0x00484FF0 (call 0x004AE68A), the clicked cell's Tiberium UIName.
+    // AbstractTypeClass::ReadINI 0x00410A60 leaves it the empty string without
+    // a UIName key, so no tip shows either way. A mod's Tiberium UIName would
+    // show over a tree on ore; VERA shows none and does not read that key.
     let Some(entity) = picked.and_then(|id| view.entities().get(id)) else {
         return String::new();
     };
@@ -295,9 +312,10 @@ fn tactical_world_tip_text_sampled(
     // The shared picker already checked cloak/sensors. TypeInvisible
     // refuses that winner; never pick another object behind it.
     // The bypass reads retained Techno+41A, not a human/control/alliance flag.
-    if !entity.discovery.owned_by_current_house() && object.invisible {
+    if !entity.seldom.discovery.owned_by_current_house() && object.invisible {
         return String::new();
     }
+    let ares = rules.ares();
     match entity.category() {
         // InfantryClass::GetUIName @0x0051F2C0: the shared crew marker
         // takes precedence over disguise. Type.Nominal alone does not.
@@ -312,7 +330,11 @@ fn tactical_world_tip_text_sampled(
         // GetDisguise(1) @522640 supplies a default when retained +518 is null.
         // Source: `tools.native_inspect disasm 0x51F2C0 --bytes 0x65`.
         EntityCategory::Infantry
-            if entity.disguise.as_ref().is_some_and(|d| d.is_disguised())
+            if entity
+                .seldom
+                .disguise
+                .as_ref()
+                .is_some_and(|d| d.is_disguised())
                 && !crate::sim::combat::combat_weapon::is_ally_by_object(
                     Some(sim.house_alliances()),
                     view.interner(),
@@ -327,7 +349,16 @@ fn tactical_world_tip_text_sampled(
                     crate::assets::csf_file::type_ui_name(disguise.ui_name.as_deref(), csf)
                 });
         }
-        // BuildingClass::GetUIName @459ED0 returns actual Type+60.
+        // BuildingClass::GetUIName @459ED0 returns actual Type+60. When Ares
+        // plays in the game (`RuleSet::ares`), Ares BuildingClass_GetUIName
+        // (10015DA0, hook 0x459ED0) shows a player its owner does not count as
+        // an ally the type's EnemyUIName, unless the building's
+        // DisplayProductionTo holds that player.
+        EntityCategory::Structure
+            if ares && let Some(label) = ares_enemy_ui_name(sim, entity, object, viewer) =>
+        {
+            return crate::assets::csf_file::type_ui_name(Some(label), csf);
+        }
         EntityCategory::Structure | EntityCategory::Infantry => {}
         // Aircraft41C1D0 returns its actual Type+60 directly, without a
         // disguise, dock or flight-state name branch. Keep the same picker
@@ -366,6 +397,26 @@ fn tactical_world_tip_text_sampled(
     crate::assets::csf_file::type_ui_name(object.ui_name.as_deref(), csf)
 }
 
+/// Ares BuildingClass_GetUIName (10015DA0, hook 0x459ED0): the type's
+/// `EnemyUIName` for a `viewer` the building's owner does not count as an
+/// ally, unless its DisplayProductionTo holds the viewer; `None` keeps the
+/// type's own name.
+fn ares_enemy_ui_name<'r>(
+    sim: &crate::sim::world::Simulation,
+    entity: &crate::sim::game_entity::GameEntity,
+    object: &'r crate::rules::object_type::ObjectType,
+    viewer: crate::sim::intern::InternedId,
+) -> Option<&'r str> {
+    object.enemy_ui_name().filter(|_| {
+        !crate::sim::combat::combat_weapon::is_ally_by_object(
+            Some(sim.house_alliances()),
+            sim.interner(),
+            entity.owner(),
+            viewer,
+        ) && !entity.shows_production_to(viewer)
+    })
+}
+
 /// `UnitClass::GetUIName @ 0x00746B20`'s turret formatter
 /// (`0x00746B88..0x00746C6E`): swprintf("%s %s") of a turret word and the
 /// actual Type+60. With an infantry first passenger the word follows the
@@ -379,18 +430,20 @@ fn unit_turret_tip_text(
     object: &crate::rules::object_type::ObjectType,
     csf: Option<&crate::assets::csf_file::CsfFile>,
 ) -> String {
-    // Ares UnitGetUIName746B89 ->1004BF20 returns the configured full
-    // weapon-mode name before the original passenger/turret formatter.
-    #[cfg(feature = "ares")]
-    if let Some(label) = object
-        .gunner_turrets
-        .weapon_ui_name(entity.current_weapon_number())
+    // When Ares plays in the game (`RuleSet::ares`), Ares
+    // UnitGetUIName746B89 ->1004BF20 returns the configured full weapon-mode
+    // name before the original passenger/turret formatter.
+    let ares = rules.ares();
+    if ares
+        && let Some(label) = object
+            .gunner_turrets
+            .weapon_ui_name(entity.current_weapon_number())
     {
         return crate::assets::csf_file::type_ui_name(Some(label), csf);
     }
     let tip = |key: &str| csf.map_or_else(|| key.to_owned(), |csf| csf.text(key).into_owned());
     let passenger = entity
-        .passenger_role
+        .passenger_role()
         .cargo()
         .and_then(|cargo| cargo.passengers().first())
         .and_then(|&id| view.entities().get(id))
@@ -409,8 +462,7 @@ fn unit_turret_tip_text(
         None => tip("Tip:Rocket"),
     };
     let own = crate::assets::csf_file::type_ui_name(object.ui_name.as_deref(), csf);
-    #[cfg(feature = "ares")]
-    {
+    if ares {
         // Ares spacing hook746C55 ->1004BF90 separates nonempty pieces only.
         if word.is_empty() {
             return own;
@@ -434,6 +486,37 @@ fn tactical_tip_text(state: &AppState) -> String {
     {
         return String::new();
     }
+    // CursorCheat returns coordinates before reaching the entity picker.
+    if input.cursor_coordinates {
+        return tactical_tip_at_cursor(state, view);
+    }
+    tactical_hover_text(
+        &state.match_state.sim_runtime,
+        &input.tactical_tip_seen,
+        input.cursor_px(),
+        || tactical_tip_at_cursor(state, view),
+    )
+}
+
+/// The last tactical tip answered with the world home (`sim_host::home_answer`),
+/// in a cell because the tooltip draw asks through `&AppState`.
+pub(crate) type TacticalTipAnswer = std::cell::RefCell<((i32, i32), String)>;
+
+/// Display::GetTooltipText (0x004AE4F0) picks live entities. The answer
+/// published before lending the world applies only to the cursor it used.
+fn tactical_hover_text(
+    host: &crate::app::match_runtime::sim_host::SimHost,
+    kept: &TacticalTipAnswer,
+    cursor: (i32, i32),
+    resolve: impl FnOnce() -> String,
+) -> String {
+    let (at, text) =
+        crate::app::match_runtime::sim_host::home_answer(host, kept, || (cursor, resolve()));
+    if at == cursor { text } else { String::new() }
+}
+
+fn tactical_tip_at_cursor(state: &AppState, view: crate::sim::runtime::SimView<'_>) -> String {
+    let input = &state.match_state.input;
     let Some(rules) = state.rules() else {
         return String::new();
     };
@@ -444,15 +527,39 @@ fn tactical_tip_text(state: &AppState) -> String {
     );
     let translucent_viewer =
         crate::app::presentation::instances::translucent_fog_viewer(state, view.simulation());
-    tactical_world_tip_text_sampled(
+    tactical_world_tip_text_for_viewer(
         view,
         rules,
         state.process_assets.csf.as_ref(),
         world,
         input.cursor_coordinates,
-        Some(&state.match_state.match_presentation.interpolation),
         translucent_viewer,
+        state.match_state.sim_runtime.frame(),
     )
+}
+
+pub(crate) fn answer_kept_tactical_tip(state: &AppState) {
+    let input = &state.match_state.input;
+    let tips = &state.match_state.match_presentation.tooltips;
+    if state.frontend.screen == GameScreen::InGame
+        && !state.match_state.paused()
+        && state.frontend.keyboard_dialog.is_none()
+        && input.cursor_visibility.is_visible()
+        && !input.cursor_coordinates
+        && tips.may_read_text(ID_TACTICAL_TIP, tactical_tip_rect(state))
+    {
+        // Prepare during the show delay as well. It can expire while the
+        // tick owns the world, before the next opportunity to pick.
+        let text = tactical_tip_text(state);
+        *input.tactical_tip_seen.borrow_mut() = (input.cursor_px(), text);
+    } else {
+        input.tactical_tip_seen.borrow_mut().1.clear();
+    }
+}
+
+fn tactical_tip_rect(state: &AppState) -> TipRect {
+    let (x, y, width, height) = crate::app::input::camera::tactical_viewport_px(state);
+    TipRect::new(x as i32, y as i32, width as i32, height as i32)
 }
 
 /// Callback479050 reads WWMouse+0C through virtual+28 (7B89F0), returning
@@ -527,6 +634,8 @@ fn sidebar_button_tip_text(
 /// StripClass::GetCameoTooltip 6A92E0, which returns a super weapon's bare
 /// name. Its `TXT_MONEY_FORMAT_1` branch and DrawCameoText 6AC480 need
 /// ShowCameoNames (+0x53A4), which only the constructor 6A4E60 writes (0).
+/// Its `EntryCount < 75` guard has no counterpart here; no strip reaches 75
+/// entries with retail rules.
 fn cameo_tip_text(money_format: Option<&str>, name: &str, cost: Option<i64>) -> String {
     let formatted = match (money_format, cost) {
         (Some(fmt), Some(cost)) => format_csf(fmt, &[CsfArg::Str(name), CsfArg::Int(cost)]),
@@ -595,12 +704,9 @@ fn in_game_regions(state: &AppState, demand: TextDemand) -> Vec<TipRegion> {
     // Set_View_Dimensions4A8960 (registration4A8B50) registers the viewport as
     // dynamic region500. CursorCheat537EF0 toggles its coordinate text at
     // 4AE580, before the ordinary object/shroud tooltip lookup.
-    let (x, y, width, height) = crate::app::input::camera::tactical_viewport_px(state);
-    regions.push(region(
-        500,
-        TipRect::new(x as i32, y as i32, width as i32, height as i32),
-        &|| dynamic_tip_text(cursor, || tactical_tip_text(state)),
-    ));
+    regions.push(region(ID_TACTICAL_TIP, tactical_tip_rect(state), &|| {
+        dynamic_tip_text(cursor, || tactical_tip_text(state))
+    }));
     // Power meter first: gamemd asks the power bar for a tip before the
     // sidebar gadget ids, and registration order decides the hit here.
     // Gadget idle republishes these retained House values each unlocked pump.
@@ -773,7 +879,7 @@ pub(crate) fn build_tooltip_instances(
     let tint = state
         .match_state
         .sim_runtime
-        .as_ref()
+        .runtime()
         .and_then(|runtime| {
             runtime
                 .resources
@@ -812,6 +918,7 @@ pub(crate) fn build_tooltip_instances(
         // The darken strip is only the "a real FNT loaded" sentinel here (the
         // 5x7 fallback builds none); the pop-up itself no longer draws with it.
         state.renderer.bit_font.darken_texture().is_some(),
+        crate::app::presentation::field_parts::layout(state).tooltip,
     )
 }
 
@@ -833,6 +940,7 @@ pub(crate) fn tooltip_quads(
     tint: [f32; 3],
     camera_offset: [f32; 2],
     with_fill: bool,
+    place: crate::ui::field_layout::TooltipPlace,
 ) -> (
     Vec<SpriteInstance>,
     Vec<SpriteInstance>,
@@ -846,7 +954,7 @@ pub(crate) fn tooltip_quads(
     let box_h = layout.height as f32 + TIP_DRAW_PAD[1];
     let bx = place_tip(
         tip_xy[0] as f32,
-        TIP_CURSOR_OFFSET[0] as f32,
+        place.x as f32,
         placement_w,
         region[0],
         region[2],
@@ -855,11 +963,20 @@ pub(crate) fn tooltip_quads(
     let bx = bx.min(region[0] + (region[2] - box_w).max(0.0));
     let by = place_tip(
         tip_xy[1] as f32,
-        TIP_CURSOR_OFFSET[1] as f32,
+        place.y as f32,
         placement_h,
         region[1],
         region[3],
     );
+    // A layout may keep the tip in a corner of the screen instead of at the
+    // cursor; it still stays on the screen.
+    let [bx, by] = match place.fixed_in(region, [box_w, box_h]) {
+        Some([x, y]) => [
+            x.clamp(region[0], region[0] + (region[2] - box_w).max(0.0)),
+            y.clamp(region[1], region[1] + (region[3] - box_h).max(0.0)),
+        ],
+        None => [bx, by],
+    };
 
     let mut fill = Vec::with_capacity(1);
     if with_fill {
@@ -943,13 +1060,44 @@ pub(crate) fn size_tip_box(
     (layout, [box_w, box_h])
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_d_z))]
 mod tests {
     use super::*;
     use crate::render::bit_font::tests::make_test_font;
 
     /// Retail English `TXT_MONEY_FORMAT_2`.
     const RETAIL_MONEY_FORMAT_2: &str = "%s $%d";
+
+    /// Ares BuildingClass_GetUIName (10015DA0, hook 0x459ED0): the owner
+    /// reads the type's name, a player it does not count as an ally the
+    /// type's `EnemyUIName`.
+    #[test]
+    fn ares_enemy_ui_name_shows_to_a_non_allied_player() {
+        use crate::rules::ruleset::RuleSet;
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let rules = RuleSet::from_ini(&crate::sim::arena_fixture::clear_ground_ini(
+            "[BuildingTypes]\n0=POWR\n1=PLAIN\n[POWR]\nStrength=1\nEnemyUIName=NAME:Fake\n\
+             [PLAIN]\nStrength=1\n",
+        ))
+        .unwrap();
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 7);
+        let [powr, plain] = [("POWR", 6), ("PLAIN", 10)].map(|(name, x)| {
+            sim.spawn_object(name, "Americans", x, 6, 0, &rules)
+                .unwrap()
+        });
+        let viewer = |name| sim.interner().get(name).unwrap();
+        let label = |id, name| {
+            let entity = sim.entities().get(id).unwrap();
+            let object = sim
+                .interner()
+                .object_type(entity.type_ref(), &rules)
+                .unwrap();
+            ares_enemy_ui_name(&sim, entity, object, viewer(name))
+        };
+        assert_eq!(label(powr, "Americans"), None);
+        assert_eq!(label(powr, "Russians"), Some("NAME:Fake"));
+        assert_eq!(label(plain, "Russians"), None);
+    }
 
     #[test]
     fn hidden_dynamic_provider_clears_power_tip_and_retains_its_timer() {
@@ -998,6 +1146,67 @@ mod tests {
         tips.on_mouse_move(6, 50, expiry + 2 * TOOLTIP_DURATION_MS);
         tips.poll(expiry + 2 * TOOLTIP_DURATION_MS + 1000);
         assert_eq!(tips.active().unwrap().id, ID_POWER_TIP);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn tactical_hover_uses_the_prepared_unit_name_during_a_lent_tick() {
+        use crate::app::match_runtime::sim_host::SimHost;
+        use crate::ui::tooltips::{TOOLTIP_DELAY_MS, TOOLTIP_DURATION_MS};
+
+        let ini = crate::sim::arena_fixture::clear_ground_ini(
+            "[VehicleTypes]\n0=TANK\n[TANK]\nStrength=100\nUIName=Name:TANK\n",
+        );
+        let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).unwrap();
+        let csf = crate::assets::csf_file::test_csf(&[("Name:TANK", "Test Tank")]);
+        let MappedTipFixture {
+            runtime,
+            csf,
+            world,
+            ..
+        } = mapped_tip_fixture_with_rules("TANK", "Russians", "Russians", rules, csf);
+        let mut host = SimHost::default();
+        host.install(Some(runtime));
+        let kept = TacticalTipAnswer::default();
+        let cursor = (20, 20);
+        let resolve = |host: &SimHost| {
+            let runtime = host.runtime().unwrap();
+            tactical_world_tip_text(
+                runtime.view(),
+                &runtime.resources.rules,
+                Some(&csf),
+                world,
+                false,
+            )
+        };
+        let rect = TipRect::new(0, 0, 100, 100);
+        let region = |text| TipRegion {
+            id: ID_TACTICAL_TIP,
+            rect,
+            text,
+        };
+        let mut tips = TooltipService::new();
+        tips.on_mouse_move(cursor.0, cursor.1, 0);
+        assert!(!tips.pass_reads_text(ID_TACTICAL_TIP, rect, 0));
+        assert!(tips.may_read_text(ID_TACTICAL_TIP, rect));
+        let expected = tactical_hover_text(&host, &kept, cursor, || resolve(&host));
+        assert_eq!(expected, "Test Tank");
+        assert!(host.lend(Box::new(|_| Box::new(()))));
+        let expiry = TOOLTIP_DELAY_MS + TOOLTIP_DURATION_MS;
+        for now in [TOOLTIP_DELAY_MS, TOOLTIP_DELAY_MS + 16, expiry - 1] {
+            let text = tactical_hover_text(&host, &kept, cursor, || resolve(&host));
+            tips.sync_regions(&[region(text)]);
+            tips.poll(now);
+            assert_eq!(
+                tips.active().map(|tip| tip.text.as_str()),
+                Some(expected.as_str())
+            );
+        }
+        let text = tactical_hover_text(&host, &kept, cursor, || resolve(&host));
+        tips.sync_regions(&[region(text)]);
+        tips.poll(expiry);
+        assert!(tips.active().is_none(), "the tooltip expires at 10 seconds");
+        assert!(tactical_hover_text(&host, &kept, (21, 20), || resolve(&host)).is_empty());
     }
 
     #[test]
@@ -1081,8 +1290,7 @@ mod tests {
         );
         runtime
             .simulation
-            .entities_mut_for_test()
-            .get_mut(entity_id)
+            .entity_mut_for_test(entity_id)
             .unwrap()
             .mark_nominal_survivor_for_test();
         let hash = runtime.simulation.state_hash();
@@ -1169,9 +1377,9 @@ mod tests {
         let sim = &mut fixture.runtime.simulation;
         let worn = sim.intern("E2");
         let viewer = sim.intern("British");
-        sim.entities_mut_for_test()
-            .get_mut(fixture.entity_id)
+        sim.entity_mut_for_test(fixture.entity_id)
             .unwrap()
+            .seldom
             .disguise
             .as_mut()
             .unwrap()
@@ -1219,9 +1427,9 @@ mod tests {
             fixture
                 .runtime
                 .simulation
-                .entities_mut_for_test()
-                .get_mut(fixture.entity_id)
+                .entity_mut_for_test(fixture.entity_id)
                 .unwrap()
+                .seldom
                 .disguise
                 .get_or_insert_with(|| crate::sim::cloak_disguise::DisguiseRuntime::new(0))
                 .acquire(0, kind, house);
@@ -1294,7 +1502,7 @@ mod tests {
                     if sim
                         .entities()
                         .get(id)
-                        .is_some_and(|entity| entity.passenger_role.is_inside_transport())
+                        .is_some_and(|entity| entity.passenger_role().is_inside_transport())
                     {
                         break;
                     }
@@ -1302,7 +1510,7 @@ mod tests {
                 assert!(
                     sim.entities()
                         .get(id)
-                        .is_some_and(|entity| entity.passenger_role.is_inside_transport()),
+                        .is_some_and(|entity| entity.passenger_role().is_inside_transport()),
                     "{passenger} boards the IFV"
                 );
             }
@@ -1374,10 +1582,6 @@ mod tests {
         viewer_name: &str,
         patch: Option<&crate::rules::ini_parser::IniFile>,
     ) -> Option<MappedTipFixture> {
-        use crate::sim::house_state::HouseState;
-        use crate::sim::runtime::SimRuntime;
-        use crate::sim::world::Simulation;
-
         let retail = match patch {
             Some(patch) => {
                 crate::rules::retail_ini_fixture::retail_battle_rules_for_map_with_patch(
@@ -1389,7 +1593,26 @@ mod tests {
         }?;
         let (_, assets) = crate::rules::retail_ini_fixture::retail_assets()?;
         let csf = crate::app::loading::init::load_csf(&assets).expect("physical retail CSF");
-        let rules = retail.rules;
+        Some(mapped_tip_fixture_with_rules(
+            type_id,
+            owner_name,
+            viewer_name,
+            retail.rules,
+            csf,
+        ))
+    }
+
+    fn mapped_tip_fixture_with_rules(
+        type_id: &str,
+        owner_name: &str,
+        viewer_name: &str,
+        rules: crate::rules::ruleset::RuleSet,
+        csf: crate::assets::csf_file::CsfFile,
+    ) -> MappedTipFixture {
+        use crate::sim::house_state::HouseState;
+        use crate::sim::runtime::SimRuntime;
+        use crate::sim::world::Simulation;
+
         let mut sim = Simulation::with_seed(0x4AE4_F000);
         sim.intern_rule_type_ids(&rules);
         sim.resolve_type_handles(&rules);
@@ -1416,18 +1639,22 @@ mod tests {
             .unwrap();
         let entity = sim.entities().get(entity_id).unwrap();
         assert_eq!(entity.owner(), owner);
-        assert_eq!(entity.discovery.owned_by_current_house(), owner == viewer);
+        assert_eq!(
+            entity.seldom.discovery.owned_by_current_house(),
+            owner == viewer
+        );
         assert!(
             !entity
                 .cloak
                 .as_ref()
                 .is_some_and(|cloak| cloak.is_fully_cloaked())
         );
-        let world = crate::app::presentation::instances::interpolated_screen_position_entity(
+        let world = crate::render::locomotor_visual::screen_position(
             sim.entities().get(entity_id).unwrap(),
         );
 
-        let order = crate::app::presentation::instances::tactical_entity_encounter_order(&sim);
+        let order =
+            crate::app::presentation::instances::tactical_entity_encounter_order(&sim, None);
         assert_eq!(
             crate::app::input::entity_pick::pick_entity_at_point(
                 sim.entities(),
@@ -1443,14 +1670,14 @@ mod tests {
             "fixture must reach the same ordinary picker before testing the text"
         );
         let mut runtime = SimRuntime::from_simulation(sim);
-        runtime.resources.rules = rules;
-        Some(MappedTipFixture {
+        runtime.resources_mut().rules = rules;
+        MappedTipFixture {
             runtime,
 
             csf,
             entity_id,
             world,
-        })
+        }
     }
 
     fn assert_mapped_tip_uses_retail_ui_name_and_clears_after_limbo(
@@ -1501,7 +1728,7 @@ mod tests {
 
         let mut tips = crate::ui::tooltips::TooltipService::new();
         let region = |text| TipRegion {
-            id: 500,
+            id: ID_TACTICAL_TIP,
             rect: TipRect::new(0, 0, 100, 100),
             text,
         };
@@ -1509,10 +1736,9 @@ mod tests {
         tips.on_mouse_move(20, 20, 0);
         tips.poll(1000);
         assert_eq!(tips.active().unwrap().text, expected);
-        runtime.simulation.techno_limbo_with_context(
-            entity_id,
-            UninitContext::with_rules(&runtime.resources.rules),
-        );
+        runtime
+            .simulation
+            .techno_limbo_with_context(entity_id, UninitContext::new(&runtime.resources.rules));
         let text = tactical_world_tip_text(
             runtime.view(),
             &runtime.resources.rules,
@@ -1742,6 +1968,7 @@ mod tests {
             [1.0, 1.0, 0.0],
             [0.0, 0.0],
             true,
+            crate::ui::field_layout::TooltipPlace::ORIGINAL,
         );
         let panned = tooltip_quads(
             &font,
@@ -1751,6 +1978,7 @@ mod tests {
             [1.0, 1.0, 0.0],
             [640.0, 480.0],
             true,
+            crate::ui::field_layout::TooltipPlace::ORIGINAL,
         );
 
         assert_eq!(at_origin.0.len(), 1);
@@ -1811,6 +2039,7 @@ mod tests {
             [1.0, 1.0, 0.0],
             [0.0, 0.0],
             true,
+            crate::ui::field_layout::TooltipPlace::ORIGINAL,
         );
         assert_eq!(
             fill[0].position,
@@ -1829,6 +2058,7 @@ mod tests {
             [1.0, 1.0, 0.0],
             [0.0, 0.0],
             true,
+            crate::ui::field_layout::TooltipPlace::ORIGINAL,
         );
         assert_eq!(flipped[0].position, [973.0, 316.0]);
         assert_eq!(flipped[0].size, [29.0, font.cell_height() + 4.0]);
@@ -1840,8 +2070,16 @@ mod tests {
         for region in [[0.0, 0.0, 800.0, 600.0], [0.0, 0.0, 1280.0, 720.0]] {
             for text in ["汉", "A1", "汉\nA1"] {
                 let layout = font.wrap_layout(text, region[2] as u32);
-                let (fill, _, glyphs) =
-                    tooltip_quads(&font, text, [100, 100], region, [1.0; 3], [0.0; 2], true);
+                let (fill, _, glyphs) = tooltip_quads(
+                    &font,
+                    text,
+                    [100, 100],
+                    region,
+                    [1.0; 3],
+                    [0.0; 2],
+                    true,
+                    crate::ui::field_layout::TooltipPlace::ORIGINAL,
+                );
                 assert_eq!(
                     fill[0].size,
                     [layout.width as f32 + 8.0, layout.height as f32 + 4.0]
@@ -1876,6 +2114,7 @@ mod tests {
             [1.0; 3],
             [0.0; 2],
             true,
+            crate::ui::field_layout::TooltipPlace::ORIGINAL,
         );
         assert_eq!(fill[0].position, [995.0, 316.0]);
         assert_eq!(fill[0].size, [29.0, font.cell_height() + 4.0]);
@@ -1896,6 +2135,7 @@ mod tests {
             [1.0, 1.0, 0.0],
             [0.0, 0.0],
             true,
+            crate::ui::field_layout::TooltipPlace::ORIGINAL,
         );
         assert_eq!(fill[0].tint, [0.0, 0.0, 0.0]);
         assert_eq!(fill[0].alpha, 1.0);

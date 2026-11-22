@@ -55,6 +55,8 @@ pub(crate) enum ShellSlideKind {
     MoviesAndCredits,
     /// Dialog 0x129 — movie list (Play Movie and Back).
     MovieList,
+    /// VERA's Mods page, from the Mods button of Options.
+    Mods,
     /// Dialog 0x102 — offline skirmish setup.
     Skirmish,
     /// Dialog 0x94 — campaign selection.
@@ -122,6 +124,7 @@ impl ShellSlideKind {
             ShellSlideKind::SinglePlayer => 0x0100,
             ShellSlideKind::MoviesAndCredits => 0x0101,
             ShellSlideKind::MovieList => 0x0129,
+            ShellSlideKind::Mods => crate::ui::mods_shell::DIALOG.0,
             ShellSlideKind::Skirmish => 0x0102,
             ShellSlideKind::Campaign => 0x0094,
             ShellSlideKind::LoadSavedGame => 0x00B7,
@@ -150,8 +153,10 @@ impl ShellSlideKind {
 
     /// The dialog's slide column with the panel's `rows` tile rows. Every
     /// rendered shell has a `slide` table entry, so a miss is a programming
-    /// error. Options slides VERA's page buttons under retail's Keyboard.
-    /// Skirmish slides VERA's Save Setup and Load Setup under Choose Map.
+    /// error. Options slides VERA's page buttons and its Mods button under
+    /// retail's Keyboard.
+    /// Skirmish slides VERA's Game Options between Start Game and Choose Map,
+    /// and VERA's Setups under Choose Map.
     pub(crate) fn column(self, rows: u32, page: Option<&MenuPageSpec>) -> SlideColumn {
         let spec = crate::ui::shell::slide::slide_spec_for(self.dialog_id())
             .expect("rendered shell dialog must have a slide column");
@@ -237,6 +242,9 @@ pub(crate) enum ShellExitThen {
     PlayMovie,
     /// Movie list Back (state `0xE` result -1).
     MovieListBack,
+    /// VERA's Mods page Back: Options is built again, on the page it was
+    /// left from.
+    ModsBack,
     /// Skirmish Start Game (result `0x617`) with the session packed and
     /// resolved when it was pressed.
     SkirmishStart(Box<crate::skirmish_launch::SkirmishLaunchSession>),
@@ -252,6 +260,9 @@ pub(crate) enum ShellExitThen {
     /// commits and writes (Main Menu `0x5CB`; state 0x12 recreates `0xE2`) or
     /// commits and runs the Keyboard page (`0x5CE`).
     Options(crate::ui::main_menu_dialogs::options::LauncherParentResult),
+    /// VERA's Esc menu chose Options: the page it asked over slides out and
+    /// `0xD5` runs, as for the Main Menu's own Options.
+    ShellMenuOptions(ShellSlideKind),
     /// Keyboard `0xA3` Back or Cancel: `0x005FBEF0` tears it down with its
     /// slide, then the bindings save or reload and a new `0xD5` is built.
     KeyboardClose(crate::app::input::keyboard::KeyboardExit),
@@ -261,6 +272,10 @@ pub(crate) enum ShellExitThen {
     },
     LanJoinAccepted(crate::app::shell_lan::LanJoinAcceptance),
     NetworkSetupBack(crate::ui::multiplayer_setup::SetupDialog),
+    NetworkSetupBackWithNotice {
+        dialog: crate::ui::multiplayer_setup::SetupDialog,
+        label: &'static str,
+    },
     NetworkSetupChooseMap(crate::ui::multiplayer_setup::SetupDialog),
     NetworkStart {
         dialog: crate::ui::multiplayer_setup::SetupDialog,
@@ -274,9 +289,9 @@ pub(crate) enum ShellExitThen {
     ChooseMapUse(crate::ui::skirmish_shell::ChooseMapSelection),
     /// Choose Map Cancel: `0x6B` slides out and `0x102` shows again.
     ChooseMapCancel,
-    /// Choose Map Create Random Map: `0x6B` slides out and hides
-    /// (`0x005E6A03..0x005E6A0B`) before the random-map dialog runs.
-    ChooseMapRandomMap,
+    /// Open the generator after Choose Map slides out. Use Map from the
+    /// Random Maps folder loads and accepts the selected seed.
+    ChooseMapRandomMap(Option<crate::map::rmg::saved_seeds::SavedSeedFile>),
     /// Random map Use Map: `0x105` slides out (`0x00595C42` ->
     /// `0x00622720`), then the chooser selects the map and runs its Use Map
     /// (`0x005E6A16..0x005E6B2F`) while it stays hidden.
@@ -313,8 +328,14 @@ pub(crate) enum ShellExitThen {
     },
     /// `0x113` Options (`0x61F`): the lobby slides out and `0x2BC` opens.
     WolOptionsOpen,
-    /// `0x2BC` closed with OK (the staged values) or Cancel (`None`).
-    WolOptionsClose(Option<crate::ui::wol_options::WolPreferences>),
+    /// `0x2BC` closed with OK (the staged values and the chat translation
+    /// settings) or Cancel (`None`).
+    WolOptionsClose(
+        Option<(
+            crate::ui::wol_options::WolPreferences,
+            crate::ui::chat_translation::ChatTranslation,
+        )>,
+    ),
     /// `0x2BC` Sound Options (`0x63A`): it slides out and `0xD6` runs.
     WolSoundOptionsOpen,
     /// `0xD6` Back (`0x686`): `0x2BC` shows again.
@@ -335,6 +356,20 @@ pub(crate) enum ShellExitThen {
 }
 
 impl ShellExitThen {
+    /// Whether this exit opens its next dialog in place of the one leaving
+    /// (`moves_in_place`): Options' Keyboard button and the Keyboard page's
+    /// Back or Cancel. Retail slides `0xD5` out before `0xA3` (`0x0055FD06`)
+    /// and `0xA3` out before the new `0xD5` (`0x005FBEF0`); VERA's Options
+    /// window is its own layout, and its Keyboard page comes and goes like
+    /// its other pages, so neither slides out and neither plays the cue.
+    pub(crate) fn in_place(&self) -> bool {
+        matches!(
+            self,
+            Self::Options(crate::ui::main_menu_dialogs::options::LauncherParentResult::Keyboard)
+                | Self::KeyboardClose(_)
+        )
+    }
+
     /// The dialog whose result this is.
     pub(crate) fn dialog(&self) -> ShellSlideKind {
         match self {
@@ -346,19 +381,22 @@ impl ShellExitThen {
             Self::SinglePlayer(_) => ShellSlideKind::SinglePlayer,
             Self::MoviesCredits(_) => ShellSlideKind::MoviesAndCredits,
             Self::PlayMovie | Self::MovieListBack => ShellSlideKind::MovieList,
+            Self::ModsBack => ShellSlideKind::Mods,
             Self::SkirmishStart(_) | Self::SkirmishBack => ShellSlideKind::Skirmish,
             Self::CampaignBack | Self::CampaignStart(_) => ShellSlideKind::Campaign,
             Self::LoadSavedGameBack => ShellSlideKind::LoadSavedGame,
             Self::Options(_) => ShellSlideKind::Options,
+            Self::ShellMenuOptions(page) => *page,
             Self::KeyboardClose(_) => ShellSlideKind::Keyboard,
             Self::LanBack | Self::LanCreate { .. } | Self::LanJoinAccepted(_) => {
                 ShellSlideKind::LanLobby
             }
             Self::NetworkSetupBack(dialog)
+            | Self::NetworkSetupBackWithNotice { dialog, .. }
             | Self::NetworkSetupChooseMap(dialog)
             | Self::NetworkStart { dialog, .. } => ShellSlideKind::NetworkSetup(*dialog),
             Self::SkirmishChooseMap => ShellSlideKind::Skirmish,
-            Self::ChooseMapUse(_) | Self::ChooseMapCancel | Self::ChooseMapRandomMap => {
+            Self::ChooseMapUse(_) | Self::ChooseMapCancel | Self::ChooseMapRandomMap(_) => {
                 ShellSlideKind::ChooseMap
             }
             Self::RandomMapUse | Self::RandomMapCancel => ShellSlideKind::RandomMap,
@@ -392,6 +430,15 @@ pub(crate) struct ShellExit {
     then: ShellExitThen,
     /// When the last tick had been shown.
     completed_at: Option<Instant>,
+}
+
+impl ShellExit {
+    /// Keep an accepted map bound to its local row during the closing slide.
+    pub(crate) fn remap_choose_map_selection(&mut self, remap: impl FnOnce(usize) -> usize) {
+        if let ShellExitThen::ChooseMapUse(selection) = &mut self.then {
+            selection.record_index = selection.record_index.map(remap);
+        }
+    }
 }
 
 /// After tearing `0x94` down, state 8 waits while the campaign voice still
@@ -446,6 +493,7 @@ pub(crate) fn begin_shell_exit(state: &mut AppState, then: ShellExitThen) -> She
         state.frontend.shell_first_paint_slide.is_some(),
         kind,
     ) {
+        ExitStartRule::Slide if then.in_place() => ShellExitStart::Immediate(then),
         ExitStartRule::Slide => {
             let column = kind.column(
                 panel_rows(state, Some(kind)),
@@ -466,7 +514,12 @@ pub(crate) fn begin_shell_exit(state: &mut AppState, then: ShellExitThen) -> She
 impl ShellExit {
     /// Advance one 30 ms tick when due; true once every tick has been shown
     /// (`0x006071E0` draws ticks `0..bound`, then the teardown continues).
-    fn advance(&mut self, now: Instant) -> bool {
+    fn advance(&mut self, now: Instant, hidden_online_start: bool) -> bool {
+        if hidden_online_start {
+            // The background admission loop only commits an agreed network
+            // start. Other dialog transitions wait for their ordinary paint.
+            return matches!(self.then, ShellExitThen::NetworkStart { .. });
+        }
         self.wave.advance(now);
         self.wave.is_complete()
     }
@@ -482,7 +535,13 @@ pub(crate) fn advance_shell_exit(state: &mut AppState, now: Instant) -> Option<S
         state.frontend.shell_exit = None;
         return None;
     }
-    if !state.frontend.shell_exit.as_mut()?.advance(now) {
+    let hidden_online_start = crate::app::App::online_start_runs_while_hidden(state);
+    if !state
+        .frontend
+        .shell_exit
+        .as_mut()?
+        .advance(now, hidden_online_start)
+    {
         return None;
     }
     if kind == ShellSlideKind::Campaign {
@@ -533,6 +592,22 @@ enum ShellEntryEffect {
     Unchanged,
     LeftShells,
     Started(ShellSlideKind),
+    /// A dialog that opened in place of the one before it (`moves_in_place`):
+    /// no entry slide is armed, and its statics start at once.
+    StartedInPlace(ShellSlideKind),
+}
+
+/// Whether `to` opens in place of `from`, as a page of VERA's Options window
+/// replaces another: Options `0xD5` and its Keyboard page `0xA3`, in either
+/// direction (`ShellExitThen::in_place` has the matching exits). Such an
+/// entry arms no slide; the page's statics start as a slide's SHOW
+/// completion would start them (`show_menu_page_statics`).
+fn moves_in_place(from: Option<ShellSlideKind>, to: ShellSlideKind) -> bool {
+    matches!(
+        (from, to),
+        (Some(ShellSlideKind::Options), ShellSlideKind::Keyboard)
+            | (Some(ShellSlideKind::Keyboard), ShellSlideKind::Options)
+    )
 }
 
 #[derive(Debug)]
@@ -593,7 +668,8 @@ impl<'a> ShellLifecycleReducer<'a> {
     }
 
     fn observe_target(&mut self, target: Option<ShellSlideKind>, now: Instant) -> ShellEntryEffect {
-        if target == *self.active_shell {
+        let previous = *self.active_shell;
+        if target == previous {
             return ShellEntryEffect::Unchanged;
         }
         if target == Some(ShellSlideKind::MainMenu)
@@ -609,6 +685,10 @@ impl<'a> ShellLifecycleReducer<'a> {
                 *self.monitor = Default::default();
                 self.page_title.reset();
                 self.status_line.reset();
+                if moves_in_place(previous, kind) {
+                    *self.first_paint_slide = None;
+                    return ShellEntryEffect::StartedInPlace(kind);
+                }
                 *self.first_paint_slide = Some(if kind == ShellSlideKind::MainMenu {
                     *self.slide_generation = self.slide_generation.wrapping_add(1);
                     if *self.slide_generation == 0 {
@@ -653,6 +733,7 @@ impl<'a> ShellLifecycleReducer<'a> {
             ShellSlideKind::SinglePlayer
             | ShellSlideKind::MoviesAndCredits
             | ShellSlideKind::MovieList
+            | ShellSlideKind::Mods
             | ShellSlideKind::Campaign
             | ShellSlideKind::LoadSavedGame
             | ShellSlideKind::Options
@@ -871,13 +952,20 @@ pub(crate) fn current_shell_slide_target(state: &AppState) -> Option<ShellSlideK
     // `0x0052DDAB`); state 0x12 builds a new `0xE2` when it closes. Its
     // Keyboard page `0xA3` runs after `0xD5` is destroyed (`0x0055FD06`) and
     // slides like it. The Exit confirmation (state 6) and the quit after it
-    // (state 7) run without a family dialog.
+    // (state 7) run without a family dialog. VERA's Esc menu asks over the
+    // showing dialog, which stays the target.
     if let Some(dialog) = state.frontend.keyboard_dialog.as_ref() {
         return (dialog.parent == crate::ui::shell::keyboard::KeyboardParent::Launcher)
             .then_some(ShellSlideKind::Keyboard)
             .filter(|kind| crate::ui::shell::slide::is_slide_eligible(kind.dialog_id()));
     }
-    if state.frontend.shell_message_box.is_some() || state.frontend.quit_cascade.is_some() {
+    if state
+        .frontend
+        .shell_message_box
+        .as_ref()
+        .is_some_and(|message_box| !message_box.keeps_page())
+        || state.frontend.quit_cascade.is_some()
+    {
         return None;
     }
     // Only the native page slides; the assetless fallback does not.
@@ -907,6 +995,8 @@ pub(crate) fn current_shell_slide_target(state: &AppState) -> Option<ShellSlideK
         ShellSlideKind::MoviesAndCredits
     } else if state.frontend.shell_route.movie_list() {
         ShellSlideKind::MovieList
+    } else if state.frontend.shell_route.mods() {
+        ShellSlideKind::Mods
     } else if state.frontend.shell_route.campaign() {
         ShellSlideKind::Campaign
     } else if state.frontend.shell_route.load_saved_game() {
@@ -969,7 +1059,8 @@ pub(crate) fn skirmish_slide_target(
 ) -> Option<ShellSlideKind> {
     use crate::ui::skirmish_shell::SkirmishShellDialog;
     Some(match shell.top_dialog()? {
-        SkirmishShellDialog::Skirmish => ShellSlideKind::Skirmish,
+        // VERA's Setups page covers `0x102` without a slide of its own.
+        SkirmishShellDialog::Skirmish | SkirmishShellDialog::Setups => ShellSlideKind::Skirmish,
         SkirmishShellDialog::ChooseMap => ShellSlideKind::ChooseMap,
         SkirmishShellDialog::RandomMap | SkirmishShellDialog::SeedBrowser => {
             ShellSlideKind::RandomMap
@@ -1041,10 +1132,22 @@ pub(crate) fn activate_shell_first_paint_after_acquire(state: &mut AppState) {
         }
         return;
     }
-    let effect = ShellLifecycleReducer::from_state(state).observe_target(target, Instant::now());
-    if let ShellEntryEffect::Started(_) = effect {
-        crate::app::App::play_shell_slide_in_sound(state);
+    match ShellLifecycleReducer::from_state(state).observe_target(target, Instant::now()) {
+        ShellEntryEffect::Started(_) => crate::app::App::play_shell_slide_in_sound(state),
+        // No slide to complete: the page's statics start now.
+        ShellEntryEffect::StartedInPlace(kind) => show_menu_page_statics(state, kind),
+        ShellEntryEffect::Unchanged | ShellEntryEffect::LeftShells => {}
     }
+}
+
+/// A menu page's SHOW completion: its heading reveal and status line start.
+fn show_menu_page_statics(state: &mut AppState, kind: ShellSlideKind) {
+    let now = Instant::now();
+    let title = crate::app::frontend::menu_page_render::active_page_title_text(state, kind);
+    let frontend = &mut state.frontend;
+    frontend.shell_page_title.set_text(&title, now);
+    frontend.shell_page_title.start(now);
+    frontend.shell_status_line.start(now);
 }
 
 /// Render the currently-showing shell while its first-paint slide is live, then
@@ -1119,6 +1222,9 @@ pub(crate) fn render_shell_first_paint_slide(
                 encoder,
                 destination,
             )?
+        }
+        ShellSlideKind::Mods => {
+            crate::app::frontend::mods_render::render_mods_page(state, encoder, destination)?
         }
         ShellSlideKind::Campaign => {
             crate::app::frontend::campaign_shell_render::render_campaign_page(
@@ -1260,14 +1366,7 @@ pub(crate) fn render_shell_first_paint_slide(
         }
         // Menu pages start their heading reveal on the same edge (0xE2 starts
         // its own in the presented-entry completion transaction).
-        Some(ShellWaveCompletion::MenuPage) => {
-            let now = Instant::now();
-            let title = crate::app::frontend::menu_page_render::active_page_title_text(state, kind);
-            let frontend = &mut state.frontend;
-            frontend.shell_page_title.set_text(&title, now);
-            frontend.shell_page_title.start(now);
-            frontend.shell_status_line.start(now);
-        }
+        Some(ShellWaveCompletion::MenuPage) => show_menu_page_statics(state, kind),
         // 0x108's SHOW completion starts every kind-1 static at once: the
         // heading, the status line and the 47 table texts.
         Some(ShellWaveCompletion::Score) => {
@@ -1319,7 +1418,7 @@ pub(crate) fn render_shell_first_paint_slide(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
     use crate::ui::shell::static_reveal::{Kind1PaintWindow, Kind1StaticReveal};
@@ -1389,8 +1488,7 @@ mod tests {
             seed: 1,
             ..Default::default()
         };
-        shell.random_map_setup_modal =
-            Some(RandomMapSetupModalState::open(options, None, false, true));
+        shell.random_map_setup_modal = Some(RandomMapSetupModalState::open(options, None, false));
         assert_eq!(
             skirmish_slide_target(&shell),
             Some(ShellSlideKind::RandomMap)
@@ -1418,7 +1516,7 @@ mod tests {
         let chooser = shell.choose_map_modal.as_mut().unwrap();
         chooser.message_box = Some(ChooseMapPrompt {
             selection: ChooseMapSelection {
-                mode_id: 1,
+                mode: 1.into(),
                 record_index: Some(0),
             },
             pressed: None,
@@ -1463,6 +1561,31 @@ mod tests {
     }
 
     #[test]
+    fn a_covered_room_can_commit_its_network_start_without_a_presented_slide() {
+        let now = Instant::now();
+        let dialog = crate::ui::multiplayer_setup::SetupDialog {
+            host: false,
+            flavor: crate::ui::multiplayer_setup::SetupFlavor::Wol,
+            modern: true,
+        };
+        let mut exit = ShellExit {
+            wave: ShellFrameWave::new_slide_out(
+                ShellSlideKind::NetworkSetup(dialog).column(9, None),
+                now,
+            ),
+            then: ShellExitThen::NetworkStart {
+                dialog,
+                agreed_seed: 12,
+            },
+            completed_at: None,
+        };
+        assert!(!exit.advance(now, false));
+        assert!(exit.advance(now, true));
+        exit.then = ShellExitThen::NetworkSetupBack(dialog);
+        assert!(!exit.advance(now, true));
+    }
+
+    #[test]
     fn a_teardown_slide_shows_every_tick_before_its_result() {
         // Movie list 0x129 at 800x600: 9 tile rows, 9 + 9 = 18 ticks of 30 ms.
         let t0 = Instant::now();
@@ -1473,13 +1596,13 @@ mod tests {
         };
         for tick in 1..=17u64 {
             assert!(
-                !exit.advance(t0 + Duration::from_millis(30 * tick)),
+                !exit.advance(t0 + Duration::from_millis(30 * tick), false),
                 "tick {tick}"
             );
         }
         // Every tile row, the buttons and the empty ones, closed on the last tick.
         assert!(exit.wave.button_draws().iter().all(|draw| draw.frame == 10));
-        assert!(exit.advance(t0 + Duration::from_millis(30 * 18)));
+        assert!(exit.advance(t0 + Duration::from_millis(30 * 18), false));
         assert_eq!(exit.then, ShellExitThen::MovieListBack);
     }
 
@@ -1497,6 +1620,7 @@ mod tests {
             (column.top_buttons, column.bottom_button, column.map_button)
         };
         assert_eq!(top_and_bottom(ShellSlideKind::MainMenu), (5, true, false));
+        assert_eq!(top_and_bottom(ShellSlideKind::Mods), (2, true, false));
         assert_eq!(
             top_and_bottom(ShellSlideKind::SinglePlayer),
             (3, true, false)
@@ -1506,18 +1630,23 @@ mod tests {
             (3, true, false)
         );
         assert_eq!(top_and_bottom(ShellSlideKind::MovieList), (1, true, false));
-        // Retail `0x102` slides Start Game and Choose Map; VERA's Save Setup
-        // and Load Setup slide under them.
+        // Retail `0x102` slides Start Game and Choose Map; VERA's Game Options
+        // slides between them and its Setups under them.
         assert_eq!(top_and_bottom(ShellSlideKind::Skirmish), (4, true, true));
         // Retail `0xD5` slides Keyboard and Network; VERA leaves Network out
-        // and slides its six page buttons under Keyboard.
+        // and slides its six page buttons under Keyboard, then its Mods
+        // button where the build has mods.
         assert_eq!(
             crate::ui::shell::slide::slide_spec_for(DialogId(0x00D5))
                 .unwrap()
                 .top_buttons,
             2
         );
-        assert_eq!(top_and_bottom(ShellSlideKind::Options), (7, true, false));
+        let mods = u32::from(crate::ui::main_menu_dialogs::options::HAS_MODS);
+        assert_eq!(
+            top_and_bottom(ShellSlideKind::Options),
+            (7 + mods, true, false)
+        );
     }
 
     #[test]
@@ -1526,7 +1655,7 @@ mod tests {
         let column = ShellSlideKind::WolLobby.column(9, Some(lobby.page_spec()));
         assert_eq!(
             (column.top_buttons, column.bottom_button, column.top_panel),
-            (4, true, false)
+            (6, true, false)
         );
         assert_eq!(ShellSlideKind::WolWelcome.column(9, None).top_buttons, 6);
         let retail = ShellSlideKind::WolLobby.column(9, None);
@@ -1553,6 +1682,78 @@ mod tests {
         assert!(branch.contains("render_active_menu_page"));
         assert!(branch.contains("destination"));
         assert!(!branch.contains("target"));
+    }
+
+    /// Options and its Keyboard page replace each other in place, as the
+    /// pages of VERA's Options window do: no entry slide either way, and the
+    /// matching exits are immediate, while the Main Menu's way into Options
+    /// still slides.
+    #[test]
+    fn options_and_its_keyboard_page_replace_each_other_without_a_slide() {
+        use crate::app::input::keyboard::KeyboardExit;
+        use crate::ui::main_menu_dialogs::options::LauncherParentResult;
+        assert!(ShellExitThen::Options(LauncherParentResult::Keyboard).in_place());
+        assert!(ShellExitThen::KeyboardClose(KeyboardExit::Back).in_place());
+        assert!(!ShellExitThen::Options(LauncherParentResult::Back).in_place());
+        assert!(!ShellExitThen::Options(LauncherParentResult::Mods).in_place());
+
+        let start = Instant::now();
+        let mut title_reveal = Kind1StaticReveal::default();
+        let mut monitor = crate::ui::shell::warning_monitor::WarningMonitor::default();
+        let mut page_title = crate::ui::shell::static_reveal::PresentedKind1Static::new(
+            crate::ui::shell::static_reveal::HEADING_KIND1,
+        );
+        let mut status_line = crate::ui::shell::static_reveal::PresentedKind1Static::new(
+            crate::ui::shell::static_reveal::STATUS_LINE_KIND1,
+        );
+        let mut active_shell = Some(ShellSlideKind::Options);
+        let mut first_paint_slide = None;
+        let mut slide_generation = 1;
+        let mut observe = |active_shell: &mut Option<ShellSlideKind>,
+                           first_paint_slide: &mut Option<ShellFrameWave>,
+                           target| {
+            ShellLifecycleReducer {
+                panel_rows: 9,
+                page_spec: None,
+                active_shell,
+                first_paint_slide,
+                slide_generation: &mut slide_generation,
+                title_reveal: &mut title_reveal,
+                monitor: &mut monitor,
+                page_title: &mut page_title,
+                status_line: &mut status_line,
+            }
+            .observe_target(Some(target), start)
+        };
+        assert_eq!(
+            observe(
+                &mut active_shell,
+                &mut first_paint_slide,
+                ShellSlideKind::Keyboard
+            ),
+            ShellEntryEffect::StartedInPlace(ShellSlideKind::Keyboard)
+        );
+        assert!(first_paint_slide.is_none());
+        assert_eq!(active_shell, Some(ShellSlideKind::Keyboard));
+        assert_eq!(
+            observe(
+                &mut active_shell,
+                &mut first_paint_slide,
+                ShellSlideKind::Options
+            ),
+            ShellEntryEffect::StartedInPlace(ShellSlideKind::Options)
+        );
+        assert!(first_paint_slide.is_none());
+        active_shell = Some(ShellSlideKind::MainMenu);
+        assert_eq!(
+            observe(
+                &mut active_shell,
+                &mut first_paint_slide,
+                ShellSlideKind::Options
+            ),
+            ShellEntryEffect::Started(ShellSlideKind::Options)
+        );
+        assert!(first_paint_slide.is_some());
     }
 
     #[test]

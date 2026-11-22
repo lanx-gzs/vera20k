@@ -4,6 +4,7 @@
 use super::{FrameEffects, Simulation, TickLane, UninitContext};
 use crate::map::map_file::MapFile;
 use crate::rules::ini_parser::IniFile;
+use crate::rules::rule_policy::RulePolicy;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::team_ai_ini::TeamAiIniRegistry;
 use crate::sim::command::{Command, CommandEnvelope};
@@ -99,7 +100,11 @@ fn authored_follows_peer_changes_house_with_only_head_tagged() {
          [Actions]\nTRANSFER=1,14,0,{country},0,0,0,0,A\n\
          [Tags]\nTRANSFER_TAG=0,Transfer linked units,TRANSFER\n"
     ));
-    let teams = TeamAiIniRegistry::from_sources(&IniFile::empty(), &map.ini, true);
+    let teams = TeamAiIniRegistry::from_sources(
+        &IniFile::empty(),
+        &map.ini,
+        RulePolicy::stock_multiplayer(),
+    );
     sim.initialize_trigger_definitions(&map, &teams, None, None, None);
     assert_eq!(sim.spawn_from_map(&map.entities, Some(rules)), 3);
     sim.classify_map_triggers(rules);
@@ -116,7 +121,7 @@ fn authored_follows_peer_changes_house_with_only_head_tagged() {
     sim.advance_triggers(
         rules,
         Some(rules.overlay_registry()),
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     );
     assert_eq!(sim.entities().get(head).unwrap().owner(), target);
     assert_eq!(
@@ -151,10 +156,9 @@ fn authored_follows_peer_changes_house_with_only_head_tagged() {
             .advance_app_frame(
                 commands,
                 rules,
-                Some(rules.overlay_registry()),
                 67,
                 TickLane::Ordinary,
-                FrameEffects::default(),
+                &mut FrameEffects::default(),
             )
             .unwrap();
         assert!(output.tick.frame_committed);
@@ -213,19 +217,15 @@ fn uninit_clears_incoming_unit_link_but_preserves_orphan_follower_byte_after_res
 
     // UnitPointerExpired7446E0 clears its pointer after inherited forwards;
     // neither it nor the deleting destructor resets the surviving tail byte.
-    sim.uninit_with_context(
-        middle,
-        UninitContext::new(rules, Some(rules.overlay_registry())),
-    );
+    sim.uninit_with_context(middle, UninitContext::new(rules));
     assert_eq!(sim.entities().get(head).unwrap().unit_follower(), None);
     assert!(sim.entities().get(tail).unwrap().is_unit_follower());
     sim.advance_app_frame(
         &[],
         rules,
-        Some(rules.overlay_registry()),
         67,
         TickLane::Ordinary,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     )
     .unwrap();
     assert!(
@@ -240,4 +240,50 @@ fn uninit_clears_incoming_unit_link_but_preserves_orphan_follower_byte_after_res
         sim.entities().get(tail).unwrap().is_unit_follower(),
         "semantic restore must retain the byte rather than derive incoming links"
     );
+}
+
+/// A `[Units]` FOLLOWS cycle behind the ordered head: gamemd's loop at
+/// 0x004D3ECD never ends; VERA routes the head alone and the frame goes on.
+#[test]
+fn a_follower_cycle_does_not_stop_the_frame() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = &retail.rules;
+    let mut sim = arena(rules);
+    let owner = sim.interner.get("Americans").unwrap();
+    let map = map("[Units]\n\
+         0=Americans,MTNK,256,8,8,0,Sleep,None,0,-1,0,1,1,1\n\
+         1=Americans,MTNK,256,10,8,0,Sleep,None,0,-1,0,2,1,1\n\
+         2=Americans,MTNK,256,12,8,0,Sleep,None,0,-1,0,1,1,1\n");
+    assert_eq!(sim.spawn_from_map(&map.entities, Some(rules)), 3);
+    let head = at_x(&sim, 8);
+    let command = CommandEnvelope::new(
+        owner,
+        sim.session.tick() + 1,
+        Command::Move {
+            entity_id: head,
+            target_rx: 20,
+            target_ry: 8,
+        },
+    );
+    let mut routed = false;
+    for frame in 0..30 {
+        let commands = if frame == 0 {
+            std::slice::from_ref(&command)
+        } else {
+            &[]
+        };
+        sim.advance_app_frame(
+            commands,
+            rules,
+            67,
+            TickLane::Ordinary,
+            &mut FrameEffects::default(),
+        )
+        .unwrap();
+        routed |= sim.entities().get(head).unwrap().navigation.nav_com()
+            == Some(NavTargetRef::cell(20, 8));
+    }
+    assert!(routed, "the head still takes its order");
 }

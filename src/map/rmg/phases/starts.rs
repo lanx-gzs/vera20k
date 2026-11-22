@@ -10,6 +10,7 @@
 //! quota split, per-region gather/select/write (one lane draw plus one
 //! candidate draw per iteration).
 
+use crate::map::playfield::PlayfieldBounds;
 use crate::map::rmg::grid::RmgGrid;
 use crate::map::rmg::rng::RmgRng;
 use crate::map::rmg::scratch::RmgScratch;
@@ -20,7 +21,7 @@ use crate::util::native_x87::X87Chop53;
 use super::area;
 use super::blob::{CellHeap, by_key};
 use super::regions::{Regions, RmgRegion};
-use super::zones::{ZoneField, diamond_frame_contains};
+use super::zones::ZoneField;
 
 /// Region-size survival floor: 3% of the interior area but at least 400.
 const AREA_FRACTION: f64 = 0.03;
@@ -55,7 +56,7 @@ pub struct StartsArgs {
     pub tiberium_layout: i32,
     pub gen_w: i32,
     pub gen_h: i32,
-    /// The padded map width (frame-test base).
+    /// The padded map width, the `Size` width the view test keeps.
     pub map_w: i32,
 }
 
@@ -77,8 +78,8 @@ pub struct StartsOutcome {
     /// Region-list indices in bucket order (ascending sort key), the order the
     /// map-type-0 tech coin flips walk.
     pub region_order: Vec<usize>,
-    /// How many waypoint slots a region could not fill because its selection
-    /// came up shorter than its quota.
+    /// How many waypoint slots no region filled: a selection shorter than its
+    /// quota, an empty one, or no region surviving the size threshold.
     ///
     /// Non-zero means the map is short of spawns: those slots stay `None` and
     /// no start is placed for them. Carried out to `GeneratedMap` so a release
@@ -90,9 +91,19 @@ pub struct StartsOutcome {
 
 pub fn run(ctx: &mut StartsCtx<'_>, args: &StartsArgs, zones: &ZoneField) -> StartsOutcome {
     // Survival threshold: max(genH * genW * 0.03, 400), truncated.
-    let area = TruncF64::from_f64(f64::from(args.gen_h))
+    let mut area = TruncF64::from_f64(f64::from(args.gen_h))
         .mul(TruncF64::from_f64(f64::from(args.gen_w)))
         .mul(TruncF64::from_f64(AREA_FRACTION));
+    // VERA extension: past the original's eight starts the 3% share is per
+    // eight players, so thirty players' islands (archipelago) are judged as
+    // eight players' are rather than all falling under it. 2..=8 unchanged.
+    if args.start_quota > crate::map::rmg::NATIVE_MAX_PLAYERS {
+        area = area
+            .mul(TruncF64::from_f64(f64::from(
+                crate::map::rmg::NATIVE_MAX_PLAYERS,
+            )))
+            .div(TruncF64::from_f64(f64::from(args.start_quota)));
+    }
     let floor = TruncF64::from_f64(MIN_REGION_CELLS);
     let threshold =
         X87Chop53::ftol_f64_low_masked(if area.lt(floor) { floor } else { area }.to_f64());
@@ -113,6 +124,13 @@ pub fn run(ctx: &mut StartsCtx<'_>, args: &StartsArgs, zones: &ZoneField) -> Sta
         place_region_starts(ctx, args, index, offset, &mut outcome);
         offset += ctx.regions.list[index].start_quota;
     }
+    // Every slot no region filled, including all of them when no region
+    // survives the threshold, so a map short of starts is always reported.
+    outcome.unfilled_start_slots = outcome
+        .waypoints
+        .iter()
+        .filter(|slot| slot.is_none())
+        .count();
 
     // The original ends by publishing start/extent preview metadata into the
     // scenario (packed cells plus isometric pixel mins/extents). Nothing in
@@ -264,9 +282,16 @@ fn place_region_starts(
     offset: i32,
     outcome: &mut StartsOutcome,
 ) {
-    // The view frame the candidates must sit in: the local rect inset by
-    // (4, 4, -8, -8).
-    let view_rect = [6, 9, args.gen_w - 8, args.gen_h - 8];
+    // The view frame the candidates must sit in: the LocalSize (2, 5, w, h)
+    // inset by (4, 4, -8, -8) (0x00594873..0x005948B0). 0x00578640 runs the
+    // playfield test over it in LocalSize's place.
+    let view = PlayfieldBounds::from_normalized_local_size(
+        args.map_w,
+        6,
+        9,
+        args.gen_w - 8,
+        args.gen_h - 8,
+    );
 
     let lane = lane_draw(ctx.rng);
     let quota = ctx.regions.list[region_index].start_quota;
@@ -285,7 +310,7 @@ fn place_region_starts(
             continue;
         }
         let cell = ctx.grid.get(x, y).expect("region cells are in-band");
-        if !diamond_frame_contains(args.map_w, view_rect, x, y, cell.level, cell.slope != 0) {
+        if !view.contains_height_aware_packed(x, y, cell.level as i8, cell.slope) {
             continue;
         }
         // Duplicates are allowed: repeated draws of the same cell append
@@ -309,8 +334,7 @@ fn place_region_starts(
             // contents follow the process's allocation history rather than the
             // seed, so even two generations in one session disagree. Neither is
             // reproducible, so stopping short is a deliberate divergence —
-            // counted and reported, never claimed as parity.
-            outcome.unfilled_start_slots += (quota - slot_index) as usize;
+            // counted by `run` and reported, never claimed as parity.
             break;
         };
         if let Some(way) = outcome.waypoints.get_mut(slot) {
@@ -475,7 +499,7 @@ pub fn mark_start_areas(ctx: &mut StartsCtx<'_>, args: &StartsArgs, outcome: &St
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use crate::map::rmg::phases::shore::{SubTile, TileBlock, TileBlocks};
@@ -561,8 +585,9 @@ mod tests {
             grid,
             &ClearBlocks,
             &ZoneParams {
-                map_w: args.map_w,
-                local_rect: [2, 5, args.gen_w, args.gen_h],
+                playfield: PlayfieldBounds::from_normalized_local_size(
+                    args.map_w, 2, 5, args.gen_w, args.gen_h,
+                ),
                 wheel_impassable: wheel,
                 cliff_back_impassability: 2,
                 overlays: &[],
@@ -905,8 +930,9 @@ mod tests {
                 &grid,
                 &LandBlocks,
                 &ZoneParams {
-                    map_w: 16,
-                    local_rect: [2, 5, gen_size.0, gen_size.1],
+                    playfield: PlayfieldBounds::from_normalized_local_size(
+                        16, 2, 5, gen_size.0, gen_size.1,
+                    ),
                     wheel_impassable: wheel,
                     cliff_back_impassability: 0,
                     overlays: &overlays,

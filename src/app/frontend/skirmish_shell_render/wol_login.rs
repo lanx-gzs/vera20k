@@ -1,8 +1,9 @@
 //! `0x10F`'s left-side children on the shared control owners: the two
 //! labels, the nickname combo (face `0x00617250` with its NewEdit), the
 //! `ES_PASSWORD` NewEdit, the Remember checkbox and the combo's drop list;
-//! on VERA online's page, its info pane in their place and its popups over
-//! it. The WOL page compositor draws them over its own backdrop and chrome.
+//! VERA online's page has its welcome, its sign-in form and the lobby's
+//! counts in their place, and its popups over them. The WOL page compositor
+//! draws them over its own backdrop and chrome.
 
 use super::controls::{
     ControlPaint, NewEditPaint, dropdown_scroll_part, paint_control, push_new_edit_caret,
@@ -15,31 +16,17 @@ use super::{
     SHELL_EDIT_CARET_DEPTH, SHELL_EDIT_FRAME_DEPTH, SHELL_LABEL_TEXT_RGB,
 };
 use crate::app::AppState;
-use crate::app::shell_wol::login_info::{Activity, News};
 use crate::render::batch::SpriteInstance;
 use crate::render::shell_paint::{self, ModalButton, PaintLabel};
 use crate::render::shell_text::{self, ShellAlign, ShellTextDraw};
-use crate::render::skirmish_shell_chrome::SkirmishShellChromeAtlas;
 use crate::ui::shell::geom::{RectPx, ShellScale};
-use crate::ui::shell::list::list_frame_lines;
 use crate::ui::shell::modal::WolAccountFormLayout;
 use crate::ui::wol_account::{FORM_CANCEL, FORM_OK, WolAccountForm};
-use crate::ui::wol_login::{WolLoginInfoLayout, WolLoginLayout, WolLoginState};
+use crate::ui::wol_login::{PLAY_AS_GUEST, SIGN_IN_AND_PLAY, WolLoginLayout, WolLoginState};
 use crate::util::time::Instant;
 
-/// The info pane's panels sit over the page art, under its popups.
-const INFO_FILL_DEPTH: f32 = shell_paint::CHROME_DEPTH - 0.00001;
-const INFO_FRAME_DEPTH: f32 = shell_paint::CHROME_DEPTH - 0.00002;
-/// The panels darken the art behind them, which still shows through.
-const INFO_FILL_ALPHA: f32 = 0.82;
-const INFO_TITLE_RGB: [f32; 3] = [1.0, 1.0, 1.0];
-const INFO_BODY_RGB: [f32; 3] = [0.80, 0.80, 0.80];
-const INFO_NOTE_RGB: [f32; 3] = [0.60, 0.60, 0.60];
-/// Inside a panel's frame, in the 800x600 shell's pixels.
-const INFO_PAD: i32 = 12;
-/// A post's date column, and a rule's number column.
-const INFO_DATE_W: i32 = 88;
-const INFO_NUMBER_W: i32 = 20;
+/// VERA online's status line and counts, beside the shell's yellow captions.
+const ONLINE_TEXT_RGB: [f32; 3] = [0.80, 0.80, 0.80];
 
 /// Sprites (skirmish atlas) and texts of `0x10F`'s children; `popup` paints
 /// after everything else.
@@ -80,11 +67,181 @@ pub(crate) fn paint_wol_login_children(
             scale.factor(),
         )
     };
-    if let Some(info) = layout.info {
-        paint_info_pane(&mut paint, state, atlas, info, scale);
+    let label = |key: &str| csf_label(state, key);
+    if let Some(choice) = layout.entry_choice() {
+        let dialog = choice.dialog;
+        // Use Create Room's original Red Alert 2 picture of the Tesla Trooper.
+        // The regular mode-2 picture covers installs without that RA2 art.
+        let background = atlas
+            .ra2_dialog_background
+            .or_else(|| atlas.mode_two_dialog_background(None));
+        if let Some(background) = background {
+            super::chrome::push_entry_fitted(
+                &mut paint.popup,
+                background,
+                dialog,
+                scale,
+                POPUP_DEPTHS.background,
+            );
+        } else {
+            super::chrome::push_solid_rect(
+                &mut paint.popup,
+                atlas,
+                dialog,
+                super::SHELL_MODAL_PANEL_RGB,
+                POPUP_DEPTHS.background,
+            );
+        }
+        let centre = ShellAlign::H_CENTER | ShellAlign::V_CENTER;
+        let count = state
+            .frontend
+            .login_info
+            .players_online()
+            .map_or_else(|| "—".to_owned(), |count| count.to_string());
+        for (value, rect, size) in [
+            (label("VERA:OnlineWelcome"), choice.heading, 1.4),
+            (
+                crate::i18n::fill(&label("VERA:PlayersOnline"), &[("count", &count)]),
+                choice.players_online,
+                1.25,
+            ),
+        ] {
+            let glyph_scale = scale.factor() * size;
+            let fit = font.fit_line(&value, (rect.w as f32 / glyph_scale).max(1.0) as u32);
+            let shadow = scale.derive_rect(rect, |r| r.translate(1, 1));
+            font.fitted(fit, |font| {
+                for (bounds, rgb, depth) in [
+                    (shadow, [0.0; 3], POPUP_DEPTHS.button),
+                    (rect, SHELL_LABEL_TEXT_RGB, POPUP_DEPTHS.text),
+                ] {
+                    paint.popup_texts.push(shell_text::draw_in_rect_scaled(
+                        font,
+                        &value,
+                        rect_to_text_rect(bounds),
+                        rgb,
+                        centre,
+                        [0.0; 2],
+                        depth,
+                        glyph_scale,
+                    ));
+                }
+            });
+        }
+        for (id, key, rect) in [
+            (PLAY_AS_GUEST, "VERA:PlayAsGuest", choice.guest),
+            (SIGN_IN_AND_PLAY, "VERA:SignInAndPlay", choice.account),
+        ] {
+            let pressed = login.buttons.is_pressed(id);
+            let mut frames = super::type3_button_frames(atlas);
+            if login.buttons.hovered.unwrap_or(login.focused_control) == id {
+                frames.up = atlas.modal_button_mnbttn_frame2.or(frames.up);
+            }
+            if let Some(face) = frames.select(pressed, true) {
+                super::chrome::push_entry(&mut paint.popup, face, rect, POPUP_DEPTHS.button);
+            }
+            let caption = scale.derive_rect(rect, |r| {
+                crate::app::frontend::shell_pass::owner_draw_button_label_rect(r, pressed)
+            });
+            let value = label(key);
+            let face_width = (scale.base_rect(caption).w - 12).max(1) as u32;
+            let fit = font.fit_line(&value, face_width);
+            paint.popup_texts.push(font.fitted(fit, |_| {
+                text(
+                    &value,
+                    caption,
+                    centre,
+                    SHELL_LABEL_TEXT_RGB,
+                    POPUP_DEPTHS.text,
+                )
+            }));
+        }
         return paint;
     }
-    let label = |key: &str| csf_label(state, key);
+    if let (Some(online), Some(form)) = (layout.online, login.form.as_ref()) {
+        // The chosen route, its fields and the lobby activity over the login art.
+        let centred = ShellAlign::H_CENTER;
+        paint.texts.push(text(
+            &label("VERA:SignInAndPlay"),
+            online.heading,
+            centred,
+            SHELL_LABEL_TEXT_RGB,
+            SHELL_CONTROL_TEXT_DEPTH,
+        ));
+        // A popup over the page holds the caret.
+        let caret_visible = login.account.is_none() && form.caret_visible(now);
+        for (field, (caption_rect, edit)) in form.fields.iter().zip(online.fields) {
+            paint.texts.push(text(
+                &label(field.label),
+                caption_rect,
+                ShellAlign::NONE,
+                SHELL_LABEL_TEXT_RGB,
+                SHELL_CONTROL_TEXT_DEPTH,
+            ));
+            let edit_text = scale.derive_rect(edit, |rect| {
+                RectPx::new(rect.x + 2, rect.y, rect.w - 1, rect.h + 1)
+            });
+            push_new_edit_instances(
+                &mut paint.controls,
+                atlas,
+                font,
+                &field.edit,
+                NewEditPaint {
+                    frame: scale.derive_rect(edit, |rect| {
+                        RectPx::new(rect.x - 2, rect.y - 2, rect.w + 5, rect.h + 5)
+                    }),
+                    text: edit_text,
+                    background: None,
+                    frame_depth: SHELL_EDIT_FRAME_DEPTH,
+                    caret_depth: SHELL_EDIT_CARET_DEPTH,
+                    caret_visible: caret_visible && field.edit.focused,
+                },
+                scale,
+            );
+            paint.texts.push(text(
+                &field.edit.painted_text(),
+                edit_text,
+                ShellAlign::V_CENTER,
+                SHELL_LABEL_TEXT_RGB,
+                SHELL_CONTROL_TEXT_DEPTH,
+            ));
+        }
+        if let Some(checked) = form.remember {
+            paint_control(
+                &mut paint.controls,
+                &atlas.control_chrome(),
+                ControlPaint::Checkbox {
+                    rect: online.remember,
+                    checked,
+                },
+                scale,
+            );
+            paint.texts.push(text(
+                &label("VERA:RememberPassword"),
+                crate::ui::skirmish_shell::checkbox_text_rect(online.remember, scale),
+                ShellAlign::V_CENTER,
+                SHELL_LABEL_TEXT_RGB,
+                SHELL_CONTROL_TEXT_DEPTH,
+            ));
+        }
+        paint.texts.push(text(
+            &form.status,
+            online.status,
+            centred,
+            ONLINE_TEXT_RGB,
+            SHELL_CONTROL_TEXT_DEPTH,
+        ));
+        for ((key, count), rect) in state.frontend.login_info.counts().zip(online.counts) {
+            let value = crate::i18n::fill(&label(key), &[("count", &count)]);
+            paint.texts.push(text(
+                &value,
+                rect,
+                centred,
+                ONLINE_TEXT_RGB,
+                SHELL_CONTROL_TEXT_DEPTH,
+            ));
+        }
+        return paint;
+    }
     for (key, rect) in &layout.labels {
         paint.texts.push(text(
             &label(key),
@@ -210,181 +367,8 @@ pub(crate) fn paint_wol_login_children(
     paint
 }
 
-/// VERA online's info pane: the news panel, its heading row naming the
-/// lobby's activity on the right, over the online rules panel. Each panel is
-/// a list's frame over the darkened art; posts and rules wrap to at most two
-/// lines, and what does not fit is left out.
-fn paint_info_pane(
-    paint: &mut WolLoginPaint,
-    state: &AppState,
-    atlas: &SkirmishShellChromeAtlas,
-    info: WolLoginInfoLayout,
-    scale: ShellScale,
-) {
-    let font = &state.renderer.bit_font;
-    let line = font.cell_height().round() as i32;
-    let lines = |value: &str, width: i32| {
-        (font.wrap_layout(value, width.max(0) as u32).lines.len() as i32).clamp(1, 2)
-    };
-    // Rects are the 800x600 shell's; the text lays out in them.
-    let mut text = |value: &str, rect: RectPx, align: ShellAlign, rgb: [f32; 3]| {
-        paint.texts.push(shell_text::draw_in_rect_scaled(
-            font,
-            value,
-            rect_to_text_rect(scale.scale_rect(rect)),
-            rgb,
-            align,
-            [0.0; 2],
-            SHELL_CONTROL_TEXT_DEPTH,
-            scale.factor(),
-        ));
-    };
-    let label = |key: &str| csf_label(state, key);
-    let inner = |panel: RectPx| {
-        let panel = scale.base_rect(panel);
-        RectPx::new(
-            panel.x + INFO_PAD,
-            panel.y + INFO_PAD - 2,
-            panel.w - 2 * INFO_PAD,
-            panel.h - 2 * INFO_PAD + 2,
-        )
-    };
-
-    let news = inner(info.news);
-    let heading = RectPx::new(news.x, news.y, news.w, line);
-    text(
-        &label("VERA:LatestNews"),
-        heading,
-        ShellAlign::NONE,
-        SHELL_LABEL_TEXT_RGB,
-    );
-    let login_info = &state.frontend.login_info;
-    if let Some(activity) = login_info.activity() {
-        let (key, count) = match activity {
-            Activity::Online(count) => ("VERA:PlayersOnline", count),
-            Activity::RecentGames(count) => ("VERA:RecentGames", count),
-        };
-        let value = crate::i18n::fill(&label(key), &[("count", &count)]);
-        text(&value, heading, ShellAlign::H_RIGHT, INFO_NOTE_RGB);
-    }
-    let bottom = news.y + news.h;
-    let mut y = heading.y + line + 8;
-    let note = match login_info.news() {
-        News::Loading => Some("VERA:NewsLoading"),
-        News::Posts(posts) if !posts.is_empty() => None,
-        News::Unavailable | News::Posts(_) => Some("VERA:NewsUnavailable"),
-    };
-    if let Some(key) = note {
-        text(
-            &label(key),
-            RectPx::new(news.x, y, news.w, line),
-            ShellAlign::NONE,
-            INFO_NOTE_RGB,
-        );
-    }
-    if let News::Posts(posts) = login_info.news() {
-        let (x, w) = (news.x + INFO_DATE_W, news.w - INFO_DATE_W);
-        for post in posts {
-            let (title, summary) = (lines(&post.title, w), lines(&post.summary, w));
-            if y + line * (title + summary) > bottom {
-                break;
-            }
-            text(
-                &post.date,
-                RectPx::new(news.x, y, INFO_DATE_W, line),
-                ShellAlign::NONE,
-                INFO_NOTE_RGB,
-            );
-            text(
-                &post.title,
-                RectPx::new(x, y, w, line * title),
-                ShellAlign::NONE,
-                INFO_TITLE_RGB,
-            );
-            text(
-                &post.summary,
-                RectPx::new(x, y + line * title, w, line * summary),
-                ShellAlign::NONE,
-                INFO_BODY_RGB,
-            );
-            y += line * (title + summary) + 10;
-        }
-    }
-
-    let rules = inner(info.rules);
-    text(
-        &label("VERA:OnlineRules"),
-        RectPx::new(rules.x, rules.y, rules.w, line),
-        ShellAlign::NONE,
-        SHELL_LABEL_TEXT_RGB,
-    );
-    let (bottom, x, w) = (
-        rules.y + rules.h,
-        rules.x + INFO_NUMBER_W,
-        rules.w - INFO_NUMBER_W,
-    );
-    let mut y = rules.y + line + 8;
-    for (index, rule) in label("VERA:OnlineRulesText").split('\n').enumerate() {
-        let height = line * lines(rule, w);
-        if y + height > bottom {
-            break;
-        }
-        text(
-            &format!("{}.", index + 1),
-            RectPx::new(rules.x, y, INFO_NUMBER_W, line),
-            ShellAlign::NONE,
-            INFO_NOTE_RGB,
-        );
-        text(
-            rule,
-            RectPx::new(x, y, w, height),
-            ShellAlign::NONE,
-            INFO_BODY_RGB,
-        );
-        y += height + 2;
-    }
-
-    for panel in [info.news, info.rules] {
-        push_info_panel(&mut paint.controls, atlas, panel);
-    }
-}
-
-/// A panel's darkened backing and a list's two frame rings around it.
-fn push_info_panel(out: &mut Vec<SpriteInstance>, atlas: &SkirmishShellChromeAtlas, panel: RectPx) {
-    let Some(pixel) = atlas.white_pixel else {
-        return;
-    };
-    let mut push = |rect: RectPx, tint: [f32; 3], alpha: f32, depth: f32| {
-        out.push(SpriteInstance {
-            position: [rect.x as f32, rect.y as f32],
-            size: [rect.w as f32, rect.h as f32],
-            uv_origin: pixel.uv_origin,
-            uv_size: pixel.uv_size,
-            depth,
-            tint,
-            alpha,
-            ..Default::default()
-        });
-    };
-    push(
-        RectPx::new(panel.x + 1, panel.y + 1, panel.w - 2, panel.h - 2),
-        super::SHELL_MODAL_PANEL_RGB,
-        INFO_FILL_ALPHA,
-        INFO_FILL_DEPTH,
-    );
-    for (rect, tone) in list_frame_lines(panel) {
-        push(
-            rect,
-            tone.rgb().map(|channel| f32::from(channel) / 255.0),
-            1.0,
-            INFO_FRAME_DEPTH,
-        );
-    }
-}
-
 /// VERA online's popups on Red Alert 2's box art, as the online Create Game
-/// box: a caption and edit per field, Login's Remember password box, OK and
-/// Cancel, and the status line.
+/// box: a caption and edit per field, OK and Cancel, and the status line.
 pub(crate) fn paint_wol_account_form(
     state: &AppState,
     form: &WolAccountForm,
@@ -440,21 +424,6 @@ pub(crate) fn paint_wol_account_form(
         ShellAlign::NONE,
         SHELL_LABEL_TEXT_RGB,
     ));
-    let mut checkboxes = Vec::new();
-    if let (Some(checked), Some(rect)) = (form.remember, layout.remember) {
-        paint_control(
-            &mut checkboxes,
-            &atlas.control_chrome(),
-            ControlPaint::Checkbox { rect, checked },
-            scale,
-        );
-        labels.push(plain(
-            csf_label(state, "VERA:RememberPassword"),
-            crate::ui::skirmish_shell::checkbox_text_rect(rect, scale),
-            ShellAlign::V_CENTER,
-            SHELL_LABEL_TEXT_RGB,
-        ));
-    }
     let buttons = [
         ModalButton {
             rect: layout.ok,
@@ -480,9 +449,7 @@ pub(crate) fn paint_wol_account_form(
         scale,
         POPUP_DEPTHS,
     );
-    // Paint order is draw order: the box first, then its checkbox.
     paint.controls = draw.sprites;
-    paint.controls.extend(checkboxes);
     paint.texts = draw.text;
     let caret_visible = form.caret_visible(Instant::now());
     for (field, (_, rect)) in form.fields.iter().zip(&layout.fields) {

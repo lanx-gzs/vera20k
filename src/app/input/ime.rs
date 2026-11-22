@@ -1,4 +1,4 @@
-//! OS input-method (IME) text entry for the chat edits.
+//! OS input-method (IME) text entry for chat and chooser edits.
 //!
 //! gamemd removes its main window's input context when it creates the window
 //! (CreateMainWindow `0x00777D80`: ImmGetContext, then
@@ -14,14 +14,15 @@
 //! paints the open composition (`0x00777EA0`) at its caret (`0x00623880`).
 //!
 //! VERA20k takes the composition and the finished text from winit's `Ime`
-//! events, and asks for an input method only while a chat edit takes keys:
+//! events, and asks for an input method only while an edit takes keys:
 //! the in-game line, the WOL lobby (`0x10F`), the WOL game room and LAN setup
-//! (C2/C9, BC/BD) and the LAN lobby (BB). Finished text goes through each
-//! screen's own text path, as WM_IME_CHAR does.
+//! (C2/C9, BC/BD), the LAN lobby (BB), and Choose Map's search line. Finished
+//! text goes through each screen's own text path, as WM_IME_CHAR does.
 //!
-//! Player-name edits stay Latin as native: NewEdit `0x00614B30` drops units
-//! at or above 0x100 from them (`0x00615226..0x0061527A`, the byte-only filter),
-//! and the LAN messages carry a name's low bytes.
+//! Player-name edits take no input method: NewEdit `0x00614B30` drops units at
+//! or above 0x100 from them (`0x00615226..0x0061527A`, the byte-only filter),
+//! so gamemd lets in typed keys as code-page bytes but no widened
+//! input-method character such as Chinese.
 //!
 //! RESIDUAL: native's other NewEdits (login, page, buddy, saved-game
 //! descriptions) also take IME input; here they keep plain key text. In
@@ -41,19 +42,19 @@ use crate::app::AppState;
 use crate::ui::shell::geom::RectPx;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use winit::event::Ime;
-use winit::keyboard::KeyCode;
 
 /// The composition colour `[0xAC4618]`, COLORREF `0x9F9F` that
 /// ShellDialog__SubclassChildByClass `0x0060F9A0` sets.
 pub(crate) const COMPOSITION_RGB: [u8; 3] = [0x9F, 0x9F, 0x00];
 
-/// The chat edit that takes IME input.
+/// An edit that takes IME input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImeTarget {
     InGameChat,
-    WolLobbyChat,
+    WolLobbyEdit,
     SetupChat,
     LanLobbyChat,
+    ChooseMapSearch,
 }
 
 /// Process-local input-method state. Presentation-only: never serialized or
@@ -91,10 +92,10 @@ impl ImeState {
     }
 }
 
-/// The chat edit that takes keys now, with its rectangle in window pixels.
+/// The edit that takes keys now, with its rectangle in window pixels.
 /// The dialogs the key dispatch serves first leave none.
 fn target(state: &AppState) -> Option<(ImeTarget, RectPx)> {
-    if state.frontend.keyboard_dialog.is_some()
+    if state.main_menu_dialog_open()
         || crate::app::input::coop_score::active(state)
         || crate::app::frontend::preview_zoom::is_open(state)
     {
@@ -114,15 +115,19 @@ fn target(state: &AppState) -> Option<(ImeTarget, RectPx)> {
             crate::app::input::multiplayer_setup::ime_chat_rect(state),
         ),
         (
-            ImeTarget::WolLobbyChat,
-            crate::app::shell_wol::lobby::ime_chat_rect(state),
+            ImeTarget::WolLobbyEdit,
+            crate::app::shell_wol::lobby::ime_edit_rect(state),
+        ),
+        (
+            ImeTarget::ChooseMapSearch,
+            crate::app::App::choose_map_search_ime_rect(state),
         ),
     ]
     .into_iter()
     .find_map(|(target, rect)| rect.map(|rect| (target, rect)))
 }
 
-/// Ask for an input method exactly while a chat edit takes keys
+/// Ask for an input method exactly while a supported edit takes keys
 /// (`0x00778180` / `0x007781A0`), and keep the system's candidate window at
 /// that edit.
 pub(crate) fn sync(state: &mut AppState) {
@@ -132,9 +137,6 @@ pub(crate) fn sync(state: &mut AppState) {
     }
     let found = target(state);
     let target = found.map(|(target, _)| target);
-    // Asks about every NewEdit, not just the chat lines: the overlay's button
-    // must open for a save-name field too.
-    let text_open = text_entry_open(state);
     let platform = &mut state.platform;
     let ime = &mut platform.ime;
     if ime.target != target {
@@ -164,7 +166,7 @@ pub(crate) fn sync(state: &mut AppState) {
         crate::web::ime::keep_focus();
     }
     #[cfg(target_os = "android")]
-    CHAT_OPEN.store(text_open, std::sync::atomic::Ordering::Relaxed);
+    android::store_text_open(state);
 }
 
 /// One winit `Ime` event.
@@ -179,6 +181,9 @@ pub(crate) fn event(state: &mut AppState, event: Ime) {
                 .map_or(ime.composition.len(), |prefix| {
                     prefix.encode_utf16().count()
                 });
+            if target(state).is_some_and(|(target, _)| target == ImeTarget::InGameChat) {
+                crate::app::input::chat::composition_changed(state);
+            }
         }
         Ime::Commit(text) => {
             state.platform.ime.cancel();
@@ -190,194 +195,15 @@ pub(crate) fn event(state: &mut AppState, event: Ime) {
     state.platform.window.request_redraw();
 }
 
-/// Whether a chat edit took IME text on the last frame.
-///
-/// The Android overlay asks before it opens a keyboard, so a player who forgot
-/// to open the chat is told, rather than typing into a dialog whose text is
-/// then dropped by [`commit`]'s `None` arm.
-#[cfg(target_os = "android")]
-static CHAT_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Text runs typed outside the event loop.
-///
-/// Android's `android-native-activity` backend has no input connection, so
-/// winit never delivers an `Ime` event there and the system keyboard cannot be
-/// asked for one. The activity shows its own `EditText` instead and posts the
-/// finished run here; the loop drains it at the top of each frame (see
-/// `AppHandler::about_to_wait`), so every commit still happens on the thread
-/// that owns the state, in the same order an OS commit would.
-#[cfg(target_os = "android")]
-#[derive(Debug, Clone)]
-enum Injected {
-    Text(String),
-    Backspace,
-    Enter,
-}
-
-#[cfg(target_os = "android")]
-static INJECTED: std::sync::Mutex<Vec<Injected>> = std::sync::Mutex::new(Vec::new());
-
-#[cfg(target_os = "android")]
-fn push(event: Injected) {
-    let mut queue = INJECTED
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    // A burst of frames cannot hold more than a few keystrokes; dropping the
-    // excess keeps a stuck keyboard from growing the queue without bound.
-    if queue.len() < 32 {
-        queue.push(event);
-    }
-}
-
-#[cfg(target_os = "android")]
-pub(crate) fn inject_commit(text: &str) {
-    if !text.is_empty() {
-        push(Injected::Text(text.to_owned()));
-    }
-}
-
-/// Backspace from the Android input method: the `EditText` that hosts the
-/// keyboard swallows the key itself, so the delete has to be replayed here.
-#[cfg(target_os = "android")]
-pub(crate) fn inject_backspace() {
-    push(Injected::Backspace);
-}
-
-/// The input method's "done"/send key.
-#[cfg(target_os = "android")]
-pub(crate) fn inject_enter() {
-    push(Injected::Enter);
-}
-
-#[cfg(target_os = "android")]
-pub(crate) fn drain_injected(state: &mut AppState) {
-    let pending = {
-        let mut queue = INJECTED
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        std::mem::take(&mut *queue)
-    };
-    for injected in pending {
-        match injected {
-            Injected::Text(text) => event(state, Ime::Commit(text)),
-            Injected::Backspace => backspace(state),
-            Injected::Enter => enter(state),
-        }
-    }
-}
-
-/// Whether a chat edit takes text now, for the activity's overlay button.
-#[cfg(target_os = "android")]
-pub(crate) fn chat_open() -> bool {
-    CHAT_OPEN.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// WM_IME_CHAR's consumers: the in-game queue and NewEdit's WM_CHAR insertion,
-/// here each screen's own text path.
-///
-/// The chat lines keep their own paths; every other NewEdit (the save-game
-/// description field, the saved-seed name field, the skirmish player name)
-/// ignores text unless its own editor holds focus, so trying them in order is
-/// safe and no screen can steal another's run.
-/// One backspace, routed to whichever edit holds focus.
-///
-/// The keyboard's own buffer is empty by design (commits are forwarded, not
-/// typed into it), so deleting has to happen in the engine: chat lines take an
-/// `EditKey::Delete`, every shell NewEdit takes `KeyCode::Backspace`.
-#[cfg(target_os = "android")]
-fn backspace(state: &mut AppState) {
-    if let Some(target) = target(state).map(|(target, _)| target) {
-        match target {
-            ImeTarget::InGameChat => crate::app::input::chat::edit_backspace(state),
-            ImeTarget::LanLobbyChat => {
-                crate::app::shell_lan::key_press(state, Some(KeyCode::Backspace), None)
-            }
-            ImeTarget::SetupChat => crate::app::input::multiplayer_setup::key_press(
-                state,
-                Some(KeyCode::Backspace),
-                None,
-            ),
-            ImeTarget::WolLobbyChat => {
-                crate::app::shell_wol::lobby::key_press(state, Some(KeyCode::Backspace), None)
-            }
-        }
-        return;
-    }
-    crate::app::App::saved_game_key(state, Some(KeyCode::Backspace), None);
-    crate::app::App::handle_saved_seed_browser_key(state, Some(KeyCode::Backspace), None);
-    if state.frontend.skirmish_shell_state.player_name_edit.focused {
-        state
-            .frontend
-            .skirmish_shell_state
-            .player_name_edit
-            .backspace();
-    }
-}
-
-/// The keyboard's "done" key: send a chat line, confirm a save dialog.
-#[cfg(target_os = "android")]
-fn enter(state: &mut AppState) {
-    if let Some(target) = target(state).map(|(target, _)| target) {
-        match target {
-            ImeTarget::InGameChat => crate::app::input::chat::edit_enter(state),
-            ImeTarget::LanLobbyChat => {
-                crate::app::shell_lan::key_press(state, Some(KeyCode::Enter), None)
-            }
-            ImeTarget::SetupChat => crate::app::input::multiplayer_setup::key_press(
-                state,
-                Some(KeyCode::Enter),
-                None,
-            ),
-            ImeTarget::WolLobbyChat => {
-                crate::app::shell_wol::lobby::key_press(state, Some(KeyCode::Enter), None)
-            }
-        }
-        return;
-    }
-    crate::app::App::saved_game_key(state, Some(KeyCode::Enter), None);
-    crate::app::App::handle_saved_seed_browser_key(state, Some(KeyCode::Enter), None);
-}
-
-fn commit(state: &mut AppState, text: &str) {
-    if let Some(target) = target(state).map(|(target, _)| target) {
-        match target {
-            ImeTarget::InGameChat => crate::app::input::chat::commit_text(state, text),
-            ImeTarget::LanLobbyChat => crate::app::shell_lan::key_press(state, None, Some(text)),
-            ImeTarget::SetupChat => {
-                crate::app::input::multiplayer_setup::key_press(state, None, Some(text))
-            }
-            ImeTarget::WolLobbyChat => {
-                crate::app::shell_wol::lobby::key_press(state, None, Some(text))
-            }
-        }
-        return;
-    }
-    // Save Game / Saved Seeds name fields (both are `SavedSeedBrowserState`).
-    crate::app::App::saved_game_key(state, None, Some(text));
-    crate::app::App::handle_saved_seed_browser_key(state, None, Some(text));
-    if state.frontend.skirmish_shell_state.player_name_edit.focused {
-        state
-            .frontend
-            .skirmish_shell_state
-            .player_name_edit
-            .insert_text(text);
-    }
-}
-
-/// Whether any NewEdit takes committed text now — not only the chat lines.
-///
-/// The Android overlay asks this before it opens a keyboard: a save-name field
-/// is as much a text field as a chat line, and refusing there was the bug that
-/// made saving unusable.
-#[cfg(target_os = "android")]
-fn text_entry_open(state: &AppState) -> bool {
-    target(state).is_some()
-        || state
-            .match_state
-            .match_presentation
-            .saved_game_browser
-            .as_ref()
-            .is_some_and(|browser| browser.description_edit.focused)
+/// Save-name, seed-name and player-name edits: the fields the shell edits in
+/// place rather than through a chat list.
+pub(crate) fn saved_edit_open(state: &AppState) -> bool {
+    state
+        .match_state
+        .match_presentation
+        .saved_game_browser
+        .as_ref()
+        .is_some_and(|browser| browser.description_edit.focused)
         || state
             .frontend
             .skirmish_shell_state
@@ -385,4 +211,181 @@ fn text_entry_open(state: &AppState) -> bool {
             .as_ref()
             .is_some_and(|browser| browser.description_edit.focused)
         || state.frontend.skirmish_shell_state.player_name_edit.focused
+}
+
+/// WM_IME_CHAR's consumers: each screen's own text path.
+fn commit(state: &mut AppState, text: &str) {
+    match target(state).map(|(target, _)| target) {
+        Some(ImeTarget::InGameChat) => crate::app::input::chat::commit_text(state, text),
+        Some(ImeTarget::LanLobbyChat) => crate::app::shell_lan::key_press(state, None, Some(text)),
+        Some(ImeTarget::SetupChat) => {
+            crate::app::input::multiplayer_setup::key_press(state, None, Some(text))
+        }
+        Some(ImeTarget::WolLobbyEdit) => {
+            crate::app::shell_wol::lobby::key_press(state, None, Some(text))
+        }
+        Some(ImeTarget::ChooseMapSearch) => {
+            crate::app::App::choose_map_search_text(state, text);
+        }
+        None => {
+            #[cfg(target_os = "android")]
+            android::commit_saved_edits(state, text);
+        }
+    }
+}
+
+/// Android's keyboard lives in the activity, not in this process: the game's
+/// `NativeActivity` window has no input connection, so winit never receives an
+/// `Ime` event here. Everything the activity types arrives through these
+/// functions instead, and is applied on the event thread at the top of a frame,
+/// in the same order an OS commit would have arrived.
+#[cfg(target_os = "android")]
+mod android {
+    use super::{Ime, commit, target};
+    use crate::app::AppState;
+    use crate::app::input::ime::ImeTarget;
+    use winit::keyboard::KeyCode;
+
+    /// Whether any text field takes input, for the activity's keyboard.
+    static TEXT_OPEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    #[derive(Debug, Clone)]
+    enum Injected {
+        Text(String),
+        Backspace,
+        Enter,
+    }
+
+    static INJECTED: std::sync::Mutex<Vec<Injected>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn store_text_open(state: &AppState) {
+        let open = target(state).is_some()
+            || crate::app::input::ime::saved_edit_open(state);
+        TEXT_OPEN.store(open, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn is_text_open() -> bool {
+        TEXT_OPEN.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn push(event: Injected) {
+        let mut queue = INJECTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if queue.len() < 32 {
+            queue.push(event);
+        }
+    }
+
+    pub(crate) fn inject_commit(text: &str) {
+        if !text.is_empty() {
+            push(Injected::Text(text.to_owned()));
+        }
+    }
+
+    pub(crate) fn inject_backspace() {
+        push(Injected::Backspace);
+    }
+
+    pub(crate) fn inject_enter() {
+        push(Injected::Enter);
+    }
+
+    pub(crate) fn drain(state: &mut AppState) {
+        let pending = {
+            let mut queue = INJECTED
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *queue)
+        };
+        for injected in pending {
+            match injected {
+                Injected::Text(text) => super::event(state, Ime::Commit(text)),
+                Injected::Backspace => backspace(state),
+                Injected::Enter => enter(state),
+            }
+        }
+    }
+
+    /// One backspace, routed to whichever edit holds focus.
+    fn backspace(state: &mut AppState) {
+        match target(state).map(|(target, _)| target) {
+            Some(ImeTarget::InGameChat) => crate::app::input::chat::edit_backspace(state),
+            Some(ImeTarget::LanLobbyChat) => {
+                crate::app::shell_lan::key_press(state, Some(KeyCode::Backspace), None)
+            }
+            Some(ImeTarget::SetupChat) => crate::app::input::multiplayer_setup::key_press(
+                state,
+                Some(KeyCode::Backspace),
+                None,
+            ),
+            Some(ImeTarget::WolLobbyEdit) => {
+                crate::app::shell_wol::lobby::key_press(state, Some(KeyCode::Backspace), None)
+            }
+            Some(ImeTarget::ChooseMapSearch) => {
+                crate::app::App::choose_map_search_key(state, Some(KeyCode::Backspace))
+            }
+            None => {
+                crate::app::App::handle_saved_seed_browser_key(
+                    state,
+                    Some(KeyCode::Backspace),
+                    None,
+                );
+                if state.frontend.skirmish_shell_state.player_name_edit.focused {
+                    state.frontend.skirmish_shell_state.player_name_edit.backspace();
+                }
+            }
+        }
+    }
+
+    /// The keyboard's done key: send a chat line, confirm a save dialog.
+    fn enter(state: &mut AppState) {
+        match target(state).map(|(target, _)| target) {
+            Some(ImeTarget::InGameChat) => crate::app::input::chat::edit_enter(state),
+            Some(ImeTarget::LanLobbyChat) => {
+                crate::app::shell_lan::key_press(state, Some(KeyCode::Enter), None)
+            }
+            Some(ImeTarget::SetupChat) => {
+                crate::app::input::multiplayer_setup::key_press(state, Some(KeyCode::Enter), None)
+            }
+            Some(ImeTarget::WolLobbyEdit) => {
+                crate::app::shell_wol::lobby::key_press(state, Some(KeyCode::Enter), None)
+            }
+            Some(ImeTarget::ChooseMapSearch) => {
+                crate::app::App::choose_map_search_key(state, Some(KeyCode::Enter))
+            }
+            None => {
+                crate::app::App::handle_saved_seed_browser_key(state, Some(KeyCode::Enter), None);
+            }
+        }
+    }
+
+    /// Text that arrives while no chat line is open belongs to a save-name or
+    /// seed-name field, which the shell edits directly.
+    pub(super) fn commit_saved_edits(state: &mut AppState, text: &str) {
+        crate::app::App::handle_saved_seed_browser_key(state, None, Some(text));
+        if state.frontend.skirmish_shell_state.player_name_edit.focused {
+            state
+                .frontend
+                .skirmish_shell_state
+                .player_name_edit
+                .insert_text(text);
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub(crate) use self::android::{inject_backspace, inject_commit, inject_enter};
+
+/// The Android keyboard asks this each poll whether a field wants text.
+#[cfg(target_os = "android")]
+pub(crate) fn chat_open() -> bool {
+    android::is_text_open()
+}
+
+/// Applies the keyboard's queued input on the event thread, once per frame.
+#[cfg(target_os = "android")]
+pub(crate) fn drain_injected(state: &mut AppState) {
+    android::drain(state);
 }

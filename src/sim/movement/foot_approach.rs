@@ -32,15 +32,15 @@ const OFFSETS: [i16; 25] = [
     0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 8, -8, 16, -16, 24, -24, 32, -32, 48, -48, 64, -64,
 ]; // original signed table8224DC
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "foot_approach_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "approach_crush_tests.rs"]
 mod approach_crush_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "mission_approach_tests.rs"]
 mod mission_approach_tests;
 
@@ -133,7 +133,11 @@ impl Simulation {
             reach: rules.combat_damage.crush,
             techno: true,
             object: true,
-            omni: object.omni_crusher,
+            // Ares UnitClass_ApproachTarget_OmniCrusher (Ares.dll 1004BC10,
+            // hook 0x741613): `OmniCrusher.Aggressive=no` skips the arm.
+            omni: object.omni_crusher
+                && (!rules.ares_form()
+                    || object.techno_combat().combat().omni_crusher_aggressive()),
             is_human: self
                 .houses
                 .get(&actor.owner())
@@ -176,17 +180,8 @@ impl Simulation {
     /// the call, or None where native goes on to FootClass::Approach_Target
     /// (`0x00741685`).
     ///
-    /// Residuals:
-    /// - With the no-move flag set, native returns the Target without the
-    ///   destination. Every mission passes 0, and no VERA caller passes 1.
-    /// - Mission_Patrol calls Approach too (`0x004D473A`), and VERA has no
-    ///   Foot Patrol body (`FootClass::Mission_Patrol @ 0x004D4280`). Trigger:
-    ///   a Foot on Patrol holding a target. Effect: it does not approach the
-    ///   target; only the reach block's (`0x006FAB74`) does, for one it
-    ///   cannot reach. Frequency: a map can author Patrol in an object's
-    ///   `MISSION=` column (retail maps not surveyed); the team script's
-    ///   Patrol action (`0x006ECCE0`) is not ported. Risk: a whole unported
-    ///   mission.
+    /// Residual: with the no-move flag set, native returns the Target without
+    /// the destination. Every mission passes 0, and no VERA caller passes 1.
     pub(crate) fn unit_approach_head(&self, id: u64, rules: &RuleSet) -> Option<NavTargetRef> {
         let crush = self.approach_crush(id, rules);
         if let Some((facts, target)) = crush
@@ -271,7 +266,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         // The harvest_attack_return corpus substitutes the Approach vcall
         // itself with a declared RET4 (`APPROACH_SEAM`); a replayed row takes
@@ -281,7 +276,7 @@ impl Simulation {
         if super::approach_oracle_seam::take_approach_return().is_some() {
             return;
         }
-        if self.approach_unit_head(id, rules, registry, frame_effects) {
+        if self.approach_unit_head(id, rules, frame_effects) {
             return;
         }
         // 0x0052234C..0x0052236A: an infantryman with a Target in a deploy
@@ -320,19 +315,12 @@ impl Simulation {
         &mut self,
         id: u64,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> bool {
         let Some(destination) = self.unit_approach_head(id, rules) else {
             return false;
         };
-        let _ = self.assign_destination_represented(
-            id,
-            Some(destination),
-            rules,
-            registry,
-            frame_effects,
-        );
+        let _ = self.assign_destination_represented(id, Some(destination), rules, frame_effects);
         true
     }
 
@@ -363,7 +351,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         let Some(actor) = self.substrate.entities.get(id) else {
             return;
@@ -381,9 +369,10 @@ impl Simulation {
         // CanFireAt answers true for a null Target (`0x006F77BB..0x006F77C6`),
         // which only the Phobos re-entry after a Foot body that cleared it
         // can bring here.
-        let in_reach = actor.attack_target.target().is_none_or(|target| {
-            crate::sim::world::can_fire_at(self, rules, id, target, slot, registry)
-        });
+        let in_reach = actor
+            .attack_target
+            .target()
+            .is_none_or(|target| crate::sim::world::can_fire_at(self, rules, id, target, slot));
         if crate::sim::world::weapon_at_index(self, rules, id, slot)
             .is_none_or(|weapon| weapon.area_fire)
         {
@@ -490,7 +479,7 @@ impl Simulation {
         id: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Result<Option<NavTargetRef>, String> {
         let Some(actor) = self.substrate.entities.get(id) else {
             return Ok(None);
@@ -535,6 +524,7 @@ impl Simulation {
             overlay_grid: self.overlay_grid.as_ref(),
             overlay_registry: registry,
             alliances: Some(&self.house_alliances),
+            buildings: Some(combat::line_of_fire::CellBuildings::of(self)),
         };
         let can_fire = match (weapon, identity) {
             //0x006F7242: In_Range answers false ahead of any map query when
@@ -567,11 +557,15 @@ impl Simulation {
         let human = self
             .houses
             .get(&actor.owner())
-            .is_none_or(|h| h.is_controlled_by_human(self.session.game_mode_nonzero()));
+            .is_none_or(|h| h.is_controlled_by_human(self.session.rule_policy()));
+        // Ares 3.0 FootClass_ApproachTarget_Passive (1005C9F0, hook
+        // 0x4D5782): a passively acquired Target (`+0x50C`) is not chased
+        // either.
+        let passive_target = rules.ares_form() && actor.passive_scan.acquired();
         let may_approach = object.can_approach_target
             && actor.drain.target().is_none()
             && actor.bunker.link().installed_in().is_none()
-            && !actor.passenger_role.in_open_transport();
+            && !(actor.passenger_role().in_open_transport() || passive_target);
         //4D5716..4D57E4: the drop arms ahead of the search. A Sticky mission,
         // or a mover that may not approach off Attack, a human's Area Guard or
         // a computer's Hunt, clears the Target and the destination.
@@ -582,7 +576,7 @@ impl Simulation {
                         || human && mission == Some(MissionType::AreaGuard)
                         || !human && mission == Some(MissionType::Hunt)))
         {
-            self.assign_target_represented(id, None, rules, registry, frame_effects)
+            self.assign_target_represented(id, None, rules, frame_effects)
                 .map_err(|e| format!("Approach target clear: {e}"))?;
             self.assign_null_destination(id, rules, registry, frame_effects);
             return Ok(None);
@@ -628,7 +622,7 @@ impl Simulation {
         // object) is taken (vt+0x480 with 0), leaves the queue and is the
         // answer.
         if let Some(entry) = actor.navigation.nav_queue().first().copied() {
-            self.assign_destination_keeping_queue(id, Some(entry), rules, registry, frame_effects)
+            self.assign_destination_keeping_queue(id, Some(entry), rules, frame_effects)
                 .map_err(|e| format!("Approach queued destination: {e}"))?;
             self.substrate
                 .entities
@@ -657,14 +651,8 @@ impl Simulation {
         let (target, identity, target_reference) = match cliff {
             Some((x, y)) => {
                 let redirected = TargetKind::Cell(x as u16, y as u16);
-                self.assign_target_represented(
-                    id,
-                    Some(redirected),
-                    rules,
-                    registry,
-                    frame_effects,
-                )
-                .map_err(|e| format!("Approach cliff target: {e}"))?;
+                self.assign_target_represented(id, Some(redirected), rules, frame_effects)
+                    .map_err(|e| format!("Approach cliff target: {e}"))?;
                 (
                     redirected,
                     redirected.cell_identity(self.resolved_terrain.as_ref().unwrap()),
@@ -684,7 +672,7 @@ impl Simulation {
                 .get(id)
                 .filter(|t| t.category() == EntityCategory::Structure)
                 .map(|t| {
-                    let (width, height) = t.type_facts.foundation().dimensions();
+                    let (width, height) = t.seldom.type_facts.foundation().dimensions();
                     (i32::from(width), i32::from(height))
                 }),
             TargetKind::Cell(..) => None,
@@ -735,6 +723,18 @@ impl Simulation {
             in_range::resolve_target_coords_3d(&target, self, rules, &self.interner, &cells)
         }
         .ok_or("Approach target surface failed")?;
+        // VERA: preserve every native ring (including CloseRange infantry spot RNG)
+        // for any range that can span a supported map. Beyond that, start the
+        // search at the farthest corner's Manhattan distance from the target,
+        // rounding up for subcell positions and keeping the ring sequence.
+        // This omits unplayable outer rings, their Dummy accesses and spot draws.
+        let full_map_span = 2 * i32::from(crate::map::cell_index::MAX_CELL_SIDE);
+        if radius / 256 > full_map_span {
+            let (x, y) = (i32::from(target_cell.0), i32::from(target_cell.1));
+            let dx = x.abs().max((i32::from(terrain.width()) - x).abs());
+            let dy = y.abs().max((i32::from(terrain.height()) - y).abs());
+            radius = radius.min((dx + dy + 2) * 256 + radius % 256);
+        }
         let mut retained_candidate = target_cell;
         //4D5FE0: after the CloseRange= arm's spot the destination is the
         // Target's own cell, without the search (4D6892 -> 4D689A).
@@ -863,7 +863,7 @@ impl Simulation {
                     source_nav,
                     source,
                     actor.on_bridge(),
-                    actor.low_bridge_tube_state.is_some(),
+                    actor.active_tube().is_some(),
                 )?;
                 if self.estimate_zone_cost(
                     id,
@@ -885,7 +885,6 @@ impl Simulation {
                 id,
                 Some(NavTargetRef::cell(cell.0 as u16, cell.1 as u16)),
                 rules,
-                registry,
                 frame_effects,
             )
             .map_err(|e| format!("Approach destination: {e}"))?;
@@ -900,26 +899,19 @@ impl Simulation {
         // the Target itself as its destination (4D6A71, vt+0x480(TarCom, 1))
         // and returns it. Neither key is set in retail.
         if object.hunter_seeker || category == EntityCategory::Infantry && object.vehicle_thief {
-            self.assign_destination_represented(
-                id,
-                Some(target_reference),
-                rules,
-                registry,
-                frame_effects,
-            )
-            .map_err(|e| format!("Approach Target destination: {e}"))?;
+            self.assign_destination_represented(id, Some(target_reference), rules, frame_effects)
+                .map_err(|e| format!("Approach Target destination: {e}"))?;
             return Ok(Some(target_reference));
         }
         let cells = NativeCellQuery::canonical(self.resolved_terrain.as_ref().unwrap());
         let fallback = self.approach_fallback(id, retained_candidate, rules, &cells)?;
-        self.assign_target_represented(id, None, rules, registry, frame_effects)
+        self.assign_target_represented(id, None, rules, frame_effects)
             .map_err(|e| format!("Approach exhausted target clear: {e}"))?;
         if let Some(cell) = fallback {
             self.assign_destination_represented(
                 id,
                 Some(NavTargetRef::cell(cell.0, cell.1)),
                 rules,
-                registry,
                 frame_effects,
             )
             .map_err(|e| format!("Approach fallback destination: {e}"))?;
@@ -1016,7 +1008,7 @@ impl Simulation {
         target_center: DriveCoord,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Result<bool, String> {
         use super::ground_pose::{position_world_coord, query_object_cell};
         use crate::sim::cell_kernel::{native_cell_own_xy, native_xy_distance};
@@ -1135,6 +1127,7 @@ impl Simulation {
                     overlay_grid: self.overlay_grid.as_ref(),
                     overlay_registry: registry,
                     alliances: Some(&self.house_alliances),
+                    buildings: Some(combat::line_of_fire::CellBuildings::of(self)),
                 },
             )
         });
@@ -1157,7 +1150,7 @@ impl Simulation {
         close_range: bool,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Result<bool, String> {
         if close_range {
             self.foot_mark_remove(id, rules, registry, frame_effects);
@@ -1255,7 +1248,7 @@ impl Simulation {
             source,
             super::ground_pose::position_world_coord(&actor.position),
             actor.on_bridge(),
-            actor.low_bridge_tube_state.is_some(),
+            actor.active_tube().is_some(),
         )?;
         let source = coord_cell(source);
         let zone = self
@@ -1329,10 +1322,8 @@ fn balloon_hover_destination(
     target: TargetKind,
     rules: &RuleSet,
 ) -> Option<NavTargetRef> {
-    weapon?
-        .projectile
-        .as_deref()
-        .and_then(|name| rules.projectile(name))
+    rules
+        .weapon_projectile(weapon?)
         .is_some_and(|projectile| projectile.vertical)
         .then_some(NavTargetRef::from(target))
 }

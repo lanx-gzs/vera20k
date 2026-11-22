@@ -24,6 +24,20 @@ use crate::util::native_x87::NativeF64Bits;
 /// the attempted name independently of constructor or later Image text.
 use crate::rules::object_image::ObjectImageLoad;
 
+/// VERA's bound on `ShrapnelCount=`'s magnitude, read by
+/// `BulletTypeClass::ReadINI`'s ReadInt (`0x0046C325`, `+0x2B8`).
+/// SpawnShrapnel (`0x0046A322..0x0046A3D2`) builds one projectile per
+/// fragment, so a value near `i32::MAX` freezes the match; retail throws at
+/// most 8.
+pub const SHRAPNEL_COUNT_LIMIT: i32 = 256;
+
+/// VERA's bound on `Cluster=`, read by `BulletTypeClass::ReadINI`'s ReadInt
+/// (`0x0046C1A1`, `+0x2AC`). A non-airburst impact detonates once per
+/// cluster and an airburst lists one target per cluster, so a value near
+/// `i32::MAX` freezes the match or runs out of memory; retail clusters at
+/// most 9.
+pub const CLUSTER_LIMIT: i32 = 256;
+
 /// A projectile definition parsed from a rules.ini section.
 ///
 /// Projectiles define how a weapon's shot travels and what it can target.
@@ -107,9 +121,11 @@ pub struct ProjectileType {
     pub flat: bool,
 
     // --- Integer fields ---
-    /// Number of sub-projectiles on detonation. (+0x2AC)
+    /// Number of sub-projectiles on detonation. (+0x2AC) At most
+    /// [`CLUSTER_LIMIT`].
     pub cluster: i32,
-    /// Number of shrapnel fragments on impact. (+0x2B8)
+    /// Number of shrapnel fragments on impact. (+0x2B8) Its magnitude is at
+    /// most [`SHRAPNEL_COUNT_LIMIT`].
     pub shrapnel_count: i32,
     /// Altitude at which the projectile detonates (for airburst). (+0x2BC)
     pub detonation_altitude: i32,
@@ -153,6 +169,9 @@ pub struct ProjectileType {
     /// Phobos constructor defaults; only Phobos builds read or consume them.
     #[cfg(feature = "phobos")]
     pub phobos_airburst: crate::rules::phobos_airburst::PhobosAirburstType,
+    /// Ares BulletTypeExt keys (`rules::ares_bullet_type`, read by
+    /// `100193C0`). A stock-way read keeps the constructor defaults.
+    pub(crate) bullet_type_ext: crate::rules::ares_bullet_type::BulletTypeExtRules,
     /// Current native Image25 text; SHP admission is separately retained below.
     pub image: Option<String>,
     /// Admitted native5F9070 requests, independently of later Image text.
@@ -354,7 +373,10 @@ pub(crate) fn read_phobos_gravity(section: &IniSection) -> Option<NativeF64Bits>
 impl ProjectileType {
     /// Phobos `Splits=`: the Phobos emitter replaces the native tail and the
     /// parent's outer cluster loop, exactly as `BulletClass::Explodes`'s
-    /// airburst checks do with `Airburst || Splits`. False without the feature.
+    /// airburst checks do with `Airburst || Splits`. Without Phobos, Ares'
+    /// `Splits=` does the same (`HasSplitBehavior`, BulletClass_Fire_SplitsA/B
+    /// `1001A7E0`/`1001A810`, hooks `0x468EB9`/`0x468FFA`). False in stock:
+    /// a stock-way read leaves the Ares key unread.
     pub const fn splits(&self) -> bool {
         #[cfg(feature = "phobos")]
         {
@@ -362,7 +384,7 @@ impl ProjectileType {
         }
         #[cfg(not(feature = "phobos"))]
         {
-            false
+            self.bullet_type_ext.splits
         }
     }
 
@@ -378,8 +400,9 @@ impl ProjectileType {
         None
     }
 
-    /// `Airburst=` or, in a Phobos build, `Splits=`: the BulletClass impact
-    /// and detonation arms Phobos' `BulletClass::Explodes` hooks select.
+    /// `Airburst=` or, in a Phobos build or a game read the Ares way,
+    /// `Splits=`: the BulletClass impact and detonation arms the
+    /// `BulletClass::Explodes` hooks select.
     pub const fn airburst_arm(&self) -> bool {
         self.airburst || self.splits()
     }
@@ -442,8 +465,10 @@ impl ProjectileType {
             vertical: section.read_bool("Vertical", false),
             flat: false,
             // Integer fields
-            cluster: section.read_int("Cluster", 1),
-            shrapnel_count: section.read_int("ShrapnelCount", 0),
+            cluster: section.read_int("Cluster", 1).min(CLUSTER_LIMIT),
+            shrapnel_count: section
+                .read_int("ShrapnelCount", 0)
+                .clamp(-SHRAPNEL_COUNT_LIMIT, SHRAPNEL_COUNT_LIMIT),
             detonation_altitude: section.read_int("DetonationAltitude", 0),
             acceleration: section.read_int("Acceleration", 3),
             course_lock_duration: section.read_int("CourseLockDuration", 0),
@@ -467,6 +492,11 @@ impl ProjectileType {
             phobos_airburst: crate::rules::phobos_airburst::PhobosAirburstType::from_section(
                 section,
             ),
+            bullet_type_ext: if crate::rules::ares_switch::ares_way() {
+                crate::rules::ares_bullet_type::BulletTypeExtRules::from_section(section)
+            } else {
+                Default::default()
+            },
             image: None,
             image_loads: Vec::new(),
             voxel_image_load: None,
@@ -501,7 +531,7 @@ impl ProjectileType {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_o_z))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -615,6 +645,17 @@ mod tests {
     }
 
     #[test]
+    fn huge_fragment_counts_stop_at_their_bounds() {
+        let ini = IniFile::from_str(
+            "[A]\nShrapnelCount=2147483647\nCluster=2147483647\n[B]\nShrapnelCount=-2147483648\n",
+        );
+        let read = |name| ProjectileType::from_ini_section(name, ini.section(name).unwrap(), None);
+        assert_eq!(read("A").shrapnel_count, SHRAPNEL_COUNT_LIMIT);
+        assert_eq!(read("A").cluster, CLUSTER_LIMIT);
+        assert_eq!(read("B").shrapnel_count, -SHRAPNEL_COUNT_LIMIT);
+    }
+
+    #[test]
     fn test_defaults() {
         let ini: IniFile = IniFile::from_str("[Empty]\nFixtureOnly=1\n");
         let section: &IniSection = ini.section("Empty").unwrap();
@@ -717,6 +758,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_o_z))]
 #[path = "projectile_line_trail_tests.rs"]
 mod line_trail_tests;

@@ -22,7 +22,7 @@ impl Simulation {
         cell: NativeCellIdentity,
         rules: &crate::rules::ruleset::RuleSet,
         registry: &crate::rules::overlay_types::OverlayTypeRegistry,
-        effects: super::FrameEffects<'_>,
+        effects: &mut super::FrameEffects<'_>,
     ) -> bool {
         if !self
             .cell_overlay(cell)
@@ -62,7 +62,7 @@ impl Simulation {
             &[coord],
         );
         self.publish_cell_and_assign_orphaned_zone(rules, coord, Some(&blocked));
-        self.stop_all_targeting_cell(coord.0, coord.1, rules, Some(registry), effects);
+        self.stop_all_targeting_cell(coord.0, coord.1, rules, effects);
         true
     }
 
@@ -93,7 +93,7 @@ impl Simulation {
         }
     }
 
-    pub(crate) fn cell_objects(
+    pub fn cell_objects(
         &self,
         cell: (u16, u16),
         layer: MovementLayer,
@@ -108,7 +108,6 @@ impl Simulation {
 
     /// `CellClass::GetContent`: the deck list (`+0xE8`) when the cell has a
     /// `BridgeHead` (`+0x140 & 0x100`), otherwise the ground list (`+0xE4`).
-    #[cfg(feature = "phobos")]
     pub(crate) fn native_cell_content(
         &self,
         cell: (u16, u16),
@@ -122,7 +121,6 @@ impl Simulation {
     }
 
     /// `CellClass::ContainsBridge`: the cell's `BridgeHead` flag.
-    #[cfg(feature = "phobos")]
     pub(crate) fn cell_has_bridge_head(&self, cell: (u16, u16)) -> bool {
         self.resolved_terrain.as_ref().is_some_and(|terrain| {
             crate::sim::cell_rect::get_cellclass_fallback(

@@ -35,6 +35,7 @@ pub(crate) fn body_palette_light(
 ///
 /// The caller supplies its frame's isolated query; drawing never stamps the
 /// simulation's shared fallback Cell. Native controls: tools/unit_light.json.
+/// Captured into each object's presentation record (`presentation::frame`).
 pub(crate) fn body_extra_light(
     entity: &crate::sim::game_entity::GameEntity,
     rules: &RuleSet,
@@ -61,15 +62,18 @@ pub(crate) fn body_extra_light(
                 crate::util::lepton::lepton_to_cell_packed(x),
                 crate::util::lepton::lepton_to_cell_packed(y),
             );
-            let height = air_movement::queried_flight_height(entity, Some(cells));
             let current = cells.lookup_world(x, y);
             let flags = cells.flags(current);
-            let above_deck = if entity.on_bridge() {
-                height >= 0
-            } else {
-                height >= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
+            // Only a structural bridge cell reads the height.
+            let above_deck = || {
+                let height = air_movement::queried_flight_height(entity, Some(cells));
+                if entity.on_bridge() {
+                    height >= 0
+                } else {
+                    height >= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
+                }
             };
-            if above_deck && flags & BRIDGE_FLAG_STRUCTURAL != 0 {
+            if flags & BRIDGE_FLAG_STRUCTURAL != 0 && above_deck() {
                 // Cell481810 chooses just one neighbor: direction0 when
                 // bit800 is set, otherwise6. Failure never tries the other.
                 let direction = if flags & BRIDGE_FLAG_DIRECTION_ZERO != 0 {
@@ -294,7 +298,7 @@ fn tint_bucket(
 ///
 /// Read only: no simulation state, timer, RNG or detach is written.
 pub(crate) fn shield_tint(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &crate::app::presentation::frame::ObjectRecord,
     simulation: &Simulation,
     rules: &RuleSet,
 ) -> (u16, i32) {
@@ -330,7 +334,7 @@ pub(crate) fn shield_tint(
 /// objects as Owner, an ally's as Allies and anyone else's as Enemies.
 #[cfg(feature = "phobos")]
 fn viewer_bucket(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &crate::app::presentation::frame::ObjectRecord,
     simulation: &Simulation,
 ) -> crate::rules::phobos_shields::AffectedHouse {
     let owner = entity.owner();
@@ -364,7 +368,7 @@ fn viewer_bucket(
 /// not yet.
 #[cfg(feature = "phobos")]
 pub(crate) fn attach_effect_tint(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &crate::app::presentation::frame::ObjectRecord,
     simulation: &Simulation,
     rules: &RuleSet,
 ) -> (u16, i32) {
@@ -434,7 +438,7 @@ pub(crate) fn attach_effect_tint(
 /// The custom tint `TechnoExt::UpdateTintValues` aggregates from every owner:
 /// Phobos shields and AttachEffects today.
 pub(crate) fn custom_tint(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &crate::app::presentation::frame::ObjectRecord,
     simulation: &Simulation,
     rules: &RuleSet,
 ) -> (u16, i32) {
@@ -480,7 +484,7 @@ pub(crate) enum TechnoDraw {
 /// Airstrike manager that targets it. GetEffectTintIntensity
 /// applies Iron then Airstrike stages, each with its own cap.
 pub(crate) fn techno_effect_light(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &crate::app::presentation::frame::ObjectRecord,
     tint: [f32; 3],
     light: crate::render::palette_light::PaletteLight,
     sim: &Simulation,
@@ -497,7 +501,7 @@ pub(crate) fn techno_effect_light(
         tint,
         light,
         sim.session().binary_frame(),
-        sim.airstrike_tint_active(entity.stable_id()),
+        entity.place.airstrike_tint_active,
         custom,
         curtain_extra,
         draw,
@@ -515,7 +519,7 @@ pub(crate) fn techno_effect_light(
 /// `0x0043FE56`).
 ///
 pub(crate) fn building_anim_light(
-    building: &crate::sim::game_entity::GameEntity,
+    building: &crate::app::presentation::frame::ObjectRecord,
     tint: [f32; 3],
     light: crate::render::palette_light::PaletteLight,
     sim: &Simulation,
@@ -551,7 +555,7 @@ pub(crate) fn building_anim_light(
             tint,
             light,
             sim.session().binary_frame().wrapping_sub(1),
-            sim.airstrike_tint_active(building.stable_id()),
+            building.place.airstrike_tint_active,
             custom,
             curtain_extra,
             TechnoDraw::Shape,
@@ -561,7 +565,7 @@ pub(crate) fn building_anim_light(
 }
 
 fn techno_effect_light_at(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &crate::app::presentation::frame::ObjectRecord,
     tint: [f32; 3],
     light: crate::render::palette_light::PaletteLight,
     frame: u32,
@@ -680,6 +684,10 @@ fn effect_light(
 /// BerserkColor while Techno+298 is active, into the caller's colour word.
 /// Composite73C1A5 passes that word to the existing packed blitter owner.
 /// A deactivated Unit (+1C8) then halves intensity, signed toward zero.
+/// When Ares plays, it replaces that halving (hook73C143 -> UnitClass_DrawVXL_Deactivated
+/// 1004CEA0) for Units: under EMP `[AudioVisual]DeactivateDimEMP`, else when
+/// deactivated DeactivateDimOperator without its operator, otherwise
+/// DeactivateDimPowered; the CRT ftol100772B0 truncates the product.
 ///
 /// The voxel builder also draws Aircraft through Techno::Draw70678D, which
 /// has no Unit colour arms. The Unit gate preserves that class boundary.
@@ -687,7 +695,7 @@ fn effect_light(
 /// berserk_color.json::mtnk (physical stock Image-resolved GTNK/DarkRed).
 /// No simulation state, timer, RNG or detach is written here.
 pub(crate) fn unit_voxel_effect_light(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &crate::app::presentation::frame::ObjectRecord,
     tint: [f32; 3],
     light: crate::render::palette_light::PaletteLight,
     rules: Option<&RuleSet>,
@@ -725,6 +733,34 @@ pub(crate) fn unit_voxel_effect_light(
             class | custom_tint(entity, sim, rules).0
         });
         light = light.with_colour_word(light.colour_word() | word);
+    }
+    if category == crate::map::entities::EntityCategory::Unit
+        && rules.is_some_and(|rules| rules.ares())
+    {
+        use crate::rules::ares_cloak_power::DeactivateDim;
+        let kind = if entity.emp_remaining() > 0 {
+            DeactivateDim::Emp
+        } else if !entity.deactivated.is_offline() {
+            return (tint, light);
+        } else if rules.is_some() && !entity.place.ares_operated {
+            DeactivateDim::Operator
+        } else {
+            DeactivateDim::Powered
+        };
+        let factor = rules.map_or_else(
+            || {
+                crate::rules::ares_cloak_power::CloakPowerGlobalRules::default()
+                    .deactivate_dim(kind)
+            },
+            |rules| rules.ares_cloak_power().deactivate_dim(kind),
+        );
+        let product = f64::from(light.brightness()) * factor;
+        let intensity = if product.is_finite() && product.abs() < 2_147_483_648.0 {
+            product.trunc() as i32
+        } else {
+            i32::MIN
+        };
+        return with_intensity(tint, light, intensity);
     }
     if entity.deactivated.is_offline() {
         with_intensity(tint, light, light.brightness() / 2)
@@ -772,7 +808,7 @@ fn with_intensity(
 /// Any nonnull Airstrike pointer (`+0x294`) ORs LaserTargetColor too,
 /// independently of its manager target and of the Force Shield colour.
 pub(crate) fn shp_colour_word(
-    entity: &crate::sim::game_entity::GameEntity,
+    entity: &crate::app::presentation::frame::ObjectRecord,
     sim: &Simulation,
     rules: &RuleSet,
     shrouded: impl FnOnce() -> bool,
@@ -818,7 +854,7 @@ pub(crate) fn shp_colour_word(
         #[cfg(feature = "phobos")]
         let word = rules
             .color_add
-            .phobos_word(sim.airstrike_laser_target_color(entity.stable_id(), rules));
+            .phobos_word(entity.place.airstrike_laser_target_color);
         #[cfg(not(feature = "phobos"))]
         let word = rules
             .color_add
@@ -847,8 +883,9 @@ pub(crate) struct MatchLighting {
     /// Replica of the simulation's radiation light sites, kept like `buildings`.
     radiation: BTreeMap<(u16, u16), PointLight>,
     profile: CellRelightProfile,
-    /// Replica of the scenario lighting state (`ScenarioSession::lighting`) as
-    /// last applied, kept like `buildings`.
+    /// The scenario lighting state (`ScenarioSession::lighting`) as the last
+    /// global relight or [`Self::refresh`] applied it. Writes that refresh no
+    /// cell ([`Self::after_pass`]) leave it behind the simulation's.
     scenario: Option<ScenarioLightingState>,
     detail_level: u32,
     /// Free Anim+FC copies, independent of cell refreshes and depth+100.
@@ -1105,18 +1142,33 @@ impl MatchLighting {
         assert!(update.commit_into(&mut self.grid));
     }
 
-    /// Reconcile explicit tool/fixture mutations and the detail option. Normal
-    /// production frames first replay their ordered events via apply_events.
+    /// A pass's work after its frame's ordered events ([`Self::apply_events`]),
+    /// which alone relight cells: retire disposed anims' copies and follow
+    /// the detail option. A scenario write that refreshes no cell natively
+    /// (Execute71/72 at `0x006DF250`/`0x006DF271`, Execute73 at
+    /// `0x006DF292`, the nuke flash going off at `0x0053A738`) publishes no
+    /// event, so cells keep the scalars their last relight gave them.
+    pub(crate) fn after_pass(
+        &mut self,
+        terrain: &ResolvedTerrainGrid,
+        sim: &Simulation,
+        detail_level: u32,
+    ) {
+        self.retire_disposed_anims(sim);
+        self.set_detail_level(terrain, sim, detail_level);
+    }
+
+    /// Install, load and tool/fixture mutations: re-derive the sources and
+    /// the scenario lighting from the simulation, relight what differs, then
+    /// follow the detail option. Match frames never call this
+    /// ([`Self::after_pass`]).
     pub(crate) fn refresh(
         &mut self,
         terrain: &ResolvedTerrainGrid,
         sim: &Simulation,
         detail_level: u32,
     ) {
-        // Retire only at physical disposal, never merely UnInit, detach or
-        // loss of Logic/Display membership. Save uses the same store check.
-        self.anim_intensities
-            .retain(|id, _| sim.anim(*id).is_some());
+        self.retire_disposed_anims(sim);
         let (buildings, radiation) = source_maps(sim);
         let mut events = Vec::new();
         for id in self
@@ -1174,10 +1226,27 @@ impl MatchLighting {
             });
         }
         self.apply_events(terrain, &events);
+        self.set_detail_level(terrain, sim, detail_level);
+    }
+
+    /// Retire an anim's Anim+FC copy only at its physical disposal, never
+    /// merely UnInit, detach or loss of Logic/Display membership. Save uses
+    /// the same store check.
+    fn retire_disposed_anims(&mut self, sim: &Simulation) {
+        self.anim_intensities
+            .retain(|id, _| sim.anim(*id).is_some());
+    }
+
+    /// The detail option: Display4AE450 ->545000 destroys only Cell Converts.
+    /// The synchronous native iterator resample preserves ColorSchemes and
+    /// every already copied Anim+FC.
+    pub(crate) fn set_detail_level(
+        &mut self,
+        terrain: &ResolvedTerrainGrid,
+        sim: &Simulation,
+        detail_level: u32,
+    ) {
         if self.detail_level != detail_level.min(2) {
-            // Display4AE450 ->545000 destroys only Cell Converts. The
-            // synchronous native iterator resample preserves ColorSchemes
-            // and every already copied Anim+FC.
             self.detail_level = detail_level.min(2);
             self.grid.reset_cell_converts(sim.palette_constructor_rgb());
             let mut dirty = self.global_cells.iter().copied().collect();
@@ -1375,27 +1444,27 @@ fn collect_live_building_lights(
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 #[path = "curtain_tint_tests.rs"]
 mod curtain_tint_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 #[path = "lighting_tint_tests.rs"]
 mod tint_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 #[path = "anim_lighting_tests.rs"]
 mod anim_lighting_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 #[path = "unit_light_tests.rs"]
 mod unit_light_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 #[path = "infantry_light_tests.rs"]
 mod infantry_light_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 mod palette_producer_tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;

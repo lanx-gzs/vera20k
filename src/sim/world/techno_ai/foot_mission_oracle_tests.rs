@@ -13,7 +13,6 @@
 
 use crate::sim::movement::DriveLocomotionRuntime;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 use serde_json::{Value, json};
 
@@ -44,14 +43,7 @@ use crate::util::native_x87::MaskedX87Chop53;
 mod area_guard_oracle_tests;
 
 pub(in crate::sim::world::techno_ai) fn oracle() -> &'static Value {
-    static CORPUS: OnceLock<Value> = OnceLock::new();
-    CORPUS.get_or_init(|| {
-        let value: Value = serde_json::from_str(crate::test_fixture::text(
-            "tools/spatial_oracle/anytown_damage/foot_missions.json",
-        ))
-        .unwrap();
-        value
-    })
+    crate::test_fixture::json("tools/spatial_oracle/anytown_damage/foot_missions.json")
 }
 
 pub(in crate::sim::world::techno_ai) fn signed(value: &Value) -> i32 {
@@ -537,9 +529,7 @@ impl SuppliedFootFixture {
         // cursor, including pre-fixture Main/MapGen history; no seed fitting.
         sim.scenario_rng =
             serde_json::from_value::<SimRng>(row["rng_before"]["scenario"].clone()).unwrap();
-        sim.main_rng = serde_json::from_value::<SimRng>(row["rng_before"]["main"].clone())
-            .unwrap()
-            .into();
+        sim.main_rng = serde_json::from_value::<SimRng>(row["rng_before"]["main"].clone()).unwrap();
         sim.mapgen_rng =
             serde_json::from_value::<SimRng>(row["rng_before"]["mapgen"].clone()).unwrap();
         let friendly = sim.interner.intern("SuppliedFriendlyHouse");
@@ -781,7 +771,10 @@ impl SuppliedFootFixture {
                         signed(&before["targeting_timer"][2]) as u32,
                     ));
                 if before["scan"] != 0 {
-                    entity.foot_retarget_after_stop.mark_stopped_cannot_fire();
+                    entity
+                        .seldom
+                        .foot_retarget_after_stop
+                        .mark_stopped_cannot_fire();
                 }
                 // Foot+68D is serialized for every concrete Foot class. This
                 // includes the supplied Unit raw-load control; it does not
@@ -886,14 +879,7 @@ impl SuppliedFootFixture {
                 sub_cell,
                 CellListInsertion::PrependNonBuilding,
             );
-            Simulation::submit_object_display(
-                &sim.interner,
-                &sim.terrain_objects,
-                &mut sim.substrate,
-                id,
-                DisplayLayer::GROUND,
-                rules,
-            );
+            Simulation::submit_object_display(&mut sim.substrate, id, DisplayLayer::GROUND);
         }
         sim.set_logic_order_for_test(logic);
         // The original row writes pose/layer controls AFTER Unlimbo. They do
@@ -947,12 +933,18 @@ impl SuppliedFootFixture {
                 "Ground Display",
             ),
         ] {
-            let expected: Vec<u64> = native_order
+            let mut actual = actual;
+            let mut expected: Vec<u64> = native_order
                 .as_array()
                 .unwrap()
                 .iter()
                 .map(|pointer| fixture.id(pointer).unwrap())
                 .collect();
+            // VERA keeps Ground as an unordered set (`DisplayLayers::submit`).
+            if list == "Ground Display" {
+                actual.sort_unstable();
+                expected.sort_unstable();
+            }
             assert_eq!(actual, expected, "supplied {list} registration order");
         }
         assert_rng(
@@ -1179,7 +1171,7 @@ fn original_literal_foot_rows_compare_mask_and_empty_result_lifecycle_only() {
             .as_u64()
             .unwrap() as u32;
         assert_eq!(
-            actor.foot_retarget_after_stop.coerce_mask(mask),
+            actor.seldom.foot_retarget_after_stop.coerce_mask(mask),
             row["greatest_threat_masks"]["greatest"][0]
                 .as_u64()
                 .unwrap() as u32,
@@ -1190,6 +1182,7 @@ fn original_literal_foot_rows_compare_mask_and_empty_result_lifecycle_only() {
         // lifecycle owner, without claiming this executes the raw scan body.
         assert_eq!(row["returned_eax"], 0);
         actor
+            .seldom
             .foot_retarget_after_stop
             .finish_scan(row["returned_eax"] != 0);
         assert_eq!(
@@ -1388,7 +1381,7 @@ fn install_recorded_anytown_query_state(
         }
     }
     zones.test_supply_uniform_raw_zone_rows(2);
-    fixture.sim.zone_grid = Some(zones);
+    fixture.sim.zone_grid = Some(zones.into());
     fixture.sim.install_fixture_path_grid(Some(&path));
     if row["house_return"].is_object() {
         let state = &row["house_return"];
@@ -1687,7 +1680,7 @@ fn run_recorded_handler(
     fixture: &mut SuppliedFootFixture,
     rules: &RuleSet,
     row: &Value,
-    ctx: super::super::ObjectAiCtx<'_>,
+    ctx: &mut super::super::ObjectAiCtx<'_>,
 ) {
     let name = row["input"]["name"].as_str().unwrap();
     for event in row["events"].as_array().unwrap() {
@@ -1702,7 +1695,7 @@ fn run_recorded_handler(
         }
     }
     if row["input"]["dispatch_entry"] == true {
-        super::dispatch_foot_mission(&mut fixture.sim, fixture.actor, rules, ctx);
+        super::dispatch_foot_mission(&mut fixture.sim, fixture.actor, rules, ctx).unwrap();
     } else {
         let actual = if row["input"]["mission"] == 21 {
             super::evaluate_foot_rescue(&mut fixture.sim, fixture.actor, rules, ctx)
@@ -1773,7 +1766,7 @@ fn original_rescue_and_area_guard_complete_represented_handler_rows() {
             &mut fixture,
             &rules,
             row,
-            super::super::ObjectAiCtx::default(),
+            &mut super::super::ObjectAiCtx::default(),
         );
         compared += 1;
     }
@@ -1808,7 +1801,7 @@ fn original_physical_retail_area_guard_idle_runs_before_cadence() {
             &mut fixture,
             &rules,
             row,
-            super::super::ObjectAiCtx::default(),
+            &mut super::super::ObjectAiCtx::default(),
         );
         compared += 1;
     }
@@ -1849,7 +1842,7 @@ fn original_full_retail_cell_leash_matches_move_idle_and_cadence_boundaries() {
             &mut fixture,
             &rules,
             row,
-            super::super::ObjectAiCtx::default(),
+            &mut super::super::ObjectAiCtx::default(),
         );
         compared += 1;
     }
@@ -1881,7 +1874,7 @@ fn original_full_retail_rescue_matches_native_scan_hit_and_empty_prefix() {
                 &mut fixture,
                 &rules,
                 row,
-                super::super::ObjectAiCtx::default(),
+                &mut super::super::ObjectAiCtx::default(),
             );
             assert_destination_projection(&fixture, row);
             complete_hits += 1;
@@ -1905,6 +1898,7 @@ fn original_full_retail_rescue_matches_native_scan_hit_and_empty_prefix() {
                 .entities
                 .get_mut(fixture.actor)
                 .unwrap()
+                .seldom
                 .foot_retarget_after_stop
                 .clear_for_rescue();
             let actual = fixture
@@ -2027,8 +2021,8 @@ fn original_retail_foot_stray_and_empty_rescue_home_complete_destination_transac
             &mut fixture,
             &rules,
             row,
-            super::super::ObjectAiCtx {
-                overlay_registry: Some(&scene.runtime.resources.overlay_registry),
+            &mut super::super::ObjectAiCtx {
+                overlay_registry: Some(scene.runtime.resources.rules.overlay_registry()),
                 ..Default::default()
             },
         );
@@ -2082,7 +2076,7 @@ fn original_initial_stationary_e1_action_enters_ready_without_rng() {
     assert!(!fixture.sim.infantry_sequencer(
         fixture.actor,
         &rules,
-        crate::sim::world::FrameEffects::default()
+        &mut crate::sim::world::FrameEffects::default()
     ));
     assert_foot_projection(&fixture, &row);
 }
@@ -2142,7 +2136,7 @@ fn original_ground_fireup_stage_uses_absolute_native_frames() {
                     4,
                     false,
                     &rules,
-                    crate::sim::world::FrameEffects::default()
+                    &mut crate::sim::world::FrameEffects::default()
                 )
                 .unwrap()
         );
@@ -2204,7 +2198,7 @@ fn original_idle_completion_releases_doing_at_existing_completion_owner() {
         assert!(!fixture.sim.infantry_sequencer(
             fixture.actor,
             &rules,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         ));
         assert_foot_projection(&fixture, row);
         compared += 1;
@@ -2302,7 +2296,7 @@ fn dying_infantry_visits_shared_native_clock() {
         fixture.actor,
         crate::sim::world::InfantryDeathSequence::Die1,
         &rules,
-        crate::sim::world::FrameEffects::default(),
+        &mut crate::sim::world::FrameEffects::default(),
     );
     let actor = fixture
         .sim
@@ -2315,7 +2309,7 @@ fn dying_infantry_visits_shared_native_clock() {
     fixture.sim.object_ai_visit_one(
         fixture.actor,
         Some(&rules),
-        super::super::ObjectAiCtx::default(),
+        &mut super::super::ObjectAiCtx::default(),
     );
     assert_eq!(
         *fixture
@@ -2430,7 +2424,7 @@ fn original_do_action_restart_preserves_independent_stage_fields() {
                 signed(&args[0]),
                 args[1] != 0,
                 &rules,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         assert_eq!(

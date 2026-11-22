@@ -1,6 +1,7 @@
 //! Match-session focus, modal, return, quit and scenario-exit control.
 
 use super::{App, AppState, GameScreen, Instant, ModifiersState};
+use crate::app::match_runtime::sim_host::SimWrite;
 
 impl App {
     /// Return the live Scenario cursor and header to the multiplayer shell.
@@ -8,7 +9,7 @@ impl App {
         let gameplay_rng = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
             .map(|simulation| {
                 (
@@ -39,7 +40,7 @@ impl App {
     }
 
     pub(super) fn return_to_main_menu(state: &mut AppState) {
-        if let Some(runtime) = state.match_state.sim_runtime.as_mut() {
+        if let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Lifecycle) {
             // Main55D283 calls BattleControlTerminated686570 on shell return;
             // its retained Scenario mission counter resets to the ctor's 1.
             runtime
@@ -65,10 +66,11 @@ impl App {
     /// Quit Game's leave: a frame suspended in Wait_For_Players finishes its
     /// tail before the result-8 return.
     pub(super) fn leave_network_wait_to_main_menu(state: &mut AppState) {
+        crate::app::match_runtime::network_failure::hold_quit_line(state);
         if state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .is_some_and(|rt| rt.simulation.pending_network_wait())
         {
             crate::app::match_runtime::sim_tick::leave_network_wait(state);
@@ -82,6 +84,9 @@ impl App {
     /// stops the elapsed clock, theme, sounds and speech before
     /// Start_Scenario).
     fn retire_running_scenario(state: &mut AppState) {
+        // Close out the last frame before retiring its movie hold or
+        // returning its transport to the shell.
+        crate::app::match_runtime::sim_tick::finish_threaded_frame(state);
         // Shell return and campaign restart both end the installed match.
         #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
         Self::browser_match_ended(state, super::cncnet::ExternalMatchResult::Quit);
@@ -90,7 +95,7 @@ impl App {
         crate::app::radar_movie::retire(state, wall_ms);
         crate::app::commander_feedback::retire(state);
         crate::app::chrono_screen::retire(state, wall_ms);
-        if let Some(runtime) = state.match_state.sim_runtime.as_mut() {
+        if let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Lifecycle) {
             // Main_Game48CCC0 clears ScenarioStarted[A8ED5C] at48CEBF
             // after the match returns (EBX=0 from48CCD4); the restart clears
             // it at686424. The runtime may remain retained, but Tag
@@ -100,12 +105,13 @@ impl App {
         }
         state.match_state.scenario_restart_requested = false;
         state.match_state.debug_pause = false;
+        crate::app::input::pause_menu::on_match_end(state);
+        state.match_state.match_presentation.options_page_category = None;
         state.match_state.match_presentation.in_game_menu =
             crate::ui::pause_menu::InGameMenuState::Closed;
         // A match's 0xCF ends with the game: its pump 0x00623120 stops the
         // loop once Main_Tick reports the game over (0x0062314E..0x00623157).
         crate::app::shell_wol::page::close_page_dialog(state);
-        state.match_state.match_presentation.in_game_options_anchor = None;
         state.match_state.match_presentation.pause_menu_interaction = Default::default();
         state.match_state.match_presentation.abort_buttons = Default::default();
         state.match_state.match_presentation.surrender_buttons = Default::default();
@@ -115,21 +121,18 @@ impl App {
         state.match_state.match_presentation.saved_game_browser = None;
         state.match_state.network_wait = Default::default();
         state.match_state.network_failure = None;
-        state.match_state.frame_stopped = false;
         crate::app::lan_service::return_transport(state);
         // Persist the deterministic diagnostic log before leaving the scenario.
         // Runtime and presentation resources remain retained in the shell.
         crate::app::match_runtime::sim_tick::flush_replay_log(state);
+        state.match_state.frame_stopped = false;
         Self::capture_returned_multiplayer_scenario(state);
         Self::persist_returned_session_toggles(state);
         state.match_state.startup.clear();
         state.match_state.scenario_elapsed_clock.reset();
         state.audio.stop_theme();
-        // F11: leaving a match silences match audio completely. Previously
-        // only music stopped — live SFX, the voice player, and queued EVA
-        // lines survived and played over the main menu, and the SFX output
-        // scale stayed wherever the exit cascade left it (this Esc route
-        // bypasses drive_scenario_exit entirely).
+        // Leaving the scenario silences all match audio: live SFX, voices and
+        // queued EVA lines stop, and the sound master returns to full.
         if let Some(ref mut sfx) = state.audio.sfx_player {
             sfx.stop_all();
         }
@@ -148,7 +151,7 @@ impl App {
         let game_speed = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map_or(state.persistence.options_profile.game_speed, |runtime| {
                 runtime.simulation.session().game_options().game_speed
             });
@@ -178,7 +181,7 @@ impl App {
         log::info!("Restarting campaign mission {}", startup.scenario());
         // The router clears all four termination bytes before 6863E0: an
         // executed EXIT edge cannot follow the restart into the shell.
-        if let Some(runtime) = state.match_state.sim_runtime.as_mut() {
+        if let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Lifecycle) {
             let _ = runtime.simulation.take_executed_exit_owner();
         }
         Self::retire_running_scenario(state);
@@ -222,7 +225,7 @@ impl App {
         let Some(sim) = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.simulation)
         else {
             return false;
@@ -239,7 +242,7 @@ impl App {
         state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .is_some_and(|rt| rt.simulation.pending_outcome_wait().is_some())
     }
 
@@ -257,6 +260,7 @@ impl App {
             return;
         }
         state.platform.window_active = active;
+        Self::sync_window_movies(state);
         if active {
             state.platform.clear_attention();
         }
@@ -267,6 +271,8 @@ impl App {
             .radar_movies
             .set_active(movie_active);
         state.match_state.input.keys_held.clear();
+        // VERA formation line: its held key's release may never arrive.
+        state.match_state.input.formation_line.clear_key();
         state.match_state.input.hotkey_modifiers = ModifiersState::empty();
         state.platform.live_modifiers = ModifiersState::empty();
         state.platform.held_modifier_keys.clear();
@@ -305,6 +311,17 @@ impl App {
         );
     }
 
+    /// Fullscreen Play_Movie (0x00432E40) pauses the Bink handle on deactivation
+    /// and resumes it on activation. A hidden shell can get both edges between
+    /// draws, so update its video and soundtrack here as well as on creation.
+    fn sync_window_movies(state: &mut AppState) {
+        state.frontend.main_menu_movie_clock.pause();
+        let active = crate::app::frontend::fullscreen_movie::playback_active(state);
+        if let Some(movie) = state.frontend.fullscreen_movie.as_mut() {
+            movie.set_active(active);
+        }
+    }
+
     /// Apply one window-visibility edge. Waking on the un-hide edge is what
     /// gets the parked redraw loop turning again.
     pub(super) fn set_window_hidden(state: &mut AppState, hidden: bool) {
@@ -312,6 +329,7 @@ impl App {
             return;
         }
         state.platform.window_hidden = hidden;
+        Self::sync_window_movies(state);
         if !hidden {
             state.platform.window.request_redraw();
         }
@@ -334,15 +352,11 @@ impl App {
         use crate::ui::pause_menu::InGameMenuState;
 
         let current = state.match_state.match_presentation.in_game_menu;
-        // Escape and Back leave Options the same way — apply and persist the
-        // touched `[Options]` values, then return to the menu — so the two
-        // cannot disagree about what was saved.
-        if current == InGameMenuState::Options {
-            crate::app::persistence::options::accept_in_game_options(state);
-            log::info!(
-                "In-game Options closed at {} tps",
-                state.match_state.sim_speed_tps
-            );
+        if current == InGameMenuState::Menu
+            && (crate::app::input::pause_menu::close_options_list(state)
+                || crate::app::input::pause_menu::back_from_options(state))
+        {
+            return;
         }
         Self::enter_in_game_menu_state(state, current.on_escape());
     }
@@ -369,8 +383,23 @@ impl App {
         if !previous.is_open() && next.is_open() && !Self::state_machine_admits_modal(state) {
             return;
         }
+        if previous == InGameMenuState::Menu {
+            crate::app::input::pause_menu::on_close(state);
+        }
+        if !next.is_open() {
+            // Back in play by any route (Resume, or a cancelled Abort or
+            // Surrender): the next Escape opens on Game Controls again.
+            state.match_state.match_presentation.options_page_category = None;
+        }
         let was_open = previous.is_open();
         let will_be_open = next.is_open();
+        if !was_open && will_be_open {
+            // The skirmish shell's chrome atlas, dropped when the match
+            // started: the menu's pages draw with it
+            // (`native_in_game_shell_active`), so it is back before anything
+            // in this frame reads the open state.
+            Self::ensure_skirmish_shell_chrome(state);
+        }
         if was_open != will_be_open {
             let locked = crate::app::input::campaign_input::is_locked(state);
             let cursor = &mut state.match_state.input.cursor_visibility;
@@ -442,15 +471,6 @@ impl App {
             crate::app::input::abort::on_open(state);
         }
 
-        // Leaving Options: drop the cached `0xBBB` hit-test anchor so the
-        // overlay's own mouse handler cannot claim clicks aimed at the menu.
-        if previous == InGameMenuState::Options {
-            state.match_state.match_presentation.in_game_options_anchor = None;
-        }
-        if next == InGameMenuState::Options {
-            crate::app::input::in_game_options::on_open(state);
-        }
-
         // An open modal is the pause (`MatchState::paused`); any transition
         // ends the debug pause.
         state.match_state.debug_pause = false;
@@ -478,10 +498,10 @@ impl App {
         let sim = state
             .match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|runtime| &runtime.simulation);
         let latch = Self::state_machine_admission(
-            state.match_state.session_mode().is_nonzero(),
+            sim.is_some_and(|sim| !sim.session().uses_campaign_world()),
             state.match_state.match_presentation.modal_latch,
             sim.and_then(|sim| {
                 sim.session()
@@ -502,11 +522,11 @@ impl App {
     /// sets the latch again (`0x0048C911`). `None` refuses; `Some` admits
     /// with the latch's new value.
     pub(crate) fn state_machine_admission(
-        game_mode_nonzero: bool,
+        uses_match_latch: bool,
         latch: bool,
         local: Option<&crate::sim::house_state::HouseState>,
     ) -> Option<bool> {
-        let Some(house) = local.filter(|_| game_mode_nonzero) else {
+        let Some(house) = local.filter(|_| uses_match_latch) else {
             return Some(latch);
         };
         if house.has_won() || house.has_lost() || house.is_to_die() {
@@ -634,21 +654,34 @@ impl App {
         // Remote EXIT senders run DestroyConnection first (0x0064C9B1).
         crate::app::match_runtime::network_match::drain_departures(state);
         crate::app::match_runtime::network_match::post_speed_changes(state);
+        crate::app::match_runtime::network_match::post_pause_changes(state);
+        crate::app::match_runtime::network_match::post_connection_changes(state);
         crate::app::match_runtime::network_match::post_caught_up(state);
         let local_owner = crate::app::input::commands::preferred_local_owner(state);
         let local_owner_id = local_owner.as_deref().and_then(|owner| {
             state
                 .match_state
                 .sim_runtime
-                .as_ref()
+                .runtime()
                 .map(|rt| &rt.simulation)
                 .and_then(|sim| sim.interner().get(owner))
         });
         let local_outcome_exit_ready = Self::local_outcome_exit_ready(state);
+        // Almost every pass has no EXIT to take. Only one that does takes
+        // the world for writing, which waits for a tick on the simulation
+        // thread and drops the published frame.
+        if !state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .is_some_and(|rt| rt.simulation.executed_exit_owner_pending())
+        {
+            return;
+        }
         let executed_owner = state
             .match_state
             .sim_runtime
-            .as_mut()
+            .write_sim(SimWrite::Lifecycle)
             .map(|rt| &mut rt.simulation)
             .and_then(|sim| sim.take_executed_exit_owner());
         let Some(executed_owner) = executed_owner else {
@@ -727,8 +760,8 @@ impl App {
         let eligible = state
             .match_state
             .sim_runtime
-            .as_ref()
-            .is_some_and(|runtime| runtime.simulation.session().game_mode_nonzero())
+            .runtime()
+            .is_some_and(|runtime| !runtime.simulation.session().uses_campaign_world())
             && state.match_state.live_network.is_none()
             && !crate::app::cooperative_round::applies(state)
             && !state.match_state.map_basic.skip_score.unwrap_or(false);
@@ -885,6 +918,9 @@ impl App {
             ScenarioExitDestination::CooperativeResult { victory } => {
                 crate::app::cooperative_round::open_result(state, victory)
             }
+            ScenarioExitDestination::AuthoredCampaignResult(outcome) => {
+                crate::app::match_runtime::stage_result::open(state, outcome)
+            }
             ScenarioExitDestination::MainMenu => {
                 Self::return_to_main_menu(state);
             }
@@ -918,7 +954,7 @@ impl App {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     /// Every in-scenario modal route, including BBB's Keyboard (state 4,
     /// `0x004E1FE0` control 0x52C) and Sound (state 6, control 0x52D)

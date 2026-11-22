@@ -33,7 +33,7 @@ fn prior_building(sim: &mut Simulation, rules: &RuleSet, name: &str, x: u16, y: 
     // excludes Unlimbo/discovery. The Unlimbo queues Construction, so its
     // discovery cannot run Grand_Opening; restore the supplied constructor
     // MissionCom before the join.
-    let prior_mission = sim.substrate.entities.get(id).unwrap().mission;
+    let prior_mission = sim.substrate.entities.get(id).unwrap().mission.clone();
     assert!(
         sim.reveal_constructed_object_at_height(
             id,
@@ -43,7 +43,7 @@ fn prior_building(sim: &mut Simulation, rules: &RuleSet, name: &str, x: u16, y: 
             0,
             PlacementEvidence::EvaluateMark,
             rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .is_some()
     );
@@ -70,14 +70,14 @@ fn joined_fixture(rules: &RuleSet, row: &Value) -> (Simulation, u64) {
         let entity = sim.substrate.entities.get_mut(yard).unwrap();
         entity.finish_building_construction_for_test();
         entity.building_art.set_actually_placed_for_test(true);
-        entity.building_last_operational.set_for_test(true);
+        entity.building.building_last_operational.set_for_test(true);
     }
     // The original corpus supplies these already admitted actors, then starts
     // its Scenario ID cursor and streams before the entry under comparison.
     // Constructor/Unlimbo draws and full map admission are outside this join.
     sim.native_unique_ids = Some(NativeUniqueIdCursor::test_at_current_value(0));
     let seed = input["seed"].as_u64().unwrap();
-    sim.main_rng = SimRng::new(seed).into();
+    sim.main_rng = SimRng::new(seed);
     sim.scenario_rng = SimRng::new(seed);
     sim.set_logic_order_for_test(vec![id]);
     assert_eq!(sim.main_rng.native_state_hex(), row["rng_before"]["main"]);
@@ -108,7 +108,7 @@ fn joined_fixture(rules: &RuleSet, row: &Value) -> (Simulation, u64) {
             RadioMessage::Hello,
             RadioPayload::default(),
             rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
     }
     sim.substrate
@@ -124,14 +124,14 @@ fn joined_fixture(rules: &RuleSet, row: &Value) -> (Simulation, u64) {
             RadioMessage::DockArrived,
             RadioPayload::default(),
             rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         transmit_to_contact(
             &mut sim,
             yard,
             RadioMessage::Break,
             rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
     }
     (sim, id)
@@ -170,7 +170,7 @@ fn assert_joined_frame(sim: &Simulation, id: u64, frame: &Value, context: &str) 
         "{context}: placement"
     );
     assert_eq!(
-        u64::from(entity.building_last_operational.is_operational()),
+        u64::from(entity.building.building_last_operational.is_operational()),
         frame["old_operational"].as_u64().unwrap(),
         "{context}: operational sample"
     );
@@ -295,7 +295,7 @@ fn assert_joined_frame(sim: &Simulation, id: u64, frame: &Value, context: &str) 
         .collect();
     assert_eq!(json!(slots), frame["slots"], "{context}: retained slots");
     assert!(
-        entity.radio_contacts.slot(0).is_none(),
+        entity.seldom.radio_contacts.slot(0).is_none(),
         "{context}: contact cleanup"
     );
 }
@@ -458,8 +458,9 @@ fn stock_opening_matches_original_building_and_same_pass_anim_visits() {
                             stable_id,
                             rules,
                             None,
-                            crate::sim::world::FrameEffects::default(),
-                        );
+                            &mut crate::sim::world::FrameEffects::default(),
+                        )
+                        .unwrap();
                     } else {
                         // Execute the same bounded join as the native corpus.
                         // Its header/mission/body slices exclude damage fires,
@@ -470,11 +471,17 @@ fn stock_opening_matches_original_building_and_same_pass_anim_visits() {
                             stable_id,
                             rules,
                             None,
-                            crate::sim::world::FrameEffects::default(),
+                            &mut crate::sim::world::FrameEffects::default(),
                         );
                         update_animation(sim, stable_id, rules);
                         ready_commence(&sim.session, &mut sim.substrate, stable_id, true);
-                        dispatch(sim, stable_id, rules, ObjectAiCtx::default(), &mut false);
+                        dispatch(
+                            sim,
+                            stable_id,
+                            rules,
+                            &mut ObjectAiCtx::default(),
+                            &mut false,
+                        );
                         ready_commence(&sim.session, &mut sim.substrate, stable_id, false);
                         apply_queued_body(&sim.session, &mut sim.substrate, stable_id);
                     }

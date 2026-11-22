@@ -46,6 +46,7 @@ use crate::rules::powerups::{
     POWERUP_ARMOR, POWERUP_COUNT, POWERUP_FIREPOWER, POWERUP_HEAL_BASE, POWERUP_MONEY,
     POWERUP_REVEAL, POWERUP_SPEED, POWERUP_SQUAD, POWERUP_UNIT, POWERUP_VETERAN,
 };
+use crate::rules::rule_policy::RulePolicy;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::terrain_rules::LandType;
 use crate::sim::components::{DriveCoord, Position};
@@ -100,7 +101,7 @@ pub(super) fn select_pickup_outcome(
     registry: &OverlayTypeRegistry,
     overlay_id: Option<u8>,
     stored_selection: u8,
-    multiplayer: bool,
+    policy: RulePolicy,
 ) -> PickupSelection {
     let mut powerup = usize::from(stored_selection);
     if powerup >= POWERUP_COUNT {
@@ -123,7 +124,7 @@ pub(super) fn select_pickup_outcome(
             .unwrap_or(POWERUP_COUNT);
     }
     let mut solo_money = 0;
-    if !multiplayer && stored_selection == 0 {
+    if !policy.uses_match_crates() && stored_selection == 0 {
         let crate_rules = &rules.crate_rules;
         solo_money = crate_rules.solo_crate_money;
         for (image, selection) in [
@@ -195,14 +196,15 @@ fn crate_land_type(sim: &Simulation, cell: (i16, i16)) -> u8 {
         })
 }
 
-/// `VocClass::PlayAt @ 0x007509E0` of one `[AudioVisual]` crate sound at the
+/// `VocClass::PlayAt @ 0x007509E0` of one configured crate sound at the
 /// crate centre. Every arm but Reveal plays it only when `HouseClass::
 /// IsControlledByCurrentPlayer @ 0x0050B6F0` admits the actor's house
-/// (`heard_by`): the sim cannot see the local player, so the event carries
-/// the house and the app applies that test. Reveal (`0x0048202D..0x0048203C`)
+/// (`heard_by`): the event carries the collecting house and the app applies
+/// the shared control predicate. Reveal (`0x0048202D..0x0048203C`)
 /// plays it for everyone.
 fn play_crate_sound(
     sound_events: &mut FrameChannel<SimSoundEvent>,
+    rules: &RuleSet,
     sound: Option<&str>,
     heard_by: Option<InternedId>,
     cell: (i16, i16),
@@ -223,7 +225,7 @@ fn play_crate_sound(
         SimFixed::from_num(128),
     );
     sound_events.emit(SimSoundEvent::voc_at_for(
-        sound.to_owned(),
+        rules.sound_name(sound),
         heard_by.map(|owner| [owner, owner]),
         &position,
     ));
@@ -268,8 +270,7 @@ pub(crate) fn multiplayer_eligible_slot(
         // `0x00481D3A`: an already cloakable actor (`Techno+0x3D2`, seeded
         // from the type's `Cloakable=` or permanently granted by a crate).
         POWERUP_CLOAK => {
-            #[cfg(feature = "ares")]
-            {
+            if rules.ares_form() {
                 // Cloak1@1005F8D0 calls builtin type/rank predicate10043450,
                 // then checks permanent Ext+98 and TypeExt+1FA. Temporary
                 // attachment cloak must not hide an unclaimed crate bonus.
@@ -284,9 +285,7 @@ pub(crate) fn multiplayer_eligible_slot(
                 !builtin
                     && !actor.stealth_ability.granted()
                     && object.is_none_or(|kind| kind.cloak_allowed())
-            }
-            #[cfg(not(feature = "ares"))]
-            {
+            } else {
                 !actor
                     .stealth_ability
                     .active(object.is_some_and(|kind| kind.cloakable))
@@ -294,20 +293,20 @@ pub(crate) fn multiplayer_eligible_slot(
         }
         // Stock 481C69; Ares Armor1@1005F840 instead reads the permanent
         // Ext+88, so an attached armor bonus does not consume the crate.
-        POWERUP_ARMOR => actor.crate_multipliers.crate_armor() == NativeF64Bits::ONE,
+        POWERUP_ARMOR => actor.seldom.crate_multipliers.crate_armor() == NativeF64Bits::ONE,
         // `0x00481CDE`: an actor already sped up, or an Aircraft.
         POWERUP_SPEED => {
             actor.foot_speed.crate_multiplier() == NativeF64Bits::ONE
                 // Ares Speed1@1005F9D0 returns481D52 directly after its
                 // Ext+90 check, bypassing the stock Aircraft(+2C==2) gate.
-                && (crate::rules::ARES_ENABLED || actor.category() != EntityCategory::Aircraft)
+                && (rules.ares() || actor.category() != EntityCategory::Aircraft)
         }
         // `0x00481D0B`: an actor already boosted, or unarmed (`Is_Armed`).
         POWERUP_FIREPOWER => {
-            actor.crate_multipliers.crate_firepower() == NativeF64Bits::ONE
+            actor.seldom.crate_multipliers.crate_firepower() == NativeF64Bits::ONE
                 // Installed Firepower1@1005F940 returns481D52 directly,
                 //bypassing stock Is_Armed just as Speed1 bypasses Aircraft.
-                && (crate::rules::ARES_ENABLED || object.is_some_and(|object| {
+                && (rules.ares() || object.is_some_and(|object| {
                     crate::sim::combat::combat_weapon::is_armed(actor, object, &sim.substrate.entities, rules, &sim.interner)
                 }))
         }
@@ -372,7 +371,7 @@ pub(crate) fn pickup_crate(
     registry: &OverlayTypeRegistry,
     cell: (i16, i16),
     actor_id: u64,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let Some(actor) = sim.substrate.entities.get(actor_id) else {
         return true;
@@ -394,8 +393,8 @@ pub(crate) fn pickup_crate(
     if !flags.crate_type {
         return true;
     }
-    let multiplayer = sim.session.game_mode_nonzero();
-    if multiplayer
+    let policy = sim.session.rule_policy();
+    if policy.uses_match_crates()
         && sim
             .houses
             .get(&owner)
@@ -413,8 +412,7 @@ pub(crate) fn pickup_crate(
             49,
             Some(actor_id),
             None,
-            crate::sim::world::UninitContext::new(rules, Some(registry))
-                .with_effects(frame_effects),
+            crate::sim::world::UninitContext::new(rules).with_effects(frame_effects),
         );
         if had_tag
             && sim
@@ -443,11 +441,11 @@ pub(crate) fn pickup_crate(
         registry,
         overlay_id,
         stored_selection,
-        multiplayer,
+        policy,
     );
     let mut powerup = selection.powerup;
     let mut preempted = false;
-    if multiplayer {
+    if policy.uses_match_crates() {
         if mcv_preempt(sim, rules, owner) {
             powerup = POWERUP_UNIT;
             preempted = true;
@@ -459,8 +457,20 @@ pub(crate) fn pickup_crate(
     }
     // `0x00481D86`: removal, then the replacement crate.
     let _ = remove_pickup_crate(sim, rules, registry, cell);
-    if multiplayer && sim.session.game_options().crates {
-        let _ = place_one_random_crate(sim, rules, registry, ForcedPostPrecheckFailure::None);
+    if policy.uses_match_crates() && sim.session.game_options().crates {
+        if let Err(error) = place_one_random_crate(
+            sim,
+            rules,
+            registry,
+            ForcedPostPrecheckFailure::None,
+            frame_effects,
+        ) {
+            // The bool pickup receiver has no fallible continuation. Native
+            // would fault in the replacement's invalid Image/Mark chain;
+            // refuse the remaining pickup effect while keeping prior writes.
+            log::error!("crate pickup replacement at {cell:?} stopped: {error}");
+            return false;
+        }
     }
     if powerup == POWERUP_SQUAD {
         powerup = POWERUP_MONEY;
@@ -506,6 +516,7 @@ pub(crate) fn pickup_crate(
                 UnitCrateOutcome::Placed => {
                     play_crate_sound(
                         &mut sim.sound_events,
+                        rules,
                         general.crate_unit_sound.as_deref(),
                         Some(owner),
                         cell,
@@ -529,19 +540,31 @@ pub(crate) fn pickup_crate(
             POWERUP_MONEY => {
                 let amount = effects::money_crate_amount(
                     &mut sim.scenario_rng,
+                    rules,
                     selection.solo_money,
                     magnitude,
                 );
-                // `0x004824B0..0x004824D4`: in game mode 0 a player-controlled
-                // actor pays `PlayerPtr`; the sim cannot see that house and
-                // pays the actor's owner. Identical whenever the controlled
-                // house is the player's own, the campaign norm.
-                crate::sim::credit_income::add_credits(&mut sim.houses, owner, amount);
+                // PickupCrate4824A7..4824D4: every Money dispatch pays
+                // PlayerPtr in mode0 when IsHumanPlayer50B6F0 admits the
+                // collector, including the random and Unit-fallback routes.
+                // Lockstep never reads the process-local PlayerPtr for payment.
+                let recipient = if !policy.uses_match_crates()
+                    && !sim.session.execution_topology().is_lockstep()
+                    && sim.house_is_human_player(owner)
+                {
+                    sim.session.current_house()
+                } else {
+                    Some(owner)
+                };
+                if let Some(recipient) = recipient {
+                    crate::sim::credit_income::add_credits(&mut sim.houses, recipient, amount);
+                }
                 // 4824EF..482529 samples retained ESI after amount/credits;
                 // the independent 483307..483334 animation query follows sound.
                 let center = crate_center(sim, cell, receiver);
                 play_crate_sound(
                     &mut sim.sound_events,
+                    rules,
                     general.crate_money_sound.as_deref(),
                     Some(owner),
                     cell,
@@ -551,11 +574,15 @@ pub(crate) fn pickup_crate(
             POWERUP_HEAL_BASE => {
                 play_crate_sound(
                     &mut sim.sound_events,
+                    rules,
                     rules.crate_rules.heal_crate_sound.as_deref(),
                     Some(owner),
                     cell,
                     center,
                 );
+                // PickupCrate482C13 plays before the first healing receiver
+                // at482C8C, including that receiver's sound/RNG effects.
+                frame_effects.flush_sound(sim, rules);
                 effects::apply_heal_base_crate(sim, rules, Some(registry), actor_id, frame_effects);
             }
             POWERUP_DARKNESS => {
@@ -566,6 +593,7 @@ pub(crate) fn pickup_crate(
                 sim.reveal_map_for_owner(owner, rules);
                 play_crate_sound(
                     &mut sim.sound_events,
+                    rules,
                     general.crate_reveal_sound.as_deref(),
                     None,
                     cell,
@@ -594,6 +622,7 @@ pub(crate) fn pickup_crate(
                 announce_upgrade(&mut sim.sound_events, &owners, "EVA_UnitArmorUpgraded");
                 play_crate_sound(
                     &mut sim.sound_events,
+                    rules,
                     general.crate_armour_sound.as_deref(),
                     Some(owner),
                     cell,
@@ -622,6 +651,7 @@ pub(crate) fn pickup_crate(
                 }
                 play_crate_sound(
                     &mut sim.sound_events,
+                    rules,
                     general.crate_speed_sound.as_deref(),
                     Some(owner),
                     cell,
@@ -641,6 +671,7 @@ pub(crate) fn pickup_crate(
                 announce_upgrade(&mut sim.sound_events, &owners, "EVA_UnitFirePowerUpgraded");
                 play_crate_sound(
                     &mut sim.sound_events,
+                    rules,
                     general.crate_fire_sound.as_deref(),
                     Some(owner),
                     cell,
@@ -658,6 +689,7 @@ pub(crate) fn pickup_crate(
                 );
                 play_crate_sound(
                     &mut sim.sound_events,
+                    rules,
                     general.crate_promote_sound.as_deref(),
                     Some(owner),
                     cell,
@@ -706,7 +738,14 @@ pub(crate) fn pickup_crate(
                 );
             }
             POWERUP_TIBERIUM => {
-                effects::apply_tiberium_crate(sim, rules, registry, cell, center);
+                if let Err(error) =
+                    effects::apply_tiberium_crate(sim, rules, registry, cell, center, frame_effects)
+                {
+                    // Native-invalid Image: stop this pickup arm after its
+                    // preceding writes, with no later placement/animation draw.
+                    log::error!("Tiberium crate failed: {error}");
+                    return false;
+                }
             }
             _ => {}
         }
@@ -769,13 +808,13 @@ fn spawn_pickup_anim(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 #[path = "pickup_tests.rs"]
 mod pickup_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
-    use super::super::tests::{crate_registry, crate_ruleset};
+    use super::super::tests::crate_ruleset;
     use super::*;
 
     /// Entire Scenario RNG state, not merely the chosen result: rejection draws
@@ -816,7 +855,7 @@ mod tests {
                 rules.crate_rules.crate_img = Some("WOOD".into());
                 rules.crate_rules.water_crate_img = Some("WOOD".into());
             }
-            let registry = crate_registry();
+            let registry = rules.overlay_registry();
             let mut rng = SimRng::new(input["seed"].as_u64().unwrap_or(31));
             assert_eq!(
                 rng.native_state_hex(),
@@ -826,10 +865,14 @@ mod tests {
             let selection = select_pickup_outcome(
                 &mut rng,
                 &rules,
-                &registry,
+                registry,
                 registry.id_for_name("WOOD"),
                 input["selection"].as_u64().unwrap_or(10) as u8,
-                input["mode"].as_i64() != Some(0),
+                if input["mode"].as_i64() == Some(0) {
+                    RulePolicy::stock_campaign()
+                } else {
+                    RulePolicy::stock_multiplayer()
+                },
             );
             assert_eq!(
                 serde_json::json!([[selection.powerup, selection.solo_money]]),

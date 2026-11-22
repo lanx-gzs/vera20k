@@ -21,7 +21,8 @@ pub(crate) enum ImageTheater {
 
 impl ImageTheater {
     /// FindTheater48DBE0 scans the six names at7E1B78 with case-insensitive
-    /// comparison; Snow is ordinal1. Unknown names return-1.
+    /// comparison; Snow is ordinal1. Unknown names return-1. The map's
+    /// theater data finds its theater through this too (`map::theater`).
     pub(crate) fn from_name(name: &str) -> Self {
         if name.eq_ignore_ascii_case("SNOW") {
             Self::Snow
@@ -40,16 +41,41 @@ impl ImageTheater {
         }
     }
 
-    /// Full_Init687633..687649 invokes ReadTheater475870 with default0
-    /// before resetting Types. This reads the raw map, not the merged Rules.
-    pub(crate) fn from_map(map: &IniFile) -> Self {
-        let name = map.section_or_empty("Map").read_string("Theater", "", 0x80);
-        if name.is_empty() {
-            Self::Temperate
-        } else {
-            Self::from_name(&name)
+    /// The TheaterType ordinal FindTheater48DBE0 returns: Temperate0 to
+    /// Lunar5, and -1 for an unknown name (Ares `Theater::FindIndex
+    /// @ 1003DAE0` and `ScenarioClass+Theater`).
+    pub(crate) const fn native_index(self) -> i32 {
+        match self {
+            Self::Uninitialized => -1,
+            Self::Temperate => 0,
+            Self::Snow => 1,
+            Self::Urban => 2,
+            Self::Desert => 3,
+            Self::NewUrban => 4,
+            Self::Lunar => 5,
         }
     }
+
+    /// Full_Init687633..687649 invokes ReadTheater475870 with default0
+    /// before resetting Types. This reads the raw map, not the merged Rules,
+    /// with the map header's read ([`read_map_theater`]).
+    pub(crate) fn from_map(map: &IniFile) -> Self {
+        Self::from_name(&read_map_theater(map))
+    }
+}
+
+/// The map's `[Map] Theater=`: `ReadTheater @ 0x00475870` with default 0
+/// (Temperate), as the map reader (0x004ACFE5) and Full_Init (0x0068763E)
+/// both call it. The name its 0x80-byte ReadString copies, uppercased, or
+/// `TEMPERATE` when the copy is empty. An unknown name stays as read; the
+/// theater lookups match names without regard to case, as FindTheater
+/// (0x0048DBE0) does. Rules reads it for the image theater, so it lives here
+/// rather than in the map reader (rules must not import map).
+pub(crate) fn read_map_theater(ini: &IniFile) -> String {
+    ini.section_or_empty("Map")
+        .read_name("Theater", 0x80)
+        .unwrap_or("TEMPERATE")
+        .to_uppercase()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,6 +145,8 @@ pub(crate) struct ObjectImageState {
     anim_bounds_loads: Option<Vec<ObjectImageLoad>>,
     anim_theater_bounds_loads: Option<Vec<ObjectImageLoad>>,
     voxel_load: Option<String>,
+    #[serde(default)]
+    pub(crate) model_slots: super::voxel_model_plan::ModelSlots,
 }
 
 impl ObjectImageState {
@@ -136,6 +164,7 @@ impl ObjectImageState {
             anim_bounds_loads: None,
             anim_theater_bounds_loads: None,
             voxel_load: None,
+            model_slots: Default::default(),
         }
     }
 

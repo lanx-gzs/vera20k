@@ -6,4 +6,6 @@
     <style name="Theme.VeraZip" parent="android:Theme.Black.NoTitleBar.Fullscreen">
         <item name="android:windowBackground">@drawable/splash_background</item>
     </style>
+
+    <!-- One theme: this build has a single launcher entry, the inspector. -->
 </resources>

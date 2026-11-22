@@ -1,6 +1,7 @@
 //! Action84 consumes the existing authored Group and deferred Mission owners.
 //! Native Execute6DDCEC..6DDD74 (WakeupGroup6E03B0) queues Guard(5,false).
 
+use crate::rules::rule_policy::RulePolicy;
 use crate::rules::team_ai_ini::TeamAiIniRegistry;
 use crate::sim::house_state::HouseState;
 use crate::sim::mission::MissionType;
@@ -44,7 +45,7 @@ fn authored_signed_group_queues_guard_across_houses() {
     let teams = TeamAiIniRegistry::from_sources(
         &crate::rules::ini_parser::IniFile::empty(),
         &map.ini,
-        true,
+        RulePolicy::stock_multiplayer(),
     );
     sim.initialize_trigger_definitions(&map, &teams, None, None, None);
     assert_eq!(sim.spawn_from_map(&map.entities, Some(rules)), 4);
@@ -66,7 +67,7 @@ fn authored_signed_group_queues_guard_across_houses() {
     }
     assert_ne!(sim.entities().get(ids[1]).unwrap().owner(), human);
 
-    let before = ids.map(|id| sim.entities().get(id).unwrap().mission);
+    let before = ids.map(|id| sim.entities().get(id).unwrap().mission.clone());
     assert_eq!(before[0].current().known(), Some(MissionType::Sleep));
     assert_eq!(before[1].current().known(), Some(MissionType::Harmless));
     let rng = sim.rng_state();
@@ -76,10 +77,10 @@ fn authored_signed_group_queues_guard_across_houses() {
     sim.advance_triggers(
         rules,
         Some(rules.overlay_registry()),
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     );
     for (index, id) in ids.into_iter().enumerate() {
-        let mission = sim.entities().get(id).unwrap().mission;
+        let mission = sim.entities().get(id).unwrap().mission.clone();
         if index < 2 {
             assert_eq!(mission.queued().known(), Some(MissionType::Guard));
             assert_eq!(mission.current(), before[index].current());

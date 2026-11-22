@@ -65,11 +65,6 @@ fn named(names: &mut Vec<u64>, held: impl IntoIterator<Item = Option<u64>>) -> b
     false
 }
 
-thread_local! {
-    /// A thread's scratch for the ids a re-read listener names.
-    static NAMES: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
-}
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ExpiryListeners {
     entities: StoreIndex,
@@ -308,11 +303,11 @@ impl StoreIndex {
     /// answers `None` for a removed one, and record what changed.
     fn reread(&mut self, ids: Vec<u64>, read: impl Fn(u64, &mut Vec<u64>) -> Option<bool>) {
         let index = &*self;
-        let changes: Vec<_> = NAMES.with_borrow_mut(|names| {
-            ids.iter()
-                .map(|&id| index.change(id, names, |names| read(id, names)))
-                .collect()
-        });
+        let mut names = Vec::new();
+        let changes: Vec<_> = ids
+            .iter()
+            .map(|&id| index.change(id, &mut names, |names| read(id, names)))
+            .collect();
         self.record(ids, changes);
     }
 
@@ -327,8 +322,9 @@ impl StoreIndex {
             return self.reread(ids, read);
         }
         let index = &*self;
-        let changes = crate::sim::parallel::map(&ids, |&id| {
-            NAMES.with_borrow_mut(|names| index.change(id, names, |names| read(id, names)))
+        // Each worker names into its own scratch.
+        let changes = crate::sim::parallel::map_with(&ids, Vec::new(), |names, &id| {
+            index.change(id, names, |names| read(id, names))
         });
         self.record(ids, changes);
     }
@@ -398,7 +394,7 @@ impl StoreIndex {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 mod tests {
     use super::*;
     use crate::rules::particle_system_type::ParticleSystemTypeId;
@@ -491,8 +487,11 @@ mod tests {
         let mut entities = EntityStore::new();
         entities.insert(attacker(1, 3));
         let mut controller = GameEntity::test_default(2, "YURI", "Russians", 12, 12);
-        controller.capture_manager =
-            Some(CaptureManagerState::with_victims_for_test(3, false, &[3]));
+        controller.capture_manager = Some(Box::new(CaptureManagerState::with_victims_for_test(
+            3,
+            false,
+            &[3],
+        )));
         entities.insert(controller);
         entities.insert(GameEntity::test_default(3, "HTNK", "Russians", 14, 14));
         let mut docked = attacker(4, 3);
@@ -550,7 +549,7 @@ mod tests {
         );
         manager.set_current_target_for_test(Some(TargetKind::Entity(6)));
         manager.set_queued_target_for_test(Some(TargetKind::Cell(3, 3)));
-        launcher.spawn_manager = Some(manager);
+        launcher.spawn_manager = Some(Box::new(manager));
         let mut entities = EntityStore::new();
         entities.insert(launcher);
         let mut stores = Stores {

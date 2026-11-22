@@ -146,6 +146,12 @@ pub fn mouse_down<I: Clone + PartialEq>(
                         .action_outcome()
                         .map_or(BrowserInputResult::None, BrowserInputResult::Outcome);
                 }
+                // VERA's Setups page loads the double-clicked setup.
+                if layout.load.is_some() {
+                    return browser
+                        .setup_outcome(SavedSeedControl::Load)
+                        .map_or(BrowserInputResult::None, BrowserInputResult::Outcome);
+                }
                 return BrowserInputResult::None;
             }
             // 0x0061A948: a press on a row selects it and clicks; presses
@@ -193,6 +199,14 @@ pub fn mouse_down<I: Clone + PartialEq>(
             browser.pressed_control = hit;
             return BrowserInputResult::ButtonPressed;
         }
+        // VERA's Setups page: Load and Delete take a press while a saved
+        // setup is selected.
+        Some(control @ (SavedSeedControl::Load | SavedSeedControl::Delete))
+            if browser.selected_saved().is_some() =>
+        {
+            browser.pressed_control = Some(control);
+            return BrowserInputResult::ButtonPressed;
+        }
         _ => {}
     }
     BrowserInputResult::None
@@ -228,6 +242,9 @@ pub fn mouse_up<I: Clone + PartialEq>(
             .action_outcome()
             .map_or(BrowserInputResult::None, BrowserInputResult::Outcome),
         Some(SavedSeedControl::Back0x686) => BrowserInputResult::Outcome(SavedSeedOutcome::Close),
+        Some(control @ (SavedSeedControl::Load | SavedSeedControl::Delete)) => browser
+            .setup_outcome(control)
+            .map_or(BrowserInputResult::None, BrowserInputResult::Outcome),
         _ => BrowserInputResult::None,
     }
 }
@@ -273,7 +290,7 @@ pub fn update_scroll<I>(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
     use crate::ui::skirmish_shell::{SavedSeedBrowserRow, SavedSeedPrompt, SavedSeedPromptPurpose};
@@ -290,6 +307,7 @@ mod tests {
                 description: format!("Save {i}").into(),
                 last_write_time: (count - i) as u64,
                 visible: true,
+                loadable: true,
             })
             .collect();
         let browser = SavedSeedBrowserState::open_rows(

@@ -274,7 +274,7 @@ fn live_tag_rgb_overrides_reach_packets_and_survive_ambient_writes_during_storm(
     sim.advance_triggers(
         crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     );
     assert_eq!(sim.lighting_sources().pending().len(), 3);
     lights.apply_events(&terrain, sim.lighting_sources().pending());
@@ -342,6 +342,54 @@ fn live_tag_rgb_overrides_reach_packets_and_survive_ambient_writes_during_storm(
     );
     assert_eq!(lights.grid.palette_rgb(before), [1200, 800, 600]);
     assert_eq!(lights.grid.palette_rgb(after), [960, 640, 512]);
+}
+
+/// Execute73 (`0x006DF292`) writes the ordinary ambient and the fade target
+/// and refreshes no cell, so the pass after it leaves every cell's scalars as
+/// the last relight gave them: a cell whose height changed since keeps its
+/// old light until a relight, such as the fade's next step, reaches it.
+#[test]
+fn ambient_action_relights_no_cell_before_the_fade() {
+    let map = MapFile::from_bytes(b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n[IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n[Basic]\nNewINIFormat=4\n[Triggers]\nAMB=Neutral,<none>,AMB,0,1,1,1,0\n[Events]\nAMB=1,13,0,0\n[Actions]\nAMB=1,73,0,40,0,0,0,0,A\n[Tags]\nAMBTAG=0,AMB,AMB\n").unwrap();
+    let rules = crate::rules::ruleset::RuleSet::empty_for_test();
+    let mut sim = Simulation::with_seed(0);
+    sim.initialize_trigger_definitions(
+        &map,
+        &crate::rules::team_ai_ini::TeamAiIniRegistry::default(),
+        None,
+        None,
+        None,
+    );
+    sim.classify_map_triggers(rules);
+    sim.publish_scenario_started();
+    let terrain =
+        crate::map::resolved_terrain::test_grid(3, 1, crate::map::resolved_terrain::test_flat_cell);
+    let mut lights = MatchLighting::default();
+    lights.install(
+        CellLightGrid::new(),
+        LightingConfig::default(),
+        2,
+        Some((&terrain, &sim)),
+        None,
+    );
+    // A bridge's raw Cell+11B write changes only later sampling.
+    lights.apply_events(
+        &terrain,
+        &[LightingEvent::CellLevels {
+            cells: vec![((1, 0), 4)],
+        }],
+    );
+    let top = |lights: &MatchLighting| lights.grid.cell_light_at((1, 0)).unwrap().top_scalar;
+    let before = top(&lights);
+    sim.advance_triggers(rules, None, &mut FrameEffects::default());
+    assert_eq!(sim.session().lighting().target_ambient(), 40);
+    lights.apply_events(&terrain, &sim.take_lighting_events());
+    lights.after_pass(&terrain, &sim, 2);
+    assert_eq!(top(&lights), before, "73 relights no cell");
+    // The fade's step (Logic55B4C6) relights the cell at its new height.
+    sim.publish_global_lighting(PaletteUpdate::Preserve);
+    lights.apply_events(&terrain, &sim.take_lighting_events());
+    assert_ne!(top(&lights), before);
 }
 
 /// A radiation site's bound type drives the field's cell light: the same
@@ -441,14 +489,22 @@ fn attach_effect_tint_ors_colours_and_sums_intensities_by_viewer() {
     sim.session_mut_for_test()
         .set_current_house_for_test(Some(americans));
     assert_eq!(
-        attach_effect_tint(sim.entities().get(target).unwrap(), &sim, &rules),
+        attach_effect_tint(
+            &crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, target),
+            &sim,
+            &rules
+        ),
         (0xF800, 1000),
         "the owner sees RED only; enem-only and none stay out"
     );
     sim.session_mut_for_test()
         .set_current_house_for_test(Some(russians));
     assert_eq!(
-        attach_effect_tint(sim.entities().get(target).unwrap(), &sim, &rules),
+        attach_effect_tint(
+            &crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, target),
+            &sim,
+            &rules
+        ),
         (0xF800 | 0x001F, 1500),
         "an enemy also sees BLUE; HIDDEN never applies"
     );
@@ -484,14 +540,22 @@ fn cumulative_effect_tint_stacks_by_type_or_once() {
     // Base (10,20,30)/(0.5) stacked twice sums to (20,40,60)/1.0.
     let (sim, rules, target) = scene("");
     assert_eq!(
-        attach_effect_tint(sim.entities().get(target).unwrap(), &sim, &rules),
+        attach_effect_tint(
+            &crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, target),
+            &sim,
+            &rules
+        ),
         (0x1147, 1000),
         "the two instances of one type sum their tint"
     );
 
     let (sim, rules, target) = scene("Tint.Cumulative=no\n");
     assert_eq!(
-        attach_effect_tint(sim.entities().get(target).unwrap(), &sim, &rules),
+        attach_effect_tint(
+            &crate::app::presentation::frame::ObjectRecord::of_test_sim(&sim, &rules, target),
+            &sim,
+            &rules
+        ),
         (0x08A3, 500),
         "without Tint.Cumulative the type tints once"
     );

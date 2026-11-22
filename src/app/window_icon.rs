@@ -25,7 +25,10 @@ const VERA_ICON_PNG: &[u8] = include_bytes!("vera_icon.png");
 pub(super) struct WindowIcon {
     /// The icon as an image file: the red star's icon group as an `.ico`, or
     /// VERA's PNG. macOS takes every entry and picks its own resolution.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(dead_code, reason = "only macOS sets the icon from the file")
+    )]
     file: Vec<u8>,
     /// The largest entry, for winit's window icon (Windows and X11).
     rgba: image::RgbaImage,
@@ -35,6 +38,15 @@ impl WindowIcon {
     /// The icon the VERA Icon box picks: VERA's artwork when it is ticked,
     /// otherwise the red star from the retail install at `ra2_dir`.
     pub(super) fn chosen(vera_icon: bool, ra2_dir: Option<&Path>) -> Option<Self> {
+        // A browser page has no window icon (winit sets none there), so the
+        // browser build reads neither source and leaves the artwork out.
+        if cfg!(all(
+            feature = "wasm",
+            target_arch = "wasm32",
+            target_os = "unknown"
+        )) {
+            return None;
+        }
         if !vera_icon {
             return ra2_dir.and_then(Self::retail);
         }
@@ -309,7 +321,7 @@ impl<'a> Resources<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
     use image::ImageEncoder;

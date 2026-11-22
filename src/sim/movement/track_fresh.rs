@@ -20,12 +20,12 @@
 //! `tools/spatial_oracle/track_blocked_timers`.
 //!
 //! Residuals:
-//! - `vt+0x37C` (Unit `0x746C90`: the EMP lock Techno+504 or the Unit
-//!   death-frame counter +6D8): neither has a Rust producer (VERA has no EMP
-//!   mechanism; see `techno_ai_cloak`), so the prologue gate reads false.
+//! - `vt+0x37C` (`GameEntity::is_under_emp`: EMP, or a Unit's running
+//!   `DeathFrames=` counter) is not asked, so the prologue gate reads false.
 //!   Trigger: an EMP'd or dying Unit. Effect: it could start a track native
-//!   refuses. Frequency: no stock EMP source is proven reachable. Risk: this
-//!   gate is a consumer of the EMP system when it lands.
+//!   refuses. Frequency: Ares EMP; a death counter only on a modded
+//!   `Crashable=` `DeathFrames=` Unit, whose Health of 0 stops the missions
+//!   that would move it. Risk: modded EMP.
 //! - Crates (`CellClass::PickupCrate 0x481A00` at `0x4B405D` and
 //!   `0x4B46E6`) run through [`Simulation::pickup_crate_at`]; a host called
 //!   without the OverlayType table answers as a cell without a crate (the
@@ -39,10 +39,6 @@
 //!   (`publish_fresh_speed`); native reads the shared dummy Cell's land row.
 //!   Trigger: a Foot on map row or column 0 heading off the map. Frequency:
 //!   none in play (the playfield keeps movers inside). Risk: none.
-//! - A train (`IsTrain=`, Type+C94, set by no retail type) extends its last
-//!   path word with Find_Path's append form (`0x4B3F07`), which keeps the
-//!   queue and appends at most 24 - prefix words (`0x4D3E82`). VERA's route
-//!   install replaces the queue, so a train takes the ordinary request.
 //!
 //! A tube word at the path head returns here (`0x4B3298`, and `0x4B2F45`
 //! after a found route); the Process_Track after it enters the tube
@@ -128,13 +124,11 @@ impl ProcessMovementArgs {
 }
 
 /// Mark0/Mark1 and the per-call services the arm reaches.
-#[derive(Clone, Copy)]
 struct FreshCall<'a> {
     id: u64,
     family: TrackFamily,
     args: ProcessMovementArgs,
     rules: &'a RuleSet,
-    registry: Option<&'a OverlayTypeRegistry>,
     frame_effects: FrameEffects<'a>,
 }
 
@@ -158,21 +152,19 @@ impl Simulation {
         family: TrackFamily,
         args: ProcessMovementArgs,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Result<bool, String> {
-        let call = FreshCall {
+        let mut call = FreshCall {
             id,
             family,
             args,
             rules,
-            registry,
-            frame_effects,
+            frame_effects: frame_effects.reborrow(),
         };
-        self.track_process_movement(&call)
+        self.track_process_movement(&mut call)
     }
 
-    fn track_process_movement(&mut self, call: &FreshCall<'_>) -> Result<bool, String> {
+    fn track_process_movement(&mut self, call: &mut FreshCall<'_>) -> Result<bool, String> {
         let id = call.id;
         let actor = self
             .substrate
@@ -192,7 +184,13 @@ impl Simulation {
                 .expect("same Process_Movement owner");
             clear_track_head(actor);
             if mission == Some(MissionType::Move) {
-                return Ok(self.unit_enter_idle_mode(id, call.rules, false, call.frame_effects));
+                return Ok(crate::sim::world::enter_idle_mode(
+                    self,
+                    id,
+                    call.rules,
+                    Some(call.rules.overlay_registry()),
+                    &mut call.frame_effects,
+                ));
             }
             return Ok(false);
         }
@@ -212,7 +210,7 @@ impl Simulation {
             return Ok(false);
         }
         //4B2741..4B2761: vt+37C (Unit 0x746C90: the EMP lock +504 or the
-        //death-frame counter +6D8, neither represented; see the residual) and
+        //death-frame counter +6D8, not asked; see the residual) and
         //vt+380, FootClass::IsParalyzed 0x4DE770 (the Foot+6A0 timer a
         //parasite arms), return with the out byte clear. Ship's vt+380 gate
         //is6A1DA9. The consumed track_fresh_response controls cover both
@@ -240,7 +238,7 @@ impl Simulation {
 
     /// 0x4B281C..0x4B2845 then track_path's request and continuations. A found
     /// route resumes head selection in the same call (0x4B3282..0x4B3298).
-    fn track_no_queue_arm(&mut self, call: &FreshCall<'_>) -> Result<bool, String> {
+    fn track_no_queue_arm(&mut self, call: &mut FreshCall<'_>) -> Result<bool, String> {
         let id = call.id;
         let frame = self.session.binary_frame() as i32;
         let actor = self
@@ -281,16 +279,14 @@ impl Simulation {
         ) {
             return Ok(false);
         }
-        let call = &match resumed {
-            Some(args) => call.with_args(args),
-            None => *call,
-        };
+        let args = resumed.unwrap_or(call.args);
+        let call = &mut call.with_args(args);
         let request = self.track_path_request(call, destination, 0)?;
         match self.run_track_path_request(
             &request,
             call.rules,
-            call.registry,
-            call.frame_effects,
+            Some(call.rules.overlay_registry()),
+            &mut call.frame_effects,
         )? {
             FootPathOutcome::Deleted => Ok(true),
             FootPathOutcome::Returned => Ok(false),
@@ -310,7 +306,7 @@ impl Simulation {
 
     fn track_path_request(
         &self,
-        call: &FreshCall<'_>,
+        call: &mut FreshCall<'_>,
         destination: DriveCoord,
         urgency: u8,
     ) -> Result<FootPathRequest, String> {
@@ -325,7 +321,7 @@ impl Simulation {
     }
 
     /// The fresh arm, from 0x4B3298 with the live path head `direction`.
-    fn track_fresh_arm(&mut self, call: &FreshCall<'_>, direction: u8) -> Result<bool, String> {
+    fn track_fresh_arm(&mut self, call: &mut FreshCall<'_>, direction: u8) -> Result<bool, String> {
         let id = call.id;
         let rules = call.rules;
         //4B3298: a tube word returns; Process_Track's tube arm enters the tube.
@@ -387,9 +383,19 @@ impl Simulation {
             return Ok(false);
         }
         //4B345B..4B34D1: Mark0, Unit+1AC(cell, dir, height, 0, 1), Mark1.
-        self.foot_mark_remove(id, rules, call.registry, call.frame_effects);
+        self.foot_mark_remove(
+            id,
+            rules,
+            Some(call.rules.overlay_registry()),
+            &mut call.frame_effects,
+        );
         let code = self.track_can_enter(call, cell, direction, height)?;
-        self.foot_mark_put(id, rules, call.registry, call.frame_effects);
+        self.foot_mark_put(
+            id,
+            rules,
+            Some(call.rules.overlay_registry()),
+            &mut call.frame_effects,
+        );
         let object = self.track_object(id, rules)?;
         let overlay = self.track_overlay(cell);
         //4B34D7..4B351D: the train and crusher coercions.
@@ -404,7 +410,7 @@ impl Simulation {
         //an admitted candidate forces the straight track later.
         let crush_overlay = code == 0
             && overlay.is_some_and(|overlay| {
-                self.overlay_flags(call.registry, overlay)
+                self.overlay_flags(Some(call.rules.overlay_registry()), overlay)
                     .is_some_and(|(crushable, wall)| {
                         crushable || (wall && object.movement_zone == MovementZone::CrusherAll)
                     })
@@ -421,11 +427,11 @@ impl Simulation {
                 if retry.is_some() {
                     self.substrate.clear_path_head(id);
                     return self
-                        .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
+                        .track_process_movement(&mut call.with_args(ProcessMovementArgs::RETRY));
                 }
                 //4B398E..4B39CC then 4B31FC: clear the head, stop or take
                 //the next waypoint.
-                self.stop_or_take_next_waypoint(id, rules, call.frame_effects);
+                self.stop_or_take_next_waypoint(id, rules, &mut call.frame_effects);
                 Ok(false)
             }
             FreshDispatch::BlockedDelay => self.track_blocked_delay(call),
@@ -448,7 +454,7 @@ impl Simulation {
                     self.substrate.clear_path_head(id);
                     Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
-                        .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
+                        .track_process_movement(&mut call.with_args(ProcessMovementArgs::RETRY));
                 }
                 //4B3B03..4B3BE9: attack the non-allied blocking object, or
                 //the wall cell when the cell holds none.
@@ -456,8 +462,8 @@ impl Simulation {
                     call.id,
                     cell,
                     call.rules,
-                    call.registry,
-                    call.frame_effects,
+                    Some(call.rules.overlay_registry()),
+                    &mut call.frame_effects,
                 );
                 //4B3C67..4B3C81: code != 7 retires the selector.
                 if let Some(actor) = self.substrate.entities.get_mut(id) {
@@ -472,12 +478,12 @@ impl Simulation {
                     self.substrate.clear_path_head(id);
                     Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
-                        .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
+                        .track_process_movement(&mut call.with_args(ProcessMovementArgs::RETRY));
                 }
                 //4B3742..4B38A1: close enough to the destination, level and
                 //off a Tunnel: stop or take the next waypoint.
                 if self.track_close_enough_stop(id, rules)? {
-                    if self.stop_or_take_next_waypoint(id, rules, call.frame_effects) {
+                    if self.stop_or_take_next_waypoint(id, rules, &mut call.frame_effects) {
                         //4B38A7: an entered idle mode returns at once.
                         return Ok(false);
                     }
@@ -487,8 +493,8 @@ impl Simulation {
                         id,
                         cell,
                         rules,
-                        call.registry,
-                        call.frame_effects,
+                        Some(call.rules.overlay_registry()),
+                        &mut call.frame_effects,
                     )?;
                 }
                 self.substrate.track_first_rejected_tail(id);
@@ -504,10 +510,10 @@ impl Simulation {
                     self.substrate.clear_path_head(id);
                     Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
-                        .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
+                        .track_process_movement(&mut call.with_args(ProcessMovementArgs::RETRY));
                 }
                 //4B3C26..4B3C62 then 4B31FC.
-                self.stop_or_take_next_waypoint(id, rules, call.frame_effects);
+                self.stop_or_take_next_waypoint(id, rules, &mut call.frame_effects);
                 Ok(false)
             }
             FreshDispatch::OwnerNotAlive
@@ -520,7 +526,7 @@ impl Simulation {
     }
 
     /// 0x4B3607..0x4B3A94: the first candidate's code-2 ladder.
-    fn track_blocked_delay(&mut self, call: &FreshCall<'_>) -> Result<bool, String> {
+    fn track_blocked_delay(&mut self, call: &mut FreshCall<'_>) -> Result<bool, String> {
         let id = call.id;
         let rules = call.rules;
         let frame = self.session.binary_frame();
@@ -560,7 +566,12 @@ impl Simulation {
         // An answered re-path searches at the urgency it registered at.
         let urgency = self.batched_code2_urgency(id, urgency);
         let request = self.track_path_request(call, destination, urgency)?;
-        let found = self.foot_find_path(&request, rules, call.registry, call.frame_effects)?;
+        let found = self.foot_find_path(
+            &request,
+            rules,
+            Some(call.rules.overlay_registry()),
+            &mut call.frame_effects,
+        )?;
         //4B3A13..4B3A2A: a vanished Foot sets the out byte.
         if self.substrate.entities.get(id).is_none() {
             return Ok(true);
@@ -580,14 +591,19 @@ impl Simulation {
             return Ok(false);
         }
         //4B3A3E..4B3A56: SetDestination(NULL, 1).
-        self.set_unit_null_destination(id, rules, None, call.frame_effects);
+        self.assign_null_destination(
+            id,
+            rules,
+            Some(rules.overlay_registry()),
+            &mut call.frame_effects,
+        );
         Ok(false)
     }
 
     /// The accepted first candidate, 0x4B357F..0x4B45F6.
     fn track_fresh_accept(
         &mut self,
-        call: &FreshCall<'_>,
+        call: &mut FreshCall<'_>,
         direction: u8,
         candidate: DriveCoord,
         cell: (i16, i16),
@@ -626,10 +642,16 @@ impl Simulation {
                 location.z.wrapping_sub(destination.z),
             );
             if distance > 0x200 {
-                //Find_Path(cell(destination), IsTrain, 0); see the train residual.
-                let request = self.track_path_request(call, destination, 0)?;
-                let found =
-                    self.foot_find_path(&request, rules, call.registry, call.frame_effects)?;
+                // Drive 0x4B3EF8..0x4B3F37 / Ship 0x6A3547..0x6A3586: IsTrain
+                // supplies Find_Path's one-word prefix on this call only.
+                let mut request = self.track_path_request(call, destination, 0)?;
+                request.retain_head = self.track_object(id, rules)?.is_train;
+                let found = self.foot_find_path(
+                    &request,
+                    rules,
+                    Some(call.rules.overlay_registry()),
+                    &mut call.frame_effects,
+                )?;
                 if found == FindPathResult::Failed {
                     //4B3F40..4B3F55: a vanished Foot sets the out byte.
                     if self.substrate.entities.get(id).is_none() {
@@ -637,7 +659,12 @@ impl Simulation {
                     }
                     //4B3F58..4B3F6E: an unreachable live destination clears.
                     if !self.foot_path_zone_precheck(id, self.live_track_destination(id), rules)? {
-                        self.set_unit_null_destination(id, rules, None, call.frame_effects);
+                        self.assign_null_destination(
+                            id,
+                            rules,
+                            Some(rules.overlay_registry()),
+                            &mut call.frame_effects,
+                        );
                     }
                 }
                 second = self
@@ -664,7 +691,7 @@ impl Simulation {
             match self.track_overlay(next_cell) {
                 Some(overlay) => {
                     let (crushable, wall) = self
-                        .overlay_flags(call.registry, overlay)
+                        .overlay_flags(Some(call.rules.overlay_registry()), overlay)
                         .unwrap_or((false, false));
                     //4B3FE1..4B4000: the Unit arm is Drive-only; Ship
                     //6A35E7..6A362C tests the crushable and wall bytes alone.
@@ -722,8 +749,8 @@ impl Simulation {
             id,
             coord_cell(candidate),
             call.rules,
-            call.registry,
-            call.frame_effects,
+            Some(call.rules.overlay_registry()),
+            &mut call.frame_effects,
         );
         //4B4066..4B4089: a false answer (a placed free vehicle): an owner in
         //limbo rejoins the ordinary path, a dead one ends the Process, and a
@@ -789,7 +816,7 @@ impl Simulation {
             }
             FreshDispatch::Retry(retry) => {
                 //4B420B..4B4219: recurse with arg3 = 1, nothing cleared.
-                self.track_process_movement(&call.with_args(ProcessMovementArgs {
+                self.track_process_movement(&mut call.with_args(ProcessMovementArgs {
                     allow_retry: retry.allow_retry,
                     force_single: retry.force_single_direction,
                 }))
@@ -798,7 +825,7 @@ impl Simulation {
                 //4B41B3..4B41F7: clear, then recurse with arg3 = 1.
                 self.substrate.clear_path_head(id);
                 self.substrate.track_retire_selector(id);
-                self.track_process_movement(&call.with_args(ProcessMovementArgs {
+                self.track_process_movement(&mut call.with_args(ProcessMovementArgs {
                     allow_retry: retry.allow_retry,
                     force_single: retry.force_single_direction,
                 }))
@@ -809,11 +836,11 @@ impl Simulation {
                     self.substrate.clear_path_head(id);
                     Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
-                        .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
+                        .track_process_movement(&mut call.with_args(ProcessMovementArgs::RETRY));
                 }
                 //4B4273..4B43BE: the CloseEnough stop.
                 if self.track_close_enough_stop(id, rules)? {
-                    if self.stop_or_take_next_waypoint(id, rules, call.frame_effects) {
+                    if self.stop_or_take_next_waypoint(id, rules, &mut call.frame_effects) {
                         return Ok(false);
                     }
                 } else {
@@ -822,8 +849,8 @@ impl Simulation {
                         id,
                         second_cell,
                         rules,
-                        call.registry,
-                        call.frame_effects,
+                        Some(call.rules.overlay_registry()),
+                        &mut call.frame_effects,
                     )?;
                 }
                 self.track_second_refused(call)
@@ -834,10 +861,10 @@ impl Simulation {
                 if retry.is_some() {
                     self.substrate.clear_path_head(id);
                     return self
-                        .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
+                        .track_process_movement(&mut call.with_args(ProcessMovementArgs::RETRY));
                 }
                 //4B448F..4B450D.
-                self.stop_or_take_next_waypoint(id, rules, call.frame_effects);
+                self.stop_or_take_next_waypoint(id, rules, &mut call.frame_effects);
                 Ok(false)
             }
             FreshDispatch::SecondRetryOrStop { retry } => {
@@ -846,10 +873,10 @@ impl Simulation {
                     self.substrate.clear_path_head(id);
                     Self::expire_movement_timer(&self.session, &mut self.substrate, id);
                     return self
-                        .track_process_movement(&call.with_args(ProcessMovementArgs::RETRY));
+                        .track_process_movement(&mut call.with_args(ProcessMovementArgs::RETRY));
                 }
                 //4B4561..4B45C8.
-                self.stop_or_take_next_waypoint(id, rules, call.frame_effects);
+                self.stop_or_take_next_waypoint(id, rules, &mut call.frame_effects);
                 Ok(false)
             }
             FreshDispatch::BlockedDelay
@@ -862,7 +889,7 @@ impl Simulation {
 
     /// 0x4B41B3..0x4B41E7 for a refused second candidate that does not
     /// recurse, then the finalize tail with a null candidate.
-    fn track_second_refused(&mut self, call: &FreshCall<'_>) -> Result<bool, String> {
+    fn track_second_refused(&mut self, call: &mut FreshCall<'_>) -> Result<bool, String> {
         self.substrate.clear_path_head(call.id);
         self.substrate.track_retire_selector(call.id);
         self.track_fresh_finalize(call, None, 0, 0)
@@ -872,7 +899,7 @@ impl Simulation {
     /// a null candidate records Cell (0,0) as the reference and stops.
     fn track_fresh_finalize(
         &mut self,
-        call: &FreshCall<'_>,
+        call: &mut FreshCall<'_>,
         candidate: Option<DriveCoord>,
         consumed: usize,
         turn_index: usize,
@@ -902,8 +929,13 @@ impl Simulation {
             loco.store_track_head(call.family, Some(candidate));
         }
         //4B46DF..4B46FA: the crate question on the head, then limbo.
-        let picked =
-            self.pickup_crate_at(id, reference, call.rules, call.registry, call.frame_effects);
+        let picked = self.pickup_crate_at(
+            id,
+            reference,
+            call.rules,
+            Some(call.rules.overlay_registry()),
+            &mut call.frame_effects,
+        );
         let actor = self
             .substrate
             .entities
@@ -918,6 +950,7 @@ impl Simulation {
                 id,
                 call.family,
                 true,
+                call.rules.ares_form(),
             );
             return Ok(false);
         }
@@ -932,7 +965,7 @@ impl Simulation {
     /// The live Unit+1AC answer for one candidate, arguments (cell, dir, h, 0, 1).
     fn track_can_enter(
         &self,
-        call: &FreshCall<'_>,
+        call: &mut FreshCall<'_>,
         cell: (i16, i16),
         direction: u8,
         height: i32,
@@ -951,7 +984,6 @@ impl Simulation {
                 previous_cell: None,
             },
             call.rules,
-            call.registry,
         )
     }
 
@@ -1015,7 +1047,7 @@ impl Simulation {
         else {
             return;
         };
-        let terrain_speed = self.terrain_speed_config().clone();
+        let terrain_speed = *self.terrain_speed_config();
         let Some(actor) = self.substrate.entities.get_mut(id) else {
             return;
         };
@@ -1113,7 +1145,22 @@ impl Simulation {
         cell: (i16, i16),
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> Result<(), String> {
+        self.scatter_blocked_track_list(id, cell, cell, rules, registry, frame_effects)
+    }
+
+    /// The same call with the deck flag read from `deck_cell` and the
+    /// objects taken from `list_cell`, which only the chain arm separates
+    /// (`0x004B1EC0..0x004B1F43`).
+    pub(super) fn scatter_blocked_track_list(
+        &mut self,
+        id: u64,
+        deck_cell: (i16, i16),
+        list_cell: (i16, i16),
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Result<(), String> {
         let Some(terrain) = self.resolved_terrain.as_ref() else {
             return Ok(());
@@ -1122,12 +1169,12 @@ impl Simulation {
             return Ok(());
         };
         let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
-        let native = cells.lookup(cell);
+        let native = cells.lookup(deck_cell);
         let level = i32::from(cells.ground_fields(native).0 as i8);
         let location = ground_pose::position_world_coord(&actor.position);
         let deck = cells.flags(native) & 0x100 != 0
             && (location.z / GROUND_LEVEL_HEIGHT_LEPTONS - level).abs() > 2;
-        self.scatter_cell_contacts(cell, deck, true, rules, registry, frame_effects)
+        self.scatter_cell_contacts(list_cell, deck, true, rules, registry, frame_effects)
     }
 
     /// `CellClass::Scatter_Objects(null, 1, no_kidding, deck)` on `cell`
@@ -1143,7 +1190,7 @@ impl Simulation {
         no_kidding: bool,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> Result<(), String> {
         #[cfg(test)]
         if super::fresh_oracle_seam::substitute(
@@ -1180,7 +1227,7 @@ impl Simulation {
     /// Cell the Foot rides or reaches from four levels above.
     fn track_crusher_pre_scatter(
         &mut self,
-        call: &FreshCall<'_>,
+        call: &mut FreshCall<'_>,
         cell: (i16, i16),
     ) -> Result<(), String> {
         let Some(terrain) = self.resolved_terrain.as_ref() else {
@@ -1224,8 +1271,8 @@ impl Simulation {
                 deck,
                 false,
                 call.rules,
-                call.registry,
-                call.frame_effects,
+                Some(call.rules.overlay_registry()),
+                &mut call.frame_effects,
             )?;
         }
         Ok(())
@@ -1240,7 +1287,7 @@ impl Simulation {
         cell: (i16, i16),
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         if cell.0 < 0 || cell.1 < 0 {
             return;
@@ -1288,7 +1335,7 @@ impl Simulation {
         id: u64,
         target: TargetKind,
         rules: &RuleSet,
-        frame_effects: FrameEffects<'_>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         #[cfg(test)]
         if super::fresh_oracle_seam::substitute(
@@ -1407,11 +1454,11 @@ impl crate::sim::world::ObjectSubstrate {
     /// the hashed `RuntimeBridgeTransitionState::pending_mismatch`.
     pub(super) fn latch_foot_68b(&mut self, id: u64) {
         if let Some(actor) = self.entities.get_mut(id) {
-            actor.runtime_bridge_transition.latch();
+            actor.seldom.runtime_bridge_transition.latch();
         }
     }
     /// Foot+5E0 = -1 on the live path word.
-    fn clear_path_head(&mut self, id: u64) {
+    pub(super) fn clear_path_head(&mut self, id: u64) {
         if let Some(actor) = self.entities.get_mut(id) {
             actor.clear_live_path_head();
         }
@@ -1442,8 +1489,15 @@ pub(crate) enum BlockingObject {
 const LAND_TUNNEL: u8 = 10;
 
 impl FreshCall<'_> {
-    fn with_args(&self, args: ProcessMovementArgs) -> Self {
-        Self { args, ..*self }
+    /// The same call with other arguments, lending this call's effects.
+    fn with_args(&mut self, args: ProcessMovementArgs) -> FreshCall<'_> {
+        FreshCall {
+            id: self.id,
+            family: self.family,
+            args,
+            rules: self.rules,
+            frame_effects: self.frame_effects.reborrow(),
+        }
     }
 }
 
@@ -1455,10 +1509,93 @@ pub(super) fn fresh_heading_ready(body_facing: u16, direction: u8) -> bool {
     body_facing == u16::from(direction) << 13
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
     use crate::sim::mission::MissionId;
+
+    #[test]
+    fn train_extends_its_remaining_head_toward_the_original_destination() {
+        let (mut sim, rules, _) = crate::sim::world::entry_test_fixture::fixture_with_rules(
+            "[VehicleTypes]\n0=TRAIN\n[TRAIN]\nStrength=400\nSpeed=5\nSpeedType=Track\n\
+             MovementZone=Normal\nIsTrain=yes\nLocomotor={4A582741-9839-11D1-B709-00A024DDAFD1}\n",
+        );
+        let start = (15, 15);
+        let goal = (15, 21);
+        let id = sim
+            .spawn_object("TRAIN", "Americans", start.0, start.1, 64, &rules)
+            .unwrap();
+        let mut effects = FrameEffects::default();
+        assert!(sim.set_unit_destination(
+            id,
+            NavTargetRef::cell(goal.0, goal.1),
+            &rules,
+            true,
+            &mut effects
+        ));
+        let frame = sim.session.binary_frame();
+        let actor = sim.substrate.entities.get_mut(id).unwrap();
+        actor.body_facing.snap(0x4000, frame);
+        actor
+            .navigation
+            .path_replay_mut()
+            .set_directions_for_test(vec![2]); // east
+        sim.run_track_process_movement(
+            id,
+            TrackFamily::Drive,
+            ProcessMovementArgs::OUTER,
+            &rules,
+            &mut effects,
+        )
+        .unwrap();
+
+        let queue = sim
+            .substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .navigation
+            .path_replay();
+        assert_eq!(
+            queue.directions().first(),
+            Some(&2),
+            "retain the unpaid east step"
+        );
+        assert_eq!(
+            queue.installed_cells(start).last(),
+            Some(&goal),
+            "search from the end of that step"
+        );
+    }
+
+    /// Unit73F865 supplies code 6 for a stationary ally. Find_Path4D3AA5
+    /// keeps that distant occupied destination only for the train.
+    #[test]
+    fn train_keeps_the_distant_cell_occupied_by_a_parked_ally() {
+        let (mut sim, rules, _) = crate::sim::world::entry_test_fixture::fixture_with_rules(
+            "[VehicleTypes]\n0=ENGINE\n1=TRUCK\n\
+             [ENGINE]\nStrength=400\nSpeed=5\nSpeedType=Track\nMovementZone=Normal\n\
+             IsTrain=yes\nLocomotor={4A582741-9839-11D1-B709-00A024DDAFD1}\n\
+             [TRUCK]\nStrength=400\nSpeed=5\nSpeedType=Track\nMovementZone=Normal\n\
+             Locomotor={4A582741-9839-11D1-B709-00A024DDAFD1}\n",
+        );
+        let destination = DriveCoord::cell(19, 15, 0);
+        sim.spawn_object("TRUCK", "Americans", 19, 15, 0, &rules)
+            .unwrap();
+        for (kind, y, keeps_goal) in [("ENGINE", 15, true), ("TRUCK", 16, false)] {
+            let mover = sim
+                .spawn_object(kind, "Americans", 15, y, 0, &rules)
+                .unwrap();
+            let answer = sim
+                .find_path_target_answer(mover, destination, &rules)
+                .unwrap();
+            assert_eq!(answer, Some(6), "{kind} encounters the stationary ally");
+            let redirect = sim
+                .find_path_redirect(mover, destination, answer.unwrap(), &rules)
+                .unwrap();
+            assert_eq!(redirect.is_none(), keeps_goal, "{kind}: {redirect:?}");
+        }
+    }
 
     #[test]
     fn terrain_blocker_response_preserves_object_target_and_move_archive() {
@@ -1510,16 +1647,19 @@ mod tests {
                     previous_cell: None,
                 },
                 &rules,
-                None,
             )
             .expect("real Unit entry receiver"),
             5,
             "stock AP Wood admits the live Terrain as a destructible blocker"
         );
         let destination = NavTargetRef::cell(14, 10);
-        assert!(
-            sim.set_unit_destination(tank, destination, &rules, true, FrameEffects::default(),)
-        );
+        assert!(sim.set_unit_destination(
+            tank,
+            destination,
+            &rules,
+            true,
+            &mut FrameEffects::default(),
+        ));
         sim.substrate
             .mission_assign_exact(tank, MissionId::from_known(MissionType::Move), 0)
             .unwrap();
@@ -1534,7 +1674,13 @@ mod tests {
             Some(MissionType::Move)
         );
 
-        sim.override_movement_blocker_at(tank, (11, 10), &rules, None, FrameEffects::default());
+        sim.override_movement_blocker_at(
+            tank,
+            (11, 10),
+            &rules,
+            None,
+            &mut FrameEffects::default(),
+        );
 
         let actor = sim.substrate.entities.get(tank).unwrap();
         assert_eq!(actor.mission.effective().known(), Some(MissionType::Attack));
@@ -1549,7 +1695,7 @@ mod tests {
         // native save timing. Native load resets Scenario RNG, so these two
         // continuations assert the loop outcome, not matching clocks/hashes.
         let terrain = sim.resolved_terrain.as_ref().unwrap().clone();
-        let speed_config = sim.terrain_speed_config().clone();
+        let speed_config = *sim.terrain_speed_config();
         let bytes =
             crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "Terrain blocker interrupt", 0);
         let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)

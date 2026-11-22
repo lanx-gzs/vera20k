@@ -59,7 +59,7 @@ pub struct GlyphEntry {
     pub uv_size: [f32; 2],
     pub pixel_width: f32,
     pub(crate) glyph_id: u16,
-    /// Drawn on the full-cell CJK grid ([`crate::render::text_engine::fonts::is_cjk_sized`]).
+    /// Drawn on the full-cell CJK grid ([`crate::i18n::is_cjk_sized`]).
     pub(crate) cjk: bool,
 }
 
@@ -70,7 +70,7 @@ impl GlyphEntry {
             uv_size: [0.0; 2],
             pixel_width: pixel_width as f32,
             glyph_id,
-            cjk: crate::render::text_engine::fonts::is_cjk_sized(u32::from(codepoint)),
+            cjk: crate::i18n::is_cjk_sized(u32::from(codepoint)),
         }
     }
 }
@@ -130,6 +130,8 @@ pub struct BitFont {
     pub(crate) tab_width: u32,
     pub(crate) tab_origin: u32,
     pub(crate) darken_texture: Option<BatchTexture>,
+    /// A `RefCell`, like `fit` and `raster`: every text draw measures and
+    /// lays out through the one `&BitFont` the renderer lends all passes.
     engine: RefCell<TextEngine>,
     /// GPU-free test fonts: every text takes the native path and places
     /// whole cells, as GAME.FNT's own glyph table did.
@@ -242,15 +244,6 @@ impl BitFont {
         self.cell_height as f32
     }
 
-    /// The interface language's tag, for region-specific CJK glyph forms
-    /// and its reading direction (`i18n::right_to_left`).
-    pub fn set_locale(&mut self, locale: &str) {
-        let right_to_left = crate::i18n::right_to_left(locale);
-        self.engine
-            .get_mut()
-            .set_locale(Some(locale), right_to_left);
-    }
-
     /// Measure and draw at `fit` for the length of `draw`.
     pub fn fitted<R>(&self, fit: Fit, draw: impl FnOnce(&BitFont) -> R) -> R {
         let outer = self.fit.replace(fit);
@@ -326,18 +319,6 @@ impl BitFont {
     /// from `fnt` would give this font again.
     pub(crate) fn is_built_from(&self, fnt: &FntFile) -> bool {
         self.source_identity.is_some() && self.source_identity.as_ref() == fnt.source_identity()
-    }
-
-    /// Take `previous`'s language, for a font rebuilt from a scenario's
-    /// GAME.FNT.
-    pub fn inherit_settings(&mut self, previous: &BitFont) {
-        let (locale, right_to_left) = {
-            let engine = previous.engine.borrow();
-            (engine.locale().map(str::to_owned), engine.right_to_left())
-        };
-        self.engine
-            .get_mut()
-            .set_locale(locale.as_deref(), right_to_left);
     }
 
     /// Start a frame: the glyph atlas may empty or grow here, never while
@@ -849,8 +830,7 @@ impl BitFont {
                 // deferred glyph changes subsequent native line boundaries.
                 let deferred_byte = chars[i - 1].0;
                 // Hanzi break between any two; anything else was a word.
-                split_word |=
-                    !crate::render::text_engine::fonts::is_cjk_sized(chars[i - 1].1 as u32);
+                split_word |= !crate::i18n::is_cjk_sized(chars[i - 1].1 as u32);
                 lines.push(LineSpan {
                     start_byte: line_start_byte,
                     end_byte: deferred_byte,
@@ -1180,7 +1160,7 @@ impl BitFont {
     }
 }
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 pub(crate) mod tests {
     use super::*;
 

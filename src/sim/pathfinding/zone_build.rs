@@ -215,6 +215,7 @@ pub(crate) fn build_base_zone_topology(
     rebuild_base_zone_topology(
         movement_classes,
         retained_levels_from_path(path_grid, width, height),
+        resolved_terrain.terrain_deformation(),
         bridge_records,
         width,
         height,
@@ -228,6 +229,7 @@ pub(crate) fn build_base_zone_topology(
 pub(crate) fn rebuild_base_zone_topology(
     movement_classes: Vec<u8>,
     levels: Vec<u8>,
+    signed_levels: bool,
     bridge_records: &[BridgeEndpointRecord],
     width: u16,
     height: u16,
@@ -240,7 +242,7 @@ pub(crate) fn rebuild_base_zone_topology(
 
     assert_eq!(levels.len(), movement_classes.len());
     let (zone_ids, zone_count, mut edge_buckets) =
-        rebuild_node_indices(&movement_classes, &levels, width, height);
+        rebuild_node_indices(&movement_classes, &levels, signed_levels, width, height);
     register_bridge_base_edges(
         &mut edge_buckets,
         &zone_ids,
@@ -250,16 +252,22 @@ pub(crate) fn rebuild_base_zone_topology(
     );
     let adjacency = edge_buckets.into_adjacency(zone_count);
 
-    let raw_zone_ids_by_row = std::array::from_fn(|row| {
+    // Each movement row derives its zones from the shared graph alone, so the
+    // rows run on the worker pool; `parallel::map` keeps them in row order.
+    let grid = crate::map::cell_index::CellGrid::for_extent(width, height);
+    let node_classes = node_movement_classes(&movement_classes, &zone_ids, zone_count);
+    let rows = crate::sim::parallel::map(MovementZone::all_ground(), |&movement_zone| {
         rebuild_zone_ids_for_movement_zone(
-            &movement_classes,
-            &zone_ids,
+            &node_classes,
             zone_count,
             &adjacency,
-            MovementZone::all_ground()[row],
-            crate::map::cell_index::CellGrid::for_extent(width, height),
+            movement_zone,
+            grid,
         )
     });
+    let raw_zone_ids_by_row = rows
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("all_ground lists the 13 concrete movement rows"));
 
     BaseZoneTopology {
         native_bridge_source_size,
@@ -332,12 +340,22 @@ fn retained_levels_from_path(path_grid: &PathGrid, width: u16, height: u16) -> V
 fn rebuild_node_indices(
     movement_classes: &[u8],
     levels: &[u8],
+    signed_levels: bool,
     width: u16,
     height: u16,
 ) -> (Vec<ZoneId>, ZoneId, BaseEdgeBuckets) {
-    let mut node_indices = vec![0 as ZoneId; movement_classes.len()];
+    let mut fill = BaseZoneFill {
+        movement_classes,
+        levels,
+        signed_levels,
+        width,
+        height,
+        node_indices: vec![0 as ZoneId; movement_classes.len()],
+        edge_buckets: BaseEdgeBuckets::new(),
+    };
     let mut next_node: ZoneId = 1;
-    let mut edge_buckets = BaseEdgeBuckets::new();
+    // One stack of pending runs serves every zone's fill.
+    let mut pending = Vec::new();
 
     for ry in 0..height {
         let mut rx = 0i32;
@@ -347,21 +365,12 @@ fn rebuild_node_indices(
                 continue;
             }
             let idx = ry as usize * width as usize + rx as usize;
-            if movement_classes[idx] == zone_class::OUTSIDE || node_indices[idx] != 0 {
+            if movement_classes[idx] == zone_class::OUTSIDE || fill.node_indices[idx] != 0 {
                 rx += 1;
                 continue;
             }
-            let run_advance = flood_fill_node_index(
-                rx as u16,
-                ry,
-                next_node,
-                movement_classes,
-                &mut node_indices,
-                levels,
-                width,
-                height,
-                &mut edge_buckets,
-            );
+            let run_advance =
+                fill.flood_fill_node_index(rx, i32::from(ry), next_node, &mut pending);
             next_node += 1;
             // Native rechecks the returned rightmost run cell; the ordinary
             // assigned-cell branch then advances past it.
@@ -369,170 +378,223 @@ fn rebuild_node_indices(
         }
     }
 
-    (node_indices, next_node.saturating_sub(1), edge_buckets)
+    (
+        fill.node_indices,
+        next_node.saturating_sub(1),
+        fill.edge_buckets,
+    )
 }
 
-fn flood_fill_node_index(
-    start_x: u16,
-    start_y: u16,
-    node_id: ZoneId,
-    movement_classes: &[u8],
-    node_indices: &mut [ZoneId],
-    levels: &[u8],
+/// The retained class and Level bytes one base-zone pass reads, and the zone
+/// IDs and edges it writes.
+struct BaseZoneFill<'a> {
+    movement_classes: &'a [u8],
+    levels: &'a [u8],
+    signed_levels: bool,
     width: u16,
     height: u16,
-    edge_buckets: &mut BaseEdgeBuckets,
-) -> i32 {
-    let start_idx = start_y as usize * width as usize + start_x as usize;
-    let movement_class = movement_classes[start_idx];
-    let seed_x = i32::from(start_x);
-    let seed_y = i32::from(start_y);
-    let Some(mut carried_level) = base_level_at(levels, seed_x, seed_y, width, height) else {
-        return 0;
-    };
+    node_indices: Vec<ZoneId>,
+    edge_buckets: BaseEdgeBuckets,
+}
 
-    // The native scan first walks left with a carried <=1 height reference.
-    // Horizontal scans overwrite prior zone IDs; only vertical recursion tests
-    // for an unassigned candidate.
-    let mut left = seed_x;
-    while let Some(index) = base_record_index(left, seed_y, width, height) {
-        if movement_classes[index] != movement_class {
-            break;
-        }
-        let Some(level) = base_level_at(levels, left, seed_y, width, height) else {
-            break;
+/// One filled scanline run whose adjacent rows are still being scanned: the
+/// state one native recursion level keeps in its frame.
+struct ScanlineRun {
+    seed_x: i32,
+    seed_y: i32,
+    /// The first cells left and right of the run.
+    left: i32,
+    right: i32,
+    /// The adjacent-row cell scanned next, in the row above until that row is
+    /// done, then in the row below.
+    scan_x: i32,
+    below: bool,
+}
+
+impl BaseZoneFill<'_> {
+    /// `MapClass__FloodFillBaseZoneScanline @ 0x0056CB90`: fills the run
+    /// through the seed, then each unassigned cell of the same class in the
+    /// rows above and below it, and returns how far the caller's scan
+    /// advances.
+    ///
+    /// Native calls itself at 0x0056CEB5 and 0x0056D000. VERA keeps the
+    /// pending runs on the heap so a winding zone can be filled in the same
+    /// depth-first order even when it exceeds the browser's call stack.
+    fn flood_fill_node_index(
+        &mut self,
+        start_x: i32,
+        start_y: i32,
+        node_id: ZoneId,
+        pending: &mut Vec<ScanlineRun>,
+    ) -> i32 {
+        let start_idx = start_y as usize * self.width as usize + start_x as usize;
+        // Every run below the seed's is entered only on a cell of this class.
+        let movement_class = self.movement_classes[start_idx];
+        let Some(seed_level) =
+            base_level_at(self.levels, start_x, start_y, self.width, self.height)
+        else {
+            return 0;
         };
-        if (i16::from(level) - i16::from(carried_level)).abs() >= 2 {
-            break;
-        }
-        node_indices[index] = node_id;
-        carried_level = level;
-        left -= 1;
-    }
-    register_scanline_edge(
-        edge_buckets,
-        left,
-        seed_y,
-        left + 1,
-        seed_y,
-        node_id,
-        movement_class,
-        node_indices,
-        levels,
-        width,
-        height,
-    );
 
-    // Right starts at the seed but retains the level carried out of the left
-    // scan. The retail comparison is strictly <4.
-    let mut right = seed_x;
-    while let Some(index) = base_record_index(right, seed_y, width, height) {
-        if movement_classes[index] != movement_class {
-            break;
-        }
-        let Some(level) = base_level_at(levels, right, seed_y, width, height) else {
-            break;
-        };
-        if (i16::from(level) - i16::from(carried_level)).abs() >= 4 {
-            break;
-        }
-        node_indices[index] = node_id;
-        carried_level = level;
-        right += 1;
-    }
-    register_scanline_edge(
-        edge_buckets,
-        right,
-        seed_y,
-        right - 1,
-        seed_y,
-        node_id,
-        movement_class,
-        node_indices,
-        levels,
-        width,
-        height,
-    );
-
-    // Both adjacent-row scans include the two flanks [L-1, R+1]. Their
-    // current-row reference is one cell right, clamped to R.
-    let mut scan_x = left;
-    let run_right = right - 1;
-    while scan_x <= right {
-        let candidate_y = seed_y - 1;
-        let reference_x = (scan_x + 1).min(run_right);
-        if let (Some(candidate), Some(candidate_level), Some(reference_level)) = (
-            base_record_index(scan_x, candidate_y, width, height),
-            base_level_at(levels, scan_x, candidate_y, width, height),
-            base_level_at(levels, reference_x, seed_y, width, height),
-        ) {
-            let neighbor = node_indices[candidate];
-            let height_allowed =
-                (i16::from(candidate_level) - i16::from(reference_level)).abs() < 2;
-            if neighbor == 0 && movement_classes[candidate] == movement_class && height_allowed {
-                let child_advance = flood_fill_node_index(
-                    scan_x as u16,
-                    candidate_y as u16,
-                    node_id,
-                    movement_classes,
-                    node_indices,
-                    levels,
-                    width,
-                    height,
-                    edge_buckets,
-                );
-                // Above advances beyond the returned child run.
-                scan_x += child_advance + 1;
+        let root = self.fill_run(start_x, start_y, seed_level, node_id, movement_class);
+        pending.push(root);
+        while let Some(run) = pending.last_mut() {
+            if let Some((x, y, level)) = self.next_child_seed(run, node_id, movement_class) {
+                let child = self.fill_run(x, y, level, node_id, movement_class);
+                pending.push(child);
                 continue;
-            } else if neighbor != 0
-                && neighbor != node_id
-                && (height_allowed || movement_class == zone_class::IMPASSABLE)
-            {
-                edge_buckets.register(neighbor, node_id);
             }
+            let advance = run.right - run.seed_x - 1;
+            pending.pop();
+            let Some(parent) = pending.last_mut() else {
+                return advance;
+            };
+            // Retail rechecks the rightmost cell in both rows. VERA's upper
+            // scan skips that recheck since the child already marked the cell
+            // with this zone ID. Keep the previous scan order on both rows.
+            parent.scan_x += if parent.below { advance } else { advance + 1 };
         }
-        scan_x += 1;
+        unreachable!("the root run's pop returns")
     }
 
-    // Below uses the same range/reference mapping, but rechecks the returned
-    // child run's rightmost cell once before advancing.
-    scan_x = left;
-    while scan_x <= right {
-        let candidate_y = seed_y + 1;
-        let reference_x = (scan_x + 1).min(run_right);
-        if let (Some(candidate), Some(candidate_level), Some(reference_level)) = (
-            base_record_index(scan_x, candidate_y, width, height),
-            base_level_at(levels, scan_x, candidate_y, width, height),
-            base_level_at(levels, reference_x, seed_y, width, height),
-        ) {
-            let neighbor = node_indices[candidate];
-            let height_allowed =
-                (i16::from(candidate_level) - i16::from(reference_level)).abs() < 2;
-            if neighbor == 0 && movement_classes[candidate] == movement_class && height_allowed {
-                let child_advance = flood_fill_node_index(
-                    scan_x as u16,
-                    candidate_y as u16,
-                    node_id,
-                    movement_classes,
-                    node_indices,
-                    levels,
-                    width,
-                    height,
-                    edge_buckets,
-                );
-                scan_x += child_advance;
+    /// The seed row's scans, before the native function looks at the rows
+    /// above and below.
+    fn fill_run(
+        &mut self,
+        seed_x: i32,
+        seed_y: i32,
+        seed_level: u8,
+        node_id: ZoneId,
+        movement_class: u8,
+    ) -> ScanlineRun {
+        let (width, height) = (self.width, self.height);
+        let mut carried_level = seed_level;
+
+        // The native scan first walks left with a carried <=1 height reference.
+        // Horizontal scans overwrite prior zone IDs; only vertical recursion tests
+        // for an unassigned candidate.
+        let mut left = seed_x;
+        while let Some(index) = base_record_index(left, seed_y, width, height) {
+            if self.movement_classes[index] != movement_class {
+                break;
+            }
+            let Some(level) = base_level_at(self.levels, left, seed_y, width, height) else {
+                break;
+            };
+            if level_gap(level, carried_level, self.signed_levels) >= 2 {
+                break;
+            }
+            self.node_indices[index] = node_id;
+            carried_level = level;
+            left -= 1;
+        }
+        register_scanline_edge(
+            &mut self.edge_buckets,
+            left,
+            seed_y,
+            left + 1,
+            seed_y,
+            node_id,
+            movement_class,
+            &self.node_indices,
+            self.levels,
+            self.signed_levels,
+            width,
+            height,
+        );
+
+        // Right starts at the seed but retains the level carried out of the left
+        // scan. The retail comparison is strictly <4.
+        let mut right = seed_x;
+        while let Some(index) = base_record_index(right, seed_y, width, height) {
+            if self.movement_classes[index] != movement_class {
+                break;
+            }
+            let Some(level) = base_level_at(self.levels, right, seed_y, width, height) else {
+                break;
+            };
+            if level_gap(level, carried_level, self.signed_levels) >= 4 {
+                break;
+            }
+            self.node_indices[index] = node_id;
+            carried_level = level;
+            right += 1;
+        }
+        register_scanline_edge(
+            &mut self.edge_buckets,
+            right,
+            seed_y,
+            right - 1,
+            seed_y,
+            node_id,
+            movement_class,
+            &self.node_indices,
+            self.levels,
+            self.signed_levels,
+            width,
+            height,
+        );
+
+        ScanlineRun {
+            seed_x,
+            seed_y,
+            left,
+            right,
+            scan_x: left,
+            below: false,
+        }
+    }
+
+    /// Scans `run`'s adjacent rows on from `run.scan_x` and stops at the next
+    /// cell the native function calls itself on, returned with its Level;
+    /// `None` once both rows are done.
+    fn next_child_seed(
+        &mut self,
+        run: &mut ScanlineRun,
+        node_id: ZoneId,
+        movement_class: u8,
+    ) -> Option<(i32, i32, u8)> {
+        let (width, height) = (self.width, self.height);
+        loop {
+            // Both adjacent-row scans include the two flanks [L-1, R+1]. Their
+            // current-row reference is one cell right, clamped to R.
+            if run.scan_x > run.right {
+                if run.below {
+                    return None;
+                }
+                run.below = true;
+                run.scan_x = run.left;
                 continue;
-            } else if neighbor != 0
-                && neighbor != node_id
-                && (height_allowed || movement_class == zone_class::IMPASSABLE)
-            {
-                edge_buckets.register(neighbor, node_id);
             }
+            let candidate_y = if run.below {
+                run.seed_y + 1
+            } else {
+                run.seed_y - 1
+            };
+            let reference_x = (run.scan_x + 1).min(run.right - 1);
+            if let (Some(candidate), Some(candidate_level), Some(reference_level)) = (
+                base_record_index(run.scan_x, candidate_y, width, height),
+                base_level_at(self.levels, run.scan_x, candidate_y, width, height),
+                base_level_at(self.levels, reference_x, run.seed_y, width, height),
+            ) {
+                let neighbor = self.node_indices[candidate];
+                let height_allowed =
+                    level_gap(candidate_level, reference_level, self.signed_levels) < 2;
+                if neighbor == 0
+                    && self.movement_classes[candidate] == movement_class
+                    && height_allowed
+                {
+                    return Some((run.scan_x, candidate_y, candidate_level));
+                } else if neighbor != 0
+                    && neighbor != node_id
+                    && (height_allowed || movement_class == zone_class::IMPASSABLE)
+                {
+                    self.edge_buckets.register(neighbor, node_id);
+                }
+            }
+            run.scan_x += 1;
         }
-        scan_x += 1;
     }
-
-    right - seed_x - 1
 }
 
 fn base_record_index(x: i32, y: i32, width: u16, height: u16) -> Option<usize> {
@@ -546,6 +608,22 @@ fn base_level_at(levels: &[u8], x: i32, y: i32, width: u16, height: u16) -> Opti
     levels.get(base_record_index(x, y, width, height)?).copied()
 }
 
+/// Height gap between two retained zone Levels. Native reads both bytes
+/// zero-extended (`MapClass__FloodFillBaseZoneScanline @ 0x0056CBC0` and
+/// `MapClass__FloodFillZoneLevelScanline @ 0x0058253C`: `xor eax,eax;
+/// mov al,[record]`), the signed gap for every Level below 128. Terrain
+/// deformation lowers ground below Level 0, so with it switched on
+/// ([`ResolvedTerrainGrid::terrain_deformation`]) they read signed, as a
+/// cell's own height is; unsigned, a crater would split from the ground
+/// around it at the next zone rebuild.
+pub(super) fn level_gap(a: u8, b: u8, signed: bool) -> u8 {
+    if signed {
+        (a as i8).abs_diff(b as i8)
+    } else {
+        a.abs_diff(b)
+    }
+}
+
 fn register_scanline_edge(
     edge_buckets: &mut BaseEdgeBuckets,
     candidate_x: i32,
@@ -556,6 +634,7 @@ fn register_scanline_edge(
     captured_class: u8,
     node_indices: &[ZoneId],
     levels: &[u8],
+    signed_levels: bool,
     width: u16,
     height: u16,
 ) {
@@ -571,7 +650,7 @@ fn register_scanline_edge(
         base_level_at(levels, reference_x, reference_y, width, height),
     ) {
         (Some(candidate_level), Some(reference_level)) => {
-            (i16::from(candidate_level) - i16::from(reference_level)).abs() < 2
+            level_gap(candidate_level, reference_level, signed_levels) < 2
         }
         _ => false,
     };
@@ -580,21 +659,30 @@ fn register_scanline_edge(
     }
 }
 
-fn rebuild_zone_ids_for_movement_zone(
+/// Each base node's movement class: that of its first cell in cell order.
+/// Every movement row reads the same table, so a rebuild scans the cells
+/// for it once rather than once per row.
+fn node_movement_classes(
     movement_classes: &[u8],
     node_indices: &[ZoneId],
     node_count: ZoneId,
-    node_adj: &[Vec<ZoneId>],
-    movement_zone: MovementZone,
-    grid: crate::map::cell_index::CellGrid,
-) -> Vec<ZoneId> {
+) -> Vec<u8> {
     let mut node_movement_classes = vec![zone_class::OUTSIDE; node_count as usize + 1];
     for (&node, &movement_class) in node_indices.iter().zip(movement_classes.iter()) {
         if node != 0 && node_movement_classes[node as usize] == zone_class::OUTSIDE {
             node_movement_classes[node as usize] = movement_class;
         }
     }
+    node_movement_classes
+}
 
+fn rebuild_zone_ids_for_movement_zone(
+    node_movement_classes: &[u8],
+    node_count: ZoneId,
+    node_adj: &[Vec<ZoneId>],
+    movement_zone: MovementZone,
+    grid: crate::map::cell_index::CellGrid,
+) -> Vec<ZoneId> {
     let Some(row_index) = movement_zone.matrix_row() else {
         return vec![0 as ZoneId; node_count as usize + 1];
     };
@@ -608,11 +696,12 @@ fn rebuild_zone_ids_for_movement_zone(
     }
 
     let mut next_label: ZoneId = 2;
+    // Each label's walk empties the queue, so one serves them all.
+    let mut queue = VecDeque::new();
     for start_node in 1..=node_count {
         if zone_id_by_node[start_node as usize] != 0 {
             continue;
         }
-        let mut queue = VecDeque::new();
         zone_id_by_node[start_node as usize] = next_label;
         queue.push_back(start_node);
 
@@ -750,26 +839,40 @@ pub(crate) fn find_high_bridge_record_index(
         .enumerate()
         .skip(start_index)
         .find(|(_, record)| {
-            if !record.is_high() {
-                return false;
-            }
-            //56DA10 compares signed endpoint words and widens before distance.
-            let (ax, ay) = (
-                i32::from(record.endpoint_a.0 as i16),
-                i32::from(record.endpoint_a.1 as i16),
-            );
-            let (bx, by) = (
-                i32::from(record.endpoint_b.0 as i16),
-                i32::from(record.endpoint_b.1 as i16),
-            );
-            let (qx, qy) = (i32::from(query.0 as i16), i32::from(query.1 as i16));
-            if ax == bx {
-                qy >= ay && qy <= by && (qx - ax).abs() <= i32::from(tolerance)
-            } else {
-                qx >= ax && qx <= bx && (qy - ay).abs() <= i32::from(tolerance)
-            }
+            high_record_reaches_row(record, query.1, tolerance)
+                && high_record_reaches_column(record, query.0, tolerance)
         })
         .map(|(index, _)| index)
+}
+
+///56DA10 compares signed endpoint words and widens before distance.
+fn signed_endpoints(record: &BridgeEndpointRecord) -> ((i32, i32), (i32, i32)) {
+    let widen = |(x, y): (u16, u16)| (i32::from(x as i16), i32::from(y as i16));
+    (widen(record.endpoint_a), widen(record.endpoint_b))
+}
+
+/// The row half of `find_high_bridge_record`'s test: whether a high record
+/// can match some cell of row `y`.
+fn high_record_reaches_row(record: &BridgeEndpointRecord, y: u16, tolerance: u16) -> bool {
+    let ((ax, ay), (bx, by)) = signed_endpoints(record);
+    let qy = i32::from(y as i16);
+    record.is_high()
+        && if ax == bx {
+            qy >= ay && qy <= by
+        } else {
+            (qy - ay).abs() <= i32::from(tolerance)
+        }
+}
+
+/// The column half of `find_high_bridge_record`'s test.
+fn high_record_reaches_column(record: &BridgeEndpointRecord, x: u16, tolerance: u16) -> bool {
+    let ((ax, _), (bx, _)) = signed_endpoints(record);
+    let qx = i32::from(x as i16);
+    if ax == bx {
+        (qx - ax).abs() <= i32::from(tolerance)
+    } else {
+        qx >= ax && qx <= bx
+    }
 }
 
 ///583180/5835D0 subtract packed words before floating distance and retain
@@ -791,19 +894,28 @@ pub(crate) fn build_bridge_redirect(
     bridge_records: &[BridgeEndpointRecord],
     width: u16,
     height: u16,
-) -> Option<Vec<Option<(u16, u16)>>> {
+) -> Option<super::zone_map::BridgeRedirect> {
     let terrain = resolved_terrain?;
 
-    let total = width as usize * height as usize;
-    let mut redirect: Vec<Option<(u16, u16)>> = vec![None; total];
-    let mut has_structural_cell = false;
-
-    for ry in 0..height {
+    // Each cell's entry reads only the terrain and the records, so the rows
+    // run on the worker pool; `parallel::map` keeps them in row order.
+    let rows: Vec<u16> = (0..height).collect();
+    let rows = crate::sim::parallel::map(&rows, |&ry| {
+        // Only the records that reach this row can match one of its cells,
+        // and they keep their order, so the first match is unchanged.
+        let bridge_records: Vec<BridgeEndpointRecord> = bridge_records
+            .iter()
+            .filter(|record| high_record_reaches_row(record, ry, 1))
+            .copied()
+            .collect();
+        let bridge_records = bridge_records.as_slice();
+        let mut row: Vec<Option<(u16, u16)>> = vec![None; usize::from(width)];
+        let mut has_structural_cell = false;
         for rx in 0..width {
             let Some(cell) = terrain.cell(rx, ry) else {
                 continue;
             };
-            let idx = ry as usize * width as usize + rx as usize;
+            let idx = usize::from(rx);
             if !cell.bridge_facts.has_structural_bridge() {
                 // A nonstructural cell keeps its own ground zone on the bridge
                 // layer only where a high record actually reaches it — the deck
@@ -811,17 +923,19 @@ pub(crate) fn build_bridge_redirect(
                 // have no bridge layer at all; that includes every cell of a low
                 // bridge, which is ground movement rather than deck movement.
                 if find_high_bridge_record(bridge_records, 0, (rx, ry), 1).is_some() {
-                    redirect[idx] = Some((rx, ry));
+                    row[idx] = Some((rx, ry));
                 }
                 continue;
             }
             has_structural_cell = true;
 
-            redirect[idx] = bridge_redirect_for_structural_cell(terrain, bridge_records, (rx, ry));
+            row[idx] = bridge_redirect_for_structural_cell(terrain, bridge_records, (rx, ry));
         }
-    }
+        (row, has_structural_cell)
+    });
 
-    has_structural_cell.then_some(redirect)
+    let has_structural_cell = rows.iter().any(|(_, structural)| *structural);
+    has_structural_cell.then(|| rows.into_iter().flat_map(|(row, _)| row).collect())
 }
 
 /// `MapClass::GetZoneID` 0x0056D230, bridge branch. Verified term by term
@@ -889,7 +1003,7 @@ pub(crate) use tests::{
     assert_native_hierarchy_graphs, hierarchy_native_bounds, hierarchy_native_fixture,
 };
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 mod tests {
     use super::hierarchy::*;
     use crate::sim::pathfinding::zone_hierarchy::{ZoneHierarchy, ZoneRecord};
@@ -909,13 +1023,10 @@ mod tests {
         query: (u16, u16),
         enabled: bool,
     ) -> (u16, u16) {
-        let cell = crate::sim::cell_rect::get_cellclass_fallback(
-            Some(terrain),
-            i32::from(query.0 as i16),
-            i32::from(query.1 as i16),
-        );
+        let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        let cell = cells.lookup((query.0 as i16, query.1 as i16));
         crate::sim::pathfinding::zone_search::native_path_entry::live_hierarchy_projection(
-            terrain, records, &cell, enabled, None,
+            &cells, records, cell, enabled, None,
         )
         .expect("fixture has an addressable terminating projection")
     }
@@ -950,10 +1061,10 @@ mod tests {
         assert_eq!(movement_classes.len(), zone_ids.len());
         let zone_count = zone_ids.iter().copied().max().unwrap_or(ZONE_INVALID);
         let adjacency = vec![Vec::new(); zone_count as usize + 1];
+        let node_classes = node_movement_classes(&movement_classes, &zone_ids, zone_count);
         let raw_zone_ids_by_row = std::array::from_fn(|row| {
             rebuild_zone_ids_for_movement_zone(
-                &movement_classes,
-                &zone_ids,
+                &node_classes,
                 zone_count,
                 &adjacency,
                 MovementZone::all_ground()[row],
@@ -1278,6 +1389,13 @@ mod tests {
 
     #[test]
     fn gsi_04_12_hierarchy_projection_no_record_ties_choose_east_and_south() {
+        use crate::map::resolved_terrain::NativeCellQuery;
+        use crate::sim::cell_rect::PlayfieldBounds;
+        use crate::sim::pathfinding::zone_map::ZoneQueryCell::{Copied, Retained};
+        use crate::sim::pathfinding::zone_search::native_path_entry::{
+            live_hierarchy_projection, resolve_bridge_endpoint,
+        };
+
         let horizontal = redirect_terrain(7, 5, Some(100), None, |cell| {
             if cell.ry == 2 && (2..=4).contains(&cell.rx) {
                 cell.bridge_facts.raw_flags = crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL
@@ -1291,6 +1409,23 @@ mod tests {
             project_live_cell_for_test(&horizontal, &[], (3, 2), true),
             (5, 2)
         );
+        let cells = NativeCellQuery::canonical(&horizontal);
+        assert_eq!(
+            resolve_bridge_endpoint(&cells, &[], Copied((3, 2)), Copied((1, 2)), None),
+            Ok((1, 2)),
+            "5833F0's no-record search measures from its separate reference"
+        );
+        let records = [BridgeEndpointRecord {
+            endpoint_a: (1, 1),
+            endpoint_b: (5, 1),
+            active: true,
+            bridge_kind: BridgeRecordKind::High,
+        }];
+        assert_eq!(
+            resolve_bridge_endpoint(&cells, &records, Copied((3, 0)), Copied((3, 0)), None),
+            Ok((5, 1)),
+            "5833F0 admits a nonstructural cell at tolerance one and returns raw endpoint B on a tie"
+        );
 
         let vertical = redirect_terrain(5, 7, Some(100), None, |cell| {
             if cell.rx == 2 && (2..=4).contains(&cell.ry) {
@@ -1303,6 +1438,30 @@ mod tests {
         assert_eq!(
             project_live_cell_for_test(&vertical, &[], (2, 3), true),
             (2, 5)
+        );
+
+        // No high exit: both mode-one sentinel probes stamp the same Dummy.
+        //5833F0 re-reads a retained input, but preserves a copied input;
+        //583180 retains its distinct unsupported record[-1] policy.
+        let mut terrain = redirect_terrain(5, 1, None, None, |_| {});
+        terrain.test_set_native_allocated_cells(&[(2, 0), (4, 0)]);
+        let cells = NativeCellQuery::isolated(&terrain);
+        cells.dummy().test_set_retained_bridge_flags(0x900);
+        let bounds = Some(PlayfieldBounds::from_normalized_local_size(5, 0, 0, 5, 1));
+        assert_eq!(
+            resolve_bridge_endpoint(&cells, &[], Copied((3, 0)), Copied((4, 0)), bounds),
+            Ok((3, 0))
+        );
+        let input = cells.lookup((3, 0));
+        assert_eq!(
+            resolve_bridge_endpoint(&cells, &[], Retained(input), Copied((4, 0)), bounds),
+            Ok((0, 0))
+        );
+        assert_eq!(cells.coord(input), (0, 0));
+        let input = cells.lookup((3, 0));
+        assert_eq!(
+            live_hierarchy_projection(&cells, &[], input, true, bounds),
+            Err("583180 record[-1] after sentinel fallback")
         );
     }
 
@@ -1426,7 +1585,7 @@ mod tests {
         let ZonePrecheckOutcome::Passed(result) = outcome else {
             panic!("the ground route remains passable");
         };
-        assert_eq!(result.paths[2], vec![1, 2]);
+        assert_eq!(result.route(2), vec![1, 2]);
     }
 
     #[test]
@@ -1890,6 +2049,7 @@ mod tests {
         let (zone_ids, zone_count, edge_buckets) = rebuild_node_indices(
             &movement_classes,
             &retained_levels_from_path(&grid, 2, 2),
+            false,
             2,
             2,
         );
@@ -1907,8 +2067,13 @@ mod tests {
             grid.set_cell_for_test((index % 2) as u16, (index / 2) as u16, level, false, false);
         }
 
-        let (zone_ids, zone_count, edge_buckets) =
-            rebuild_node_indices(&[0; 4], &retained_levels_from_path(&grid, 2, 2), 2, 2);
+        let (zone_ids, zone_count, edge_buckets) = rebuild_node_indices(
+            &[0; 4],
+            &retained_levels_from_path(&grid, 2, 2),
+            false,
+            2,
+            2,
+        );
         let adjacency = edge_buckets.into_adjacency(zone_count);
 
         assert_eq!(zone_ids, vec![1, 1, 2, 2]);
@@ -1928,6 +2093,7 @@ mod tests {
         let (zone_ids, zone_count, _) = rebuild_node_indices(
             &[zone_class::GROUND, 7, 7, zone_class::GROUND],
             &retained_levels_from_path(&grid, 2, 2),
+            false,
             2,
             2,
         );
@@ -1942,11 +2108,43 @@ mod tests {
         grid.set_cell_for_test(0, 0, 0, false, false);
         grid.set_cell_for_test(1, 0, 4, false, false);
 
-        let (zone_ids, zone_count, _) =
-            rebuild_node_indices(&[0; 2], &retained_levels_from_path(&grid, 2, 1), 2, 1);
+        let (zone_ids, zone_count, _) = rebuild_node_indices(
+            &[0; 2],
+            &retained_levels_from_path(&grid, 2, 1),
+            false,
+            2,
+            1,
+        );
 
         assert_eq!(zone_ids, vec![1, 2]);
         assert_eq!(zone_count, 2);
+    }
+
+    #[test]
+    fn base_zone_fill_nests_one_run_per_row_on_a_small_stack() {
+        // A one-cell column nests a run for every row below its seed. A
+        // browser bounds Wasm recursion near 1 MB; this thread's fixed 256 KiB
+        // stays small whatever RUST_MIN_STACK says.
+        const HEIGHT: u16 = 50_000;
+        let (zone_ids, zone_count) = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let cells = usize::from(HEIGHT);
+                let (zone_ids, zone_count, _) = rebuild_node_indices(
+                    &vec![zone_class::GROUND; cells],
+                    &vec![0; cells],
+                    false,
+                    1,
+                    HEIGHT,
+                );
+                (zone_ids, zone_count)
+            })
+            .expect("the fill thread starts")
+            .join()
+            .expect("the fill does not overflow its stack");
+
+        assert_eq!(zone_count, 1);
+        assert!(zone_ids.iter().all(|&zone| zone == 1));
     }
 
     #[test]

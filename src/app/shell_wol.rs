@@ -20,8 +20,7 @@
 pub(crate) mod buddies;
 pub(crate) mod buddy;
 mod live_service;
-#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
-pub(crate) use live_service::lobby_base_url;
+pub(crate) use live_service::lobby_get;
 pub(crate) mod lobby;
 mod lobby_phrases;
 mod login;
@@ -37,23 +36,21 @@ mod test_service;
 pub(crate) mod translation;
 
 pub(crate) use live_service::OnlineCleanup;
-pub(crate) use live_service::RELEASES_URL;
 #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
 pub(crate) use live_service::discard_spawned_visit;
 pub(crate) use live_service::keep_network_report;
 #[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use live_service::retire_visit_for_exit;
 pub(crate) use live_service::{
-    DecodedRelayGrant, begin_spawned_match, decode_external_relay_grant, end_spawned_match,
+    DecodedRelayGrant, begin_spawned_match, decode_external_relay_grant,
+    decode_external_watch_grant, end_spawned_match, relay_ticket_is_watch,
 };
-pub(crate) use live_service::{
-    local_choices_agreed, online_cleanup_pending, online_exit_ready, online_match_id,
-};
+pub(crate) use live_service::{local_choices_agreed, online_cleanup_pending, online_match_id};
 pub(crate) use login::{account_form_layout, combo_popup, login_layout, open_login_art};
 pub(crate) use service::{
-    NET_STATUS_LOST, WolApiStatus, WolHighScoreRecord, WolLadderRecord, WolLoginAccepted,
-    WolProvider, WolServer, WolServerList, WolServiceEvent, WolServiceRequest, request,
-    service_event,
+    NET_STATUS_LOST, SERVER_STATUS_READY, WolApiStatus, WolHighScoreRecord, WolLadderRecord,
+    WolLoginAccepted, WolMatch, WolProvider, WolServer, WolServerList, WolServiceEvent,
+    WolServiceRequest, service_event,
 };
 pub(crate) use test_service::{
     WolTestGuest, default_buddies as test_service_buddies,
@@ -220,6 +217,8 @@ pub(crate) struct WolVisit {
     legacy_ui: bool,
     live_service: Option<live_service::LiveService>,
     requests: Vec<WolServiceRequest>,
+    /// Latest account form submission, including one still queued for the next poll.
+    account_attempt: u64,
     /// The WOLAPI credential store as the service last reported it.
     credentials: Vec<WolCredential>,
     /// `[0xB77AD0]`: the text the login sinks leave for `0x00786EF0`.
@@ -234,14 +233,16 @@ pub(crate) struct WolVisit {
     /// the match and cleared on runner entry (`0x00787973`); the chat sinks
     /// show nothing while it is set.
     in_game: bool,
-    /// VERA: this match started from VERA's own game room, which stays
-    /// joined through the match so its players return to it afterwards
-    /// (`finish` asks the lobby for it back).
-    pub(crate) back_to_room: bool,
-    /// VERA: BC6's Continue after a co-op mission: the stage the kept
-    /// room's host takes when the room comes back. The runner's post-match
-    /// entry drops it unless it waits for that room.
-    pub(crate) cooperative_resume: Option<crate::app::shell_network_setup::CooperativeResume>,
+    /// VERA: why the last online match ended, until the chat the player
+    /// lands in exists.
+    problem_line: Option<String>,
+    /// VERA: whether the online lobby lets players watch matches, as its
+    /// list of them last answered (docs/lobby-protocol.md "Watching"); `None`
+    /// before the first answer.
+    lobby_watches: Option<bool>,
+    /// VERA: the lobby lets a room's players visit the public lobby, as
+    /// its sign-in answered (docs/lobby-protocol.md "Visiting the lobby").
+    lobby_visits: bool,
     /// `![0xB77DC0]`: connected to a server. A WOLAPI creation
     /// (`0x00786485`) and a failed login clear it, a connect sets it, and a
     /// lost connection outside a match clears it.
@@ -300,14 +301,16 @@ impl WolVisit {
             legacy_ui: false,
             live_service: None,
             requests: Vec::new(),
+            account_attempt: 0,
             credentials: Vec::new(),
             last_error: None,
             last_login_result: None,
             motd: None,
             last_pager: None,
             in_game: false,
-            back_to_room: false,
-            cooperative_resume: None,
+            problem_line: None,
+            lobby_watches: None,
+            lobby_visits: false,
             connected: false,
             disconnected: false,
             relogin: None,
@@ -323,11 +326,6 @@ impl WolVisit {
             quick_match: Default::default(),
             spawned: None,
         }
-    }
-
-    /// Diagnostics and tests can select a backend without changing presentation.
-    pub(crate) fn set_provider(&mut self, provider: WolProvider) {
-        self.provider = provider;
     }
 
     pub(crate) fn modern_ui(&self) -> bool {
@@ -443,6 +441,32 @@ pub(crate) fn in_match(state: &AppState) -> bool {
         .is_some_and(|visit| visit.in_game)
 }
 
+/// VERA: whether the online lobby lets players watch matches, as its list of
+/// them last answered (docs/lobby-protocol.md "Watching"); `None` before the
+/// first answer.
+pub(crate) fn lobby_watches(state: &AppState) -> Option<bool> {
+    state
+        .frontend
+        .wol
+        .as_ref()
+        .and_then(|visit| visit.lobby_watches)
+}
+
+/// VERA: whether the online lobby lets a room's players visit the public
+/// lobby, as its sign-in answered; a lobby from before it does not.
+pub(crate) fn lobby_campaign_rooms(state: &AppState) -> bool {
+    state.frontend.wol.as_ref().and_then(|visit| visit.live_service.as_ref())
+        .is_some_and(|service| service.campaign_rooms)
+}
+
+pub(crate) fn lobby_visits(state: &AppState) -> bool {
+    state
+        .frontend
+        .wol
+        .as_ref()
+        .is_some_and(|visit| visit.lobby_visits)
+}
+
 /// A WOL box (`0x005E2CD0` style 0) with a CSF body.
 pub(crate) fn message_box(state: &AppState, key: &str) -> crate::ui::wol_shell::WolMessageBox {
     service::message_box(state, key, false)
@@ -473,6 +497,28 @@ fn logout(visit: &mut WolVisit) {
     visit.connected = false;
     visit.requests.push(service::WolServiceRequest::Logout);
     visit.page_received = None;
+}
+
+/// VERA: show `text` in the chat this online visit next lands in.
+pub(crate) fn hold_problem_line(state: &mut AppState, text: String) {
+    if let Some(visit) = state.frontend.wol.as_mut()
+        && visit.provider == WolProvider::Online
+    {
+        visit.problem_line = Some(text);
+    }
+}
+
+/// VERA: add `text` to the line waiting for the chat this online visit next
+/// lands in, or let it wait alone.
+pub(crate) fn add_problem_line(state: &mut AppState, text: String) {
+    if let Some(visit) = state.frontend.wol.as_mut()
+        && visit.provider == WolProvider::Online
+    {
+        visit.problem_line = Some(match visit.problem_line.take() {
+            Some(held) => format!("{held} {text}"),
+            None => text,
+        });
+    }
 }
 
 /// The runner handed over to a WOL match (`[0xB77DC1]` set).
@@ -507,7 +553,7 @@ pub(crate) fn open_lobby(state: &mut AppState, postmatch: bool) {
         .is_some_and(|lobby| lobby.runner == lobby::Runner::Buddy);
     match (buddy_mode, postmatch, buddy_runner) {
         (true, false, true) => buddy::stopped(state),
-        (true, _, _) => buddy::open(state),
+        (true, _, _) => lobby::open_runner(state, lobby::Runner::Buddy),
         (false, _, _) => lobby::open(state, postmatch),
     }
 }
@@ -537,9 +583,15 @@ pub(crate) fn reenter_after_match(state: &mut AppState) {
         )
     {
         // VERA's kept game room returns only to the custom lobby runner.
-        visit.back_to_room = false;
+        state.match_state.session.take_network_room_return();
     }
     live_service::match_returned(state);
+    if !App::prepare_multiplayer_settings(
+        state,
+        crate::app::match_runtime::session::SessionMode::Wol,
+    ) {
+        return;
+    }
     persona::enter_wol_main(state);
     read_wol_settings(state);
     let now_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
@@ -551,19 +603,6 @@ pub(crate) fn reenter_after_match(state: &mut AppState) {
     send_wol_preferences(state);
     apply_wol_preferences(state);
     open_lobby(state, true);
-}
-
-fn provider_for_visit(
-    test_service: bool,
-    capture_size: Option<winit::dpi::PhysicalSize<u32>>,
-) -> WolProvider {
-    // Stand-in games and players are diagnostic fixtures. A saved test
-    // preference must never replace the real service in ordinary play.
-    if capture_size.is_some() && test_service {
-        WolProvider::TestService
-    } else {
-        WolProvider::Online
-    }
 }
 
 impl App {
@@ -581,10 +620,10 @@ impl App {
         let lobby_music = state.frontend.wol_preferences.lobby_music != 0;
         let saved_shuffle = state.audio.enter_wol_lobby_music(lobby_music, now_ms);
         let mut visit = WolVisit::open(saved_shuffle);
-        visit.provider = provider_for_visit(
-            state.persistence.options_profile.wol_test_service,
-            state.platform.capture_client_size,
-        );
+        visit.provider = state
+            .frontend
+            .wol_capture_provider
+            .unwrap_or(WolProvider::Online);
         visit.set_legacy_ui(state.frontend.native_shell_ui);
         state.frontend.wol = Some(visit);
         // Persona I/O is selected by the new visit's provider, never a
@@ -919,6 +958,48 @@ impl App {
         }
     }
 
+    /// VERA's Esc menu (`app::shell_menu`): the boxes, popups and player card
+    /// over a page keep Esc.
+    pub(super) fn wol_leaves_escape(state: &AppState) -> bool {
+        if Self::wol_quick_match_verify(state) || page::open(state) {
+            return false;
+        }
+        let Some(visit) = state.frontend.wol.as_ref() else {
+            return false;
+        };
+        !visit.waiting()
+            && match &visit.page {
+                WolPage::Login(login) => !login.choosing_entry() && login.account.is_none(),
+                WolPage::Lobby => visit.lobby().is_some_and(|lobby| {
+                    lobby.interactive() && lobby.ui.popup.is_none() && lobby.ui.card.is_none()
+                }),
+                WolPage::Buddy(dialog) => dialog.ui.add.is_none(),
+                _ => true,
+            }
+    }
+
+    /// Esc closes the login page's open name list or the Options page's open
+    /// translation list.
+    pub(super) fn close_wol_open_list(state: &mut AppState) -> bool {
+        if options::close_list(state) {
+            return true;
+        }
+        let Some(login) = state
+            .frontend
+            .wol
+            .as_mut()
+            .and_then(|visit| match &mut visit.page {
+                WolPage::Login(login) => Some(login),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let open = login.popup.control.is_some();
+        login.popup.close();
+        open
+    }
+
     /// Keys while a WOL page shows. `0x10E` ignores IDOK/IDCANCEL
     /// (`0x007988C0`); the boxes' loop (`0x007759E0`) and the hidden or shown
     /// `0xC4` take none. `0x10F`'s and `0x113`'s NewEdits read keys.
@@ -966,7 +1047,7 @@ impl App {
     /// The login flow returned 0 (Back, or a failed connect after its box):
     /// mode 0 (`0x0077B3F6`), and the loop runs a fresh `0x10E` with its
     /// entry slide, or the online sign-in again.
-    pub(crate) fn reopen_wol_welcome(state: &mut AppState) {
+    pub(super) fn reopen_wol_welcome(state: &mut AppState) {
         let Some(visit) = state.frontend.wol.as_mut() else {
             return;
         };

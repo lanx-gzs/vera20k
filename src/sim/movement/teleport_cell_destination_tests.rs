@@ -160,7 +160,7 @@ fn fixture(row: &Value, rules: &RuleSet) -> (Simulation, u64, InternedId) {
             0,
             0,
             rules,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .unwrap();
     let actor = sim.substrate.entities.get_mut(id).unwrap();
@@ -271,7 +271,7 @@ fn fixture(row: &Value, rules: &RuleSet) -> (Simulation, u64, InternedId) {
                 0,
                 0,
                 rules,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         let supplied = coord(&transport["coords"]);
@@ -334,7 +334,7 @@ fn fixture(row: &Value, rules: &RuleSet) -> (Simulation, u64, InternedId) {
 }
 
 fn import_rng(sim: &mut Simulation, native: &Value) {
-    sim.main_rng = SimRng::from_native_state_hex_for_test(native["main"].as_str().unwrap()).into();
+    sim.main_rng = SimRng::from_native_state_hex_for_test(native["main"].as_str().unwrap());
     sim.scenario_rng = SimRng::from_native_state_hex_for_test(native["scenario"].as_str().unwrap());
     sim.mapgen_rng = SimRng::from_native_state_hex_for_test(native["mapgen"].as_str().unwrap());
 }
@@ -552,7 +552,7 @@ fn execute(
                     NavTargetRef::cell(rx, ry),
                     rules,
                     registry,
-                    crate::sim::world::FrameEffects::default(),
+                    &mut crate::sim::world::FrameEffects::default(),
                 )
                 .unwrap();
         }
@@ -561,7 +561,7 @@ fn execute(
                 id,
                 rules,
                 registry,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap(),
         "queue_mission" => {
@@ -608,7 +608,7 @@ fn object_enter_resolution_matches_original_transport_controls() {
                 &rules,
                 false,
                 None,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         assert_eq!(
@@ -673,14 +673,14 @@ fn full_transport_arrival_replays_original_warp_in_refusal_tail() {
                 0,
                 0,
                 &rules,
-                crate::sim::world::FrameEffects::default(),
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         sim.substrate
             .entities
             .get_mut(transport)
             .unwrap()
-            .passenger_role
+            .passenger_role_mut_for_test()
             .cargo_mut()
             .unwrap()
             .board_forced_chain(&[(occupant, rules.object("E1").unwrap().size)]);
@@ -709,7 +709,7 @@ fn full_transport_arrival_replays_original_warp_in_refusal_tail() {
             super::super::PerCellReason::Arrival,
             &rules,
             None,
-            crate::sim::world::FrameEffects::default(),
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .unwrap();
         assert_state(
@@ -739,7 +739,7 @@ fn full_transport_arrival_replays_original_warp_in_refusal_tail() {
                 .entities
                 .get(id)
                 .unwrap()
-                .passenger_role
+                .passenger_role()
                 .is_none(),
             "{name}: rejected passenger stays outside"
         );
@@ -775,7 +775,7 @@ fn chrono_epoch_expiry_matches_original_timer_check() {
             destination: None,
             delay_timer: crate::sim::timer::CdTimer::from_raw(signed(&timer[0]), signed(&timer[2])),
         });
-        sim.process_teleport(id, &rules, crate::sim::world::ObjectAiCtx::default());
+        sim.process_teleport(id, &rules, &mut crate::sim::world::ObjectAiCtx::default());
         assert_eq!(
             sim.substrate.entities.get(id).unwrap().is_warping_in(),
             row["after"]["actor"]["warping_in"].as_bool().unwrap(),
@@ -1076,6 +1076,7 @@ fn two_ordinary_cleg_moves_publish_class_destinations_before_process() {
     );
     for target_rx in [12, 13] {
         assert!(sim.apply_command_with_overlays(
+            None,
             "Americans",
             &Command::Move {
                 entity_id: id,
@@ -1084,7 +1085,7 @@ fn two_ordinary_cleg_moves_publish_class_destinations_before_process() {
             },
             &rules,
             None,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         ));
         let entity = sim.substrate.entities.get(id).unwrap();
         let runtime = entity
@@ -1137,7 +1138,7 @@ fn a_deferred_restore_keeps_a_cleg_object_navcom() {
     cleg.navigation.set_nav_com_for_test(Some(target));
     cleg.navigation
         .set_pending_destination_setter_for_test(true);
-    sim.complete_pending_order(id, &rules, None, crate::sim::world::FrameEffects::default());
+    sim.complete_pending_order(id, &rules, &mut crate::sim::world::FrameEffects::default());
     let cleg = sim.substrate.entities.get(id).unwrap();
     assert_eq!(cleg.navigation.nav_com(), Some(target));
     assert!(!cleg.navigation.pending_destination_setter());
@@ -1150,6 +1151,62 @@ fn a_deferred_restore_keeps_a_cleg_object_navcom() {
             .requested,
         "his Teleport Move_To ran"
     );
+}
+
+/// ResolveDestination's Infantry fallback (`0x00718ECB..0x00719088`): a CLEG
+/// refused at a friendly vehicle's cell lands beside it while the vehicle is
+/// his NavCom. With a Cell NavCom the same refusal stands.
+#[test]
+fn a_cleg_refused_at_an_object_lands_beside_it() {
+    let Some(rules) = command_fixture_rules() else {
+        return;
+    };
+    let data = corpus();
+    let row = row_named(&data, "guard_two_distinct_cells");
+    for object_navcom in [true, false] {
+        let (mut sim, id, _) = fixture(row, &rules);
+        crate::sim::arena_fixture::supply_native_map(&mut sim);
+        let vehicle = sim
+            .spawn_object("FV", "Americans", 13, 10, 0, &rules)
+            .expect("FV spawns");
+        let target = if object_navcom {
+            NavTargetRef::object(vehicle)
+        } else {
+            NavTargetRef::cell(13, 10)
+        };
+        let actor = sim.substrate.entities.get_mut(id).unwrap();
+        actor.navigation.set_nav_com_for_test(Some(target));
+        let accepted = sim
+            .teleport_move_to(
+                id,
+                DriveCoord::cell(13, 10, 0),
+                &rules,
+                false,
+                None,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
+        assert_eq!(accepted, object_navcom);
+        let marked = sim
+            .substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .locomotor
+            .as_ref()
+            .unwrap()
+            .teleport_runtime()
+            .unwrap()
+            .resolved_destination();
+        match marked {
+            Some(point) => assert_eq!(
+                (point.x / 256 - 13).abs().max((point.y / 256 - 10).abs()),
+                1,
+                "{point:?} is in the ring around the vehicle"
+            ),
+            None => assert!(!object_navcom, "the object fallback marks a cell"),
+        }
+    }
 }
 
 /// An absent caller dependency is a Rust transaction error, not native
@@ -1191,7 +1248,7 @@ fn overlay_destination_without_registered_inputs_is_atomic() {
                 target,
                 &rules,
                 missing,
-                crate::sim::world::FrameEffects::default()
+                &mut crate::sim::world::FrameEffects::default()
             )
             .is_err()
         );
@@ -1231,7 +1288,7 @@ fn teleport_admission_input_error_restores_physical_occupation() {
             NavTargetRef::cell(12, 10),
             &rules,
             None,
-            crate::sim::world::FrameEffects::default()
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -1351,6 +1408,7 @@ fn cleg_overlay_cell_requests_match_every_original_command_boundary() {
                     let (rx, ry) = pair(&boundary["input"]["cell"]);
                     assert!(
                         sim.apply_command_with_overlays(
+                            None,
                             "Americans",
                             &Command::Move {
                                 entity_id: id,
@@ -1359,7 +1417,7 @@ fn cleg_overlay_cell_requests_match_every_original_command_boundary() {
                             },
                             &rules,
                             Some(&registry),
-                            crate::sim::world::FrameEffects::default(),
+                            &mut crate::sim::world::FrameEffects::default(),
                         ),
                         "{context}: the Move event runs"
                     );

@@ -57,7 +57,7 @@ fn shoot(sim: &mut Simulation, rules: &RuleSet, emitter: u64, victim: u64, weapo
         },
         rules,
         None,
-        FrameEffects::empty(),
+        &mut FrameEffects::empty(),
     );
     let bullets: Vec<_> = sim
         .projectiles
@@ -66,7 +66,7 @@ fn shoot(sim: &mut Simulation, rules: &RuleSet, emitter: u64, victim: u64, weapo
         .filter(|id| !before.contains(id))
         .collect();
     assert_eq!(bullets.len(), 1);
-    sim.object_ai_visit_one(bullets[0], Some(rules), ObjectAiCtx::default());
+    sim.object_ai_visit_one(bullets[0], Some(rules), &mut ObjectAiCtx::default());
 }
 
 fn armor(sim: &Simulation, victim: u64) -> f64 {
@@ -74,8 +74,7 @@ fn armor(sim: &Simulation, victim: u64) -> f64 {
         sim.entities()
             .get(victim)
             .unwrap()
-            .crate_multipliers
-            .armor()
+            .armor_multiplier()
             .bits(),
     )
 }
@@ -102,6 +101,7 @@ fn armor_crate(sim: &mut Simulation, rules: &RuleSet, victim: u64) -> bool {
 
 #[test]
 fn attached_armor_parent_hit_changes_received_damage_then_expires() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let (mut sim, rules, emitter, victim) = scene();
     shoot(&mut sim, &rules, emitter, victim, 0);
     assert_eq!(armor(&sim, victim), 2.0);
@@ -125,6 +125,7 @@ fn attached_armor_parent_hit_changes_received_damage_then_expires() {
 
 #[test]
 fn attached_armor_refresh_stack_and_crates_keep_the_permanent_baseline() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let (mut sim, rules, emitter, victim) = scene();
     hit(&mut sim, &rules, emitter, victim, "AE");
     assert_eq!(armor(&sim, victim), 2.0);
@@ -163,6 +164,7 @@ fn attached_armor_refresh_stack_and_crates_keep_the_permanent_baseline() {
 
 #[test]
 fn attached_armor_restore_checks_both_values_and_discard_recovers_the_crate() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let (mut sim, rules, emitter, victim) = scene();
     assert!(armor_crate(&mut sim, &rules, victim));
     hit(&mut sim, &rules, emitter, victim, "AE");
@@ -181,6 +183,7 @@ fn attached_armor_restore_checks_both_values_and_discard_recovers_the_crate() {
         .entities
         .get_mut(victim)
         .unwrap()
+        .seldom
         .crate_multipliers
         .set_armor_multiplier_for_test(NativeF64Bits::ONE);
     loaded
@@ -188,7 +191,6 @@ fn attached_armor_restore_checks_both_values_and_discard_recovers_the_crate() {
         .entities
         .get_mut(victim)
         .unwrap()
-        .crate_multipliers
         .set_attached_armor(NativeF64Bits::from_bits(3.0_f64.to_bits()));
     assert_eq!(
         armor(&loaded, victim),

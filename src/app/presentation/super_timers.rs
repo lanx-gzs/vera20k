@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use crate::app::AppState;
+use crate::app::presentation::super_timer_groups::{TeamSuperRow, grouped_super_rows};
 use crate::assets::csf_file::{CsfFile, type_ui_name};
 use crate::render::batch::SpriteInstance;
 use crate::rules::house_colors::{HouseColorIndex, NO_REMAP, house_text_rgb};
@@ -22,7 +23,7 @@ use crate::ui::game_screen::GameScreen;
 
 /// Frames to a timer line's second (`0x88888889`, `sar 3`: a truncating
 /// divide).
-const FRAMES_PER_SECOND: i32 = 15;
+pub(crate) const FRAMES_PER_SECOND: i32 = 15;
 /// The blackout lines' label, read through the string table (`0x00842A50`,
 /// `0x00734E60`).
 const BLACKOUT_LABEL: &str = "MSG:BlackoutTimer";
@@ -49,6 +50,10 @@ pub(crate) enum TimerSource {
     /// A house's blackout (`+0x2A4`), labelled `MSG:BlackoutTimer`, in the
     /// house's scheme.
     Blackout(InternedId),
+    /// VERA's `[VERA] GroupedSuperTimers=` line in place of the Super lines:
+    /// one team's Supers of one type, labelled `<team> <UIName> ready/total`
+    /// in the team's first house's scheme; it blinks like a Super's line.
+    Team(TeamSuperRow),
 }
 
 /// One timer line; its index is its place in [`timer_lines`]' answer.
@@ -64,7 +69,9 @@ pub(crate) struct TimerLine {
 /// (`scenario_left`, None while its start is -1), each Super of the list in
 /// its order, then each house with blackout time left, in `HouseClass::Array`
 /// order. In GameMode 0 (`campaign`) a held Super whose timer has all of
-/// `GetRechargeTime` left takes no line (`0x006D49D1..0x006D4A06`).
+/// `GetRechargeTime` left takes no line (`0x006D49D1..0x006D4A06`). With
+/// Ares, `supers` holds only the Supers whose `SW.TimerVisibility` admits
+/// the player (hook `0x6D49D1`, filtered by the caller).
 pub(crate) fn timer_lines(
     scenario_left: Option<i32>,
     supers: &[SuperTimerView],
@@ -164,15 +171,28 @@ impl TimerBlink {
     /// The Super's blink. A new grant, which a new list place shows, clears
     /// it (`+0x40`, Grant `0x006CB580`); the deadline stays.
     fn of<'a>(blinks: &'a mut TimerBlinks, view: &SuperTimerView) -> &'a mut TimerBlink {
-        let blink = blinks
-            .entry((view.owner(), view.sw_type()))
-            .or_insert(TimerBlink {
-                place: view.place(),
-                ..TimerBlink::default()
-            });
-        if blink.place != view.place() {
+        Self::of_key(blinks, view.owner(), view.sw_type(), view.place())
+    }
+
+    /// The blink of a grouped team line, by its first house and type. It has
+    /// no grant place, so it keeps place 0 and a regrouping never clears it.
+    fn of_team<'a>(blinks: &'a mut TimerBlinks, row: &TeamSuperRow) -> &'a mut TimerBlink {
+        Self::of_key(blinks, row.representative, row.sw_type, 0)
+    }
+
+    fn of_key<'a>(
+        blinks: &'a mut TimerBlinks,
+        owner: InternedId,
+        sw_type: InternedId,
+        place: u32,
+    ) -> &'a mut TimerBlink {
+        let blink = blinks.entry((owner, sw_type)).or_insert(TimerBlink {
+            place,
+            ..TimerBlink::default()
+        });
+        if blink.place != place {
             blink.on = false;
-            blink.place = view.place();
+            blink.place = place;
         }
         blink
     }
@@ -196,8 +216,10 @@ impl TimerBlink {
 /// The Supers' timer blinks, by owner and type.
 pub(crate) type TimerBlinks = HashMap<(InternedId, InternedId), TimerBlink>;
 
-/// VERA presentation extension. No timer, grant, visibility or command state
-/// belongs here: this only chooses which existing DrawTimer rows are shown.
+/// VERA presentation extension, on with `[VERA] CompactSuperTimers=`
+/// (Options). No timer, grant, visibility or command state belongs here: this
+/// only chooses which existing DrawTimer rows are shown. Off, every line
+/// stacks up from the bottom as `0x006D4941..0x006D4B25` draws it.
 #[derive(Debug, Default)]
 pub(crate) struct TimerDock {
     expanded: bool,
@@ -252,15 +274,17 @@ impl TimerDock {
         true
     }
 
-    /// Native line order and placement remain untouched through six Supers.
-    /// Beyond that, keep local Supers first and page the remaining ready-first
-    /// rows. Scenario/blackout lines retain their original relative order.
+    /// Native line order and placement remain untouched while `compact` is
+    /// off, and through six Supers. Beyond that, keep local Supers first and
+    /// page the remaining ready-first rows. Scenario/blackout lines retain
+    /// their original relative order.
     fn rows(
         &mut self,
         lines: &[TimerLine],
         local: Option<InternedId>,
         view: [i32; 2],
         font_height: i32,
+        compact: bool,
     ) -> Vec<DockRow> {
         self.clear_hits();
         let supers: Vec<_> = lines
@@ -268,7 +292,7 @@ impl TimerDock {
             .enumerate()
             .filter_map(|(i, line)| matches!(line.source, TimerSource::Super(_)).then_some(i))
             .collect();
-        if supers.len() <= 6 {
+        if !compact || supers.len() <= 6 {
             self.expanded = false;
             self.offset = 0;
             self.max_offset = 0;
@@ -337,10 +361,21 @@ impl TimerDock {
     }
 }
 
+/// The cursor in the pixels of the timers' box, where the dock keeps its hit
+/// areas: the battlefield's own pixels in the original interface.
+pub(crate) fn cursor_in_view(state: &AppState) -> (i32, i32) {
+    let (x, y) = state.match_state.input.cursor_px();
+    let [left, top, _, _] = crate::app::presentation::field_parts::rect(
+        state,
+        crate::ui::field_layout::FieldPart::Timers,
+    );
+    (x - left, y - top)
+}
+
 /// Consume wheel messages only over the expanded timer ink, before world zoom
 /// or sidebar scrolling. Empty space around the rows stays interactive terrain.
 pub(crate) fn wheel(state: &mut AppState, delta: f32) -> bool {
-    let (x, y) = state.match_state.input.cursor_px();
+    let (x, y) = cursor_in_view(state);
     state
         .match_state
         .match_presentation
@@ -383,16 +418,32 @@ pub(crate) fn build_super_timer_instances(
         .match_state
         .match_presentation
         .super_timer_next_flip_ms = None;
-    if state.frontend.screen != GameScreen::InGame {
+    use crate::app::presentation::field_parts;
+    use crate::ui::field_layout::FieldPart;
+    // A layout that leaves the timers out draws none and keeps no hit area.
+    if state.frontend.screen != GameScreen::InGame || !field_parts::shows(state, FieldPart::Timers)
+    {
         return (Vec::new(), Vec::new());
     }
-    let (Some(runtime), Some(rules)) = (state.match_state.sim_runtime.as_ref(), state.rules())
+    let (Some(runtime), Some(rules)) =
+        (state.match_state.sim_runtime.presentation(), state.rules())
     else {
         return (Vec::new(), Vec::new());
     };
     let sim = &runtime.simulation;
     let frame = sim.session().binary_frame();
     let supers = crate::sim::superweapon::super_timer_views(sim, rules);
+    // When the Rules were read the Ares way (`RuleSet::ares_form`), Ares hook
+    // 0x6D49D1 (10035A80) asks SW.TimerVisibility at the head of each Super's
+    // line test; a hidden Super takes no line.
+    let supers: Vec<_> = if rules.ares_form() {
+        supers
+            .into_iter()
+            .filter(|view| crate::sim::superweapon::ares_timer_visible(sim, rules, *view))
+            .collect()
+    } else {
+        supers
+    };
     let blackouts = sim.houses().order().iter().map(|&house| {
         let left = sim
             .power_states()
@@ -401,12 +452,32 @@ pub(crate) fn build_super_timer_instances(
         (house, left)
     });
     let scenario = sim.session().scenario_timer_view();
-    let lines = timer_lines(
+    let grouped = state.persistence.options_profile.grouped_super_timers;
+    let mut lines = timer_lines(
         scenario.map(|(left, _)| left),
-        &supers,
+        if grouped { &[] } else { &supers },
         blackouts,
         !sim.session().game_mode_nonzero(),
     );
+    if grouped {
+        // The team lines take the Super lines' place: after the Scenario
+        // line, before the blackouts.
+        let alliances = sim.house_alliances();
+        let teams = grouped_super_rows(
+            sim.houses().order(),
+            |asker, other| alliances.is_allied(sim.interner(), asker, other),
+            &supers,
+            sim.session().current_house(),
+        );
+        let at = usize::from(scenario.is_some());
+        lines.splice(
+            at..at,
+            teams.into_iter().map(|row| TimerLine {
+                source: TimerSource::Team(row),
+                seconds: row.nearest_seconds,
+            }),
+        );
+    }
     if lines.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -419,12 +490,20 @@ pub(crate) fn build_super_timer_instances(
                 state
                     .match_state
                     .match_presentation
-                    .house_color_map
+                    .effective_house_color_map()
                     .get(sim.interner().resolve(house))
             })
             .copied()
             .unwrap_or(NO_REMAP);
         house_text_rgb(schemes, color)
+    };
+    let super_name = |sw_type: InternedId| {
+        type_ui_name(
+            rules
+                .super_weapon(sim.interner().resolve(sw_type))
+                .and_then(|sw| sw.ui_name.as_deref()),
+            csf,
+        )
     };
     let lines: Vec<(TimerLine, String, [u8; 3])> = lines
         .into_iter()
@@ -436,38 +515,43 @@ pub(crate) fn build_super_timer_instances(
                         .filter(|(_, caption)| !caption.is_empty())
                         .map_or_else(String::new, |(_, caption)| localized(csf, caption)),
                 ),
-                TimerSource::Super(view) => (
-                    Some(view.owner()),
-                    type_ui_name(
-                        rules
-                            .super_weapon(sim.interner().resolve(view.sw_type()))
-                            .and_then(|sw| sw.ui_name.as_deref()),
-                        csf,
+                TimerSource::Super(view) => (Some(view.owner()), super_name(view.sw_type())),
+                TimerSource::Blackout(house) => (Some(house), localized(csf, BLACKOUT_LABEL)),
+                TimerSource::Team(row) => (
+                    Some(row.representative),
+                    format!(
+                        "{} {} {}/{}",
+                        row.team.label(),
+                        super_name(row.sw_type),
+                        row.ready,
+                        row.total
                     ),
                 ),
-                TimerSource::Blackout(house) => (Some(house), localized(csf, BLACKOUT_LABEL)),
             };
             (line, label, house_rgb(house))
         })
         .collect();
     let blink_rgb = blink_rgb(rules);
     let now_ms = crate::app::input::tooltips::now_ms(state);
-    let (view_w, view_h) = crate::app::input::camera::tactical_viewport_size(state);
-    // Screen-space lanes add back the world camera the UI shader subtracts.
-    let camera = [
-        state.match_state.input.camera_x,
-        state.match_state.input.camera_y,
-    ];
+    // The dock stacks up from the bottom right of its box, the battlefield
+    // in the original interface, and works in the box's own pixels.
+    let [_, _, view_w, view_h] = field_parts::rect(state, FieldPart::Timers);
+    // Screen-space lanes add back the world camera the UI shader subtracts,
+    // and the box's corner.
+    let camera = field_parts::lane_camera(state, FieldPart::Timers);
 
     let font = &state.renderer.bit_font;
     let local = sim.session().current_house();
     let timer_lines: Vec<_> = lines.iter().map(|(line, _, _)| *line).collect();
+    // The grouped lines are few; they replace the compact dock's paging.
+    let compact = state.persistence.options_profile.compact_super_timers && !grouped;
     let dock = &mut state.match_state.match_presentation.super_timer_dock;
     let rows = dock.rows(
         &timer_lines,
         local,
         [view_w as i32, view_h as i32],
         font.cell_height() as i32,
+        compact,
     );
     let mut positions = vec![None; lines.len()];
     for (position, row) in rows.iter().enumerate() {
@@ -490,9 +574,13 @@ pub(crate) fn build_super_timer_instances(
     let mut texts = Vec::new();
     let mut next_flip_ms: Option<u64> = None;
     for (index, (line, label, rgb)) in lines.iter().enumerate() {
-        let blinking = match line.source {
-            TimerSource::Super(view) => {
-                let blink = TimerBlink::of(blinks, &view);
+        let blink = match line.source {
+            TimerSource::Super(view) => Some(TimerBlink::of(blinks, &view)),
+            TimerSource::Team(row) => Some(TimerBlink::of_team(blinks, &row)),
+            TimerSource::Scenario | TimerSource::Blackout(_) => None,
+        };
+        let blinking = match blink {
+            Some(blink) => {
                 let on = blink.step(line.seconds, now_ms);
                 if line.seconds == 0 {
                     next_flip_ms = Some(
@@ -501,7 +589,7 @@ pub(crate) fn build_super_timer_instances(
                 }
                 on
             }
-            TimerSource::Scenario | TimerSource::Blackout(_) => false,
+            None => false,
         };
         // Hidden rows still step the existing wall-clock blink owner.
         let Some(position) = positions[index] else {
@@ -573,6 +661,6 @@ pub(crate) fn blink_due(state: &AppState) -> bool {
         .is_some_and(|next| crate::app::input::tooltips::now_ms(state) >= next)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_presentation))]
 #[path = "super_timers_tests.rs"]
 mod tests;

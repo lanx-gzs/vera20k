@@ -48,8 +48,7 @@ fn retail_berserk_infantry_ctrl_ground_shows_no_move() {
     let gi = sim
         .spawn_object("E1", "Americans", 12, 10, 0, rules)
         .unwrap();
-    sim.entities_mut_for_test()
-        .get_mut(gi)
+    sim.entity_mut_for_test(gi)
         .unwrap()
         .berserk
         .set_active_for_test(true);
@@ -68,14 +67,14 @@ fn retail_berserk_infantry_ctrl_ground_shows_no_move() {
         full_visibility: true,
     };
     assert_eq!(
-        query.selection_action((12, 12), None),
+        query.selection_action((12, 12), None).0,
         Some(CursorFeedbackKind::Invalid)
     );
 }
 
-#[cfg(feature = "ares")]
 #[test]
 fn ares_vehicle_capture_cursor_shares_manual_action_and_preserves_shift_selection() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
     let patch = crate::rules::ini_parser::IniFile::from_str("[E1]\nVehicleThief=yes\n");
     let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules_for_map_with_patch(
         "XMP03T4.MAP",
@@ -95,8 +94,10 @@ fn ares_vehicle_capture_cursor_shares_manual_action_and_preserves_shift_selectio
         kind: HoverTargetKind::EnemyUnit,
     };
     let before = sim.state_hash();
+    let control = sim.control_projection();
     assert!(crate::app::input::context_order::vehicle_capture_action(
         &sim,
+        &control,
         &retail.rules,
         actor,
         target,
@@ -114,11 +115,13 @@ fn ares_vehicle_capture_cursor_shares_manual_action_and_preserves_shift_selectio
             OrderModifier::Normal,
             false,
             false,
+            &mut Default::default(),
         ),
         CursorFeedbackKind::Enter
     );
     assert!(!crate::app::input::context_order::vehicle_capture_action(
         &sim,
+        &control,
         &retail.rules,
         actor,
         target,
@@ -134,6 +137,16 @@ fn ares_vehicle_capture_cursor_shares_manual_action_and_preserves_shift_selectio
 
 #[test]
 fn ares_no_manual_fire_native_modifier_cursors_use_the_shared_action() {
+    no_manual_fire_modifier_cursors(false);
+}
+
+#[test]
+fn ares_no_manual_fire_modifier_cursors_follow_the_key_in_an_ares_game() {
+    no_manual_fire_modifier_cursors(true);
+}
+
+fn no_manual_fire_modifier_cursors(ares_way: bool) {
+    let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
     let corpus = crate::test_fixture::json("tools/spatial_oracle/no_manual_fire.json");
     let rows = corpus["rows"].as_array().unwrap();
     for setting in [false, true] {
@@ -152,9 +165,9 @@ fn ares_no_manual_fire_native_modifier_cursors_use_the_shared_action() {
             .filter(|row| row["no_manual_fire_native_reader_value"] == u64::from(setting))
         {
             let case = &row["input"];
-            // The same authored key is ignored by the default build. Its
+            // A game not read the Ares way ignores the same authored key. Its
             // expected result is the actual DLL control with the flag off.
-            let expected = if crate::rules::ARES_ENABLED {
+            let expected = if ares_way {
                 row
             } else {
                 rows.iter()
@@ -192,6 +205,7 @@ fn ares_no_manual_fire_native_modifier_cursors_use_the_shared_action() {
                         modifier,
                         alt,
                         false,
+                        &mut Default::default(),
                     ),
                     modifier == OrderModifier::AttackMove,
                 )
@@ -214,7 +228,6 @@ fn ares_no_manual_fire_native_modifier_cursors_use_the_shared_action() {
                         empty_cell_cursor(
                             &sim,
                             Some(&retail.rules),
-                            None,
                             sim.session().current_house(),
                             Some(actor),
                             (17, 16),
@@ -296,6 +309,7 @@ fn retail_weapon_cursor_overrides_survive_distance() {
                 crate::app::input::context_order::OrderModifier::Normal,
                 false,
                 false,
+                &mut Default::default(),
             );
             assert_eq!(
                 cursor_id_for_feedback(feedback),
@@ -334,7 +348,6 @@ fn retail_cell_chords_have_their_native_cursors() {
         let feedback = empty_cell_cursor(
             &sim,
             Some(&retail.rules),
-            None,
             sim.session().current_house(),
             Some(actor),
             (30, 30),
@@ -370,7 +383,6 @@ fn retail_ctrl_alt_over_shroud_is_a_move_for_a_foot() {
         cursor_id_for_feedback(empty_cell_cursor(
             sim,
             Some(rules),
-            None,
             sim.session().current_house(),
             Some(tank),
             cell,
@@ -393,8 +405,7 @@ fn retail_ctrl_alt_over_shroud_is_a_move_for_a_foot() {
     assert!(guards(&sim, (10, 10)));
     assert!(!guards(&sim, (10, 30)));
     // A berserk tank answers 0 before the rung (`0x00700609`): the arrow.
-    sim.entities_mut_for_test()
-        .get_mut(tank)
+    sim.entity_mut_for_test(tank)
         .unwrap()
         .berserk
         .set_active_for_test(true);
@@ -486,6 +497,7 @@ fn native_modifier_controls_match_production_cursor_queries() {
                 modifier,
                 alt,
                 false,
+                &mut Default::default(),
             );
             promote_attack_move_feedback(feedback, modifier == OrderModifier::AttackMove)
         } else {
@@ -507,7 +519,6 @@ fn native_modifier_controls_match_production_cursor_queries() {
                     empty_cell_cursor(
                         &sim,
                         Some(&retail.rules),
-                        None,
                         sim.session().current_house(),
                         Some(actor),
                         (17, 16),
@@ -553,10 +564,11 @@ fn infantry_deploy_and_loaded_transport_self_cursors_share_click_admission() {
                 .unwrap();
             let mut cargo = crate::sim::passenger::PassengerCargo::new(1, 0.0);
             cargo.board_forced_chain(&[(passenger, 1.0)]);
-            sim.entities_mut_for_test()
-                .get_mut(actor)
+            sim.entity_mut_for_test(actor)
                 .unwrap()
-                .passenger_role = crate::sim::passenger::PassengerRole::transport(cargo);
+                .set_passenger_role_for_test(crate::sim::passenger::PassengerRole::transport(
+                    cargo,
+                ));
         }
         for modifier in [
             OrderModifier::Normal,
@@ -578,6 +590,7 @@ fn infantry_deploy_and_loaded_transport_self_cursors_share_click_admission() {
                 modifier,
                 true,
                 false,
+                &mut Default::default(),
             );
             assert_eq!(
                 cursor_id_for_feedback(feedback),
@@ -627,8 +640,7 @@ fn native_infantry_weapon_suffix_controls_match_shared_action_owner() {
             )
             .unwrap();
         if spec["bunkered"] == true {
-            sim.entities_mut_for_test()
-                .get_mut(target)
+            sim.entity_mut_for_test(target)
                 .unwrap()
                 .bunker
                 .set_bunker_link_for_test(crate::sim::docking::bunker_link::BunkerLink::Installed(
@@ -696,8 +708,7 @@ fn retail_infantry_self_click_admission_uses_undeploy_delay() {
             (31, true),
             (32, false),
         ] {
-            sim.entities_mut_for_test()
-                .get_mut(actor)
+            sim.entity_mut_for_test(actor)
                 .unwrap()
                 .mission_leaf
                 .set_infantry_doing_verified(doing)
@@ -726,6 +737,7 @@ fn retail_infantry_self_click_admission_uses_undeploy_delay() {
                         modifier,
                         false,
                         false,
+                        &mut Default::default(),
                     )),
                     Some(expected),
                     "{name} Doing{doing} {modifier:?}"
@@ -799,6 +811,7 @@ fn retail_gi_guardian_and_desolator_self_clicks_complete_both_deployment_directi
                     OrderModifier::Normal,
                     false,
                     false,
+                    &mut Default::default(),
                 )),
                 Some(CursorId::Deploy),
                 "{name}: click toward Doing{destination_doing}"

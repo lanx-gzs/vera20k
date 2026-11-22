@@ -86,7 +86,7 @@ fn retail_hills_ordinary_move_reserves_a_collapsing_deck_cell() {
                 &commands,
                 crate::headless_scenario::SIM_TICK_MS,
                 TickLane::Ordinary,
-                FrameEffects::default(),
+                &mut FrameEffects::default(),
             )
             .unwrap();
         let sim = scene.sim();
@@ -118,7 +118,6 @@ fn retail_hills_ordinary_move_reserves_a_collapsing_deck_cell() {
         let mut drivers = BridgeDamageDrivers::new(
             &mut runtime.simulation,
             &runtime.resources.rules,
-            Some(&runtime.resources.overlay_registry),
             FrameEffects::default(),
         );
         let returned = drivers.apply_damage_to_cell((target.0 as i16, target.1 as i16));
@@ -194,9 +193,9 @@ fn retail_hills_empty_claim_nonmatching_head_and_stale_pending_controls() {
     moving_collapse::apply(
         &mut runtime.simulation,
         &runtime.resources.rules,
-        Some(&runtime.resources.overlay_registry),
+        Some(runtime.resources.rules.overlay_registry()),
         (76, 75),
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     );
     assert_eq!(
         runtime.simulation.state_hash(),
@@ -222,7 +221,7 @@ fn retail_hills_empty_claim_nonmatching_head_and_stale_pending_controls() {
             &[command],
             crate::headless_scenario::SIM_TICK_MS,
             TickLane::Ordinary,
-            FrameEffects::default(),
+            &mut FrameEffects::default(),
         )
         .unwrap();
     let mut arrived = false;
@@ -255,9 +254,9 @@ fn retail_hills_empty_claim_nonmatching_head_and_stale_pending_controls() {
     moving_collapse::apply(
         &mut runtime.simulation,
         &runtime.resources.rules,
-        Some(&runtime.resources.overlay_registry),
+        Some(runtime.resources.rules.overlay_registry()),
         (76, 75),
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     );
     assert_eq!(
         runtime.simulation.state_hash(),
@@ -292,7 +291,6 @@ fn retail_hills_empty_claim_nonmatching_head_and_stale_pending_controls() {
     let mut driver = BridgeDamageDrivers::new(
         &mut runtime.simulation,
         &runtime.resources.rules,
-        Some(&runtime.resources.overlay_registry),
         FrameEffects::default(),
     );
     let no_driver = (90, 44);
@@ -387,6 +385,7 @@ fn retail_hills_tanya_charge_collapses_under_an_ordinary_incoming_tank() {
             .entities()
             .get(hut)
             .unwrap()
+            .building
             .pending_c4_detonation
             .pending();
         if let Some(charge) = pending {
@@ -424,7 +423,7 @@ fn retail_hills_tanya_charge_collapses_under_an_ordinary_incoming_tank() {
                 &commands,
                 crate::headless_scenario::SIM_TICK_MS,
                 TickLane::Ordinary,
-                FrameEffects::default(),
+                &mut FrameEffects::default(),
             )
             .unwrap();
         let sim = scene.sim();
@@ -467,7 +466,7 @@ fn retail_hills_tanya_charge_collapses_under_an_ordinary_incoming_tank() {
                 health,
                 "hut C4 expiry preserves the hut"
             );
-            assert!(hut.pending_c4_detonation.pending().is_none());
+            assert!(hut.building.pending_c4_detonation.pending().is_none());
             assert_eq!(sim.pending_bridge_collapses.at(0), None);
             return;
         }

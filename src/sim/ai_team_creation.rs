@@ -43,18 +43,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::map::entities::EntityCategory;
 use crate::rules::locomotor_type::MovementZone;
+use crate::rules::rule_policy::TeamLimitScope;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::superweapon_type::SuperWeaponKind;
 use crate::rules::team_ai_ini::TeamAiDefinitionSource;
+use crate::sim::house_state::HouseState;
 use crate::sim::intern::InternedId;
 use crate::sim::production::find_factory;
+use crate::sim::scenario_session::ScenarioSession;
 use crate::sim::superweapon::{super_nearly_ready, super_types_with_type};
 use crate::sim::team_script_vm::{
     TeamAiTriggerDefinition, TeamAiTriggerOwner, TeamMemberTypeIdentity, TeamTypeDefinition,
 };
 use crate::sim::timer::CdTimer;
 use crate::sim::world::Simulation;
-use crate::util::native_x87::X87Chop53;
+use crate::util::native_x87::MaskedX87Chop53;
 
 /// The AI trigger weight that takes precedence (`0x006F0C72`): once one
 /// qualifies, only triggers of this weight compete.
@@ -129,20 +132,21 @@ pub(crate) fn update_team_creation(
     sim: &mut Simulation,
     rules: &RuleSet,
     owner: InternedId,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) {
     let frame = sim.session.binary_frame() as i32;
-    let game_mode_nonzero = sim.session.game_mode_nonzero();
     let Some(house) = sim.houses.get(&owner) else {
         return;
     };
     if !house.team_creation().timer.expired(frame)
-        || house.is_controlled_by_human(game_mode_nonzero)
+        || house.is_controlled_by_human(sim.session.rule_policy())
         || house.multiplay_passive()
+        || house.command_driven()
     {
         return;
     }
-    let team_types = select_team_types(sim, rules, owner, frame_effects);
+    let admission = AiTriggerAdmission::resolve(&sim.session, house);
+    let team_types = select_team_types(sim, rules, owner, admission, frame_effects);
     for team_type in team_types {
         sim.create_team(team_type, Some(owner), rules);
     }
@@ -188,14 +192,15 @@ fn select_team_types(
     sim: &mut Simulation,
     rules: &RuleSet,
     owner: InternedId,
-    frame_effects: FrameEffects<'_>,
+    admission: AiTriggerAdmission,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> Vec<InternedId> {
     select_team_types_with(
         sim,
         rules,
         owner,
         |sim, trigger, enemy, defense_full| {
-            is_eligible(sim, rules, trigger, owner, enemy, defense_full)
+            is_eligible(sim, rules, trigger, owner, enemy, defense_full, admission)
         },
         |sim, low, high| sim.scenario_rng.next_range_i32_inclusive(low, high),
         frame_effects,
@@ -210,7 +215,7 @@ pub(crate) fn select_team_types_with(
     owner: InternedId,
     eligible: impl FnMut(&Simulation, &TeamAiTriggerDefinition, Option<InternedId>, bool) -> bool,
     mut draw: impl FnMut(&mut Simulation, i32, i32) -> i32,
-    frame_effects: FrameEffects<'_>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> Vec<InternedId> {
     let Some(house) = sim.houses.get(&owner) else {
         return Vec::new();
@@ -318,9 +323,11 @@ fn draw_ai_trigger(
         if !eligible(sim, trigger, enemy, defense_full) {
             continue;
         }
-        let native = X87Chop53::ftol_i32_low_masked(
-            X87Chop53::load_f64(record.weight()).expect("an AI trigger weight is finite"),
-        );
+        // The running weight is saved state, so a damaged save can hold a
+        // non-finite one; the masked load converts it as native's FLD/FISTP
+        // do (to 0) instead of trusting the record() clamp alone.
+        let native =
+            MaskedX87Chop53::ftol_i32_low_masked(MaskedX87Chop53::load_f64(record.weight()));
         let weight = match personality {
             Some(personality) => {
                 match personality.effective_weight(
@@ -388,19 +395,41 @@ fn draw_ai_trigger(
 ///   `0x005095D0`).
 /// Ares `AITriggerTypeClass_ConditionMet_SideIndex @ 0x1002F2D0` accepts
 /// every registered side: 0 is unrestricted, otherwise token-1 must equal the
-/// house's side index. The stock build keeps its three-token domain.
-fn side_admits(trigger_side: i32, house_side: i32) -> bool {
-    #[cfg(feature = "ares")]
-    {
+/// house's side index. Any other game keeps the stock three-token domain.
+fn side_admits(trigger_side: i32, house_side: i32, ares: bool) -> bool {
+    if ares {
         trigger_side == 0 || house_side == trigger_side - 1
-    }
-    #[cfg(not(feature = "ares"))]
-    {
+    } else {
         match trigger_side {
             1 => house_side == 0,
             2 => house_side == 1,
             3 => house_side == 2,
             _ => true,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct AiTriggerAdmission {
+    uses_house_team_rules: bool,
+    difficulty: usize,
+}
+
+impl AiTriggerAdmission {
+    fn resolve(session: &ScenarioSession, house: &HouseState) -> Self {
+        let uses_house_team_rules = session.rule_policy().uses_house_team_rules();
+        // AITriggerTypeClass::Is_Eligible @ 0x0041E7D7..0x0041E84A
+        // selects House+184 (hardest first) or Scenario+60C (easiest first).
+        let difficulty = if uses_house_team_rules {
+            2 - house.difficulty().table_index()
+        } else {
+            session
+                .campaign_house_difficulties()
+                .map_or(1, |(player, _)| player.table_index())
+        };
+        Self {
+            uses_house_team_rules,
+            difficulty,
         }
     }
 }
@@ -412,6 +441,7 @@ fn is_eligible(
     owner: InternedId,
     enemy: Option<InternedId>,
     defense_full: bool,
+    admission: AiTriggerAdmission,
 ) -> bool {
     let vm = &sim.team_script_vm;
     let Some(house) = sim.houses.get(&owner) else {
@@ -443,20 +473,10 @@ fn is_eligible(
     if !trigger.enabled {
         return false;
     }
-    // gamemd.exe, AITriggerTypeClass::Is_Eligible @ 0x0041E720:
-    // 41E7D7..41E84A selects House+184 (hardest first) in multiplayer,
-    // Scenario+60C (easiest first) in a campaign, before the owner gate.
-    let difficulty = if sim.session.game_mode_nonzero() {
-        if !trigger.multiplayer {
-            return false;
-        }
-        2 - house.difficulty().table_index()
-    } else {
-        sim.session
-            .campaign_house_difficulties()
-            .map_or(1, |(player, _)| player.table_index())
-    };
-    if !trigger.difficulty_enabled[difficulty] {
+    // AITriggerTypeClass::Is_Eligible @ 0x0041E7D7..0x0041E84A.
+    if (admission.uses_house_team_rules && !trigger.multiplayer)
+        || !trigger.difficulty_enabled[admission.difficulty]
+    {
         return false;
     }
     match trigger.owner {
@@ -469,22 +489,26 @@ fn is_eligible(
             }
         }
     }
-    if !side_admits(trigger.side, house.side_index()) || house.tech_level() < trigger.threshold {
+    if !side_admits(trigger.side, house.side_index(), rules.ares_form())
+        || house.tech_level() < trigger.threshold
+    {
         return false;
     }
     if !condition_holds(sim, rules, trigger, owner, enemy) {
         return false;
     }
+    // AITriggerTypeClass::Is_Eligible (41EA71/41EAA4) checks the
+    // creating House even in a campaign.
     let team_types = std::iter::once(primary).chain(secondary);
     team_types
         .clone()
         .all(|tt| zones_admit(sim, tt, owner, enemy))
         && team_types
             .clone()
-            .all(|tt| factories_admit(sim, rules, tt, owner))
+            .all(|tt| factories_admit(sim, rules, tt, owner, !admission.uses_house_team_rules))
         && team_types
             .clone()
-            .all(|tt| !vm.at_max_teams(tt.id, owner, false))
+            .all(|tt| !vm.at_max_teams(tt.id, owner, TeamLimitScope::PerHouse))
 }
 
 /// The eligibility test's defense gate (`0x0041E740..0x0041E7AD`): with no
@@ -676,21 +700,40 @@ fn factories_admit(
     rules: &RuleSet,
     team_type: &TeamTypeDefinition,
     owner: InternedId,
+    allow_recruits_without_factory: bool,
 ) -> bool {
     let Some(task_force) = sim.team_script_vm.task_force_of(team_type.id) else {
         return false;
     };
     task_force.entries.iter().all(|entry| {
-        let factory = rules
-            .object_in_category(
-                entry.member_type.category,
-                sim.interner.resolve(entry.member_type.id),
-            )
+        let object = rules.object_in_category(
+            entry.member_type.category,
+            sim.interner.resolve(entry.member_type.id),
+        );
+        // Ares 3.0 HouseClass_CanInstantiateTeam 100240D0 (hook 0x0050965E)
+        // fails an entry without a type (0x005096F1).
+        let ares = rules.ares_form();
+        if ares && object.is_none() {
+            return false;
+        }
+        let factory = object
             .is_some_and(|obj| find_factory(sim, rules, owner, obj, true, true, false).is_some());
+        // The same hook admits a factory's entry only while the type's
+        // `BuildLimit=` leaves room for the entry's whole count, unless the
+        // house's difficulty has `[GlobalControls] AllowBypassBuildLimit`;
+        // otherwise the entry takes the no-factory path (0x00509671).
+        let factory = factory
+            && (!ares
+                || object.is_some_and(|obj| {
+                    sim.houses.get(&owner).is_some_and(|house| {
+                        rules.ares_ai_bypasses_build_limit(house.difficulty().table_index())
+                    }) || crate::sim::production::ares_build_limit_remaining(sim, rules, owner, obj)
+                        >= entry.count
+                }));
         if factory {
             return true;
         }
-        if sim.session.game_mode_nonzero() {
+        if !allow_recruits_without_factory {
             return false;
         }
         (0..sim.substrate.entities.foot_registry_len())
@@ -705,10 +748,10 @@ fn factories_admit(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_a_b, tests_sim_t_z, tests_sim_trigger)))]
 #[path = "ai_team_creation_tests.rs"]
 pub(crate) mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "ai_team_creation_campaign_tests.rs"]
 mod campaign_tests;

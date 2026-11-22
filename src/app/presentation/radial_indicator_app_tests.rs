@@ -58,6 +58,7 @@ fn query(sim: &Simulation, rules: &RuleSet, ids: &[u64], ms: u64) -> Vec<RadialI
     let mut pulse = RangePulse::default();
     let result = build(
         Some(sim),
+        Some(&crate::app::presentation::frame::PresentationFrame::of_test(sim, rules)),
         Some(rules),
         ids,
         None,
@@ -102,6 +103,7 @@ fn target_query(
     )]);
     build(
         Some(sim),
+        Some(&crate::app::presentation::frame::PresentationFrame::of_test(sim, rules)),
         Some(rules),
         &[],
         armed_super_weapon,
@@ -486,8 +488,7 @@ fn targeting_a_missing_cell_cannot_change_the_simulation_dummy() {
         .unwrap();
     // A retained dummy target makes the dummy coordinate part of lockstep
     // state. This supplied prior isolates rendering from target acquisition.
-    sim.entities_mut_for_test()
-        .get_mut(tank)
+    sim.entity_mut_for_test(tank)
         .unwrap()
         .set_archive_target(Some(crate::sim::combat::TargetKind::Cell(
             u16::MAX,
@@ -517,6 +518,7 @@ fn targeting_a_missing_cell_cannot_change_the_simulation_dummy() {
         );
         let draws = build(
             Some(&sim),
+            Some(&crate::app::presentation::frame::PresentationFrame::of_test(&sim, rules)),
             Some(rules),
             &[],
             Some("NukeSpecial"),
@@ -552,10 +554,9 @@ fn advance(sim: &mut Simulation, rules: &RuleSet) {
     sim.advance_app_frame(
         &[],
         rules,
-        None,
         33,
         TickLane::Ordinary,
-        FrameEffects::default(),
+        &mut FrameEffects::default(),
     )
     .unwrap();
 }
@@ -578,6 +579,7 @@ fn action_query(
     let [placement, superweapon] = pulses;
     build(
         Some(sim),
+        Some(&crate::app::presentation::frame::PresentationFrame::of_test(sim, rules)),
         Some(rules),
         &[],
         super_weapon,
@@ -910,6 +912,7 @@ fn placement_query(
     let mut pulse = RangePulse::default();
     build(
         Some(sim),
+        Some(&crate::app::presentation::frame::PresentationFrame::of_test(sim, rules)),
         Some(rules),
         &[],
         None,
@@ -986,8 +989,7 @@ fn placement_enhancer_rings_need_membership_range_and_the_current_player() {
     let mut sim = state(&rules);
     insert_enhancer(&mut sim, "ENH", "Americans", (16, 16), false);
     assert!(placement_query(&sim, &rules, "GAPOWR", (18, 16), true).is_empty());
-    sim.entities_mut_for_test()
-        .get_mut(1)
+    sim.entity_mut_for_test(1)
         .unwrap()
         .set_building_online_for_test(true);
     assert_eq!(
