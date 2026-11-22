@@ -13,6 +13,9 @@ jobs:
   android:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: android
     steps:
       - uses: actions/checkout@v4
 
@@ -30,26 +33,27 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk
 
-      - name: Set up Android SDK / NDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install NDK 28
-        run: sdkmanager "ndk;28.2.13676358" "platforms;android-26"
+      - name: Install Android NDK and platform
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;28.2.13676358" "platforms;android-26"
 
       - name: Build native library
+        working-directory: .
         env:
-          ANDROID_NDK_HOME: ${{ runner.android.sdk }}/ndk/28.2.13676358
+          ANDROID_NDK_HOME: /usr/local/lib/android/sdk/ndk/28.2.13676358
           CARGO_PROFILE_FAST_OPT_LEVEL: 1
           CARGO_PROFILE_FAST_INCREMENTAL: false
         run: |
           cargo ndk -t arm64-v8a --platform 26 \
             -o android/app/src/main/jniLibs build --profile fast \
             -p vera20k-android --no-default-features --locked
-        working-directory: android
 
       - name: Build debug APK
         run: ./gradlew :app:assembleDebug --no-daemon
-        working-directory: android
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
