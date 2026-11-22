@@ -1,12 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Launch window before the first frame: our own wordmark on our own
-     background colour, so the tap-to-first-frame gap is branded but never
-     somebody else's logo. -->
+<!-- Launch window before the first frame: our own background colour, so the
+     tap-to-first-frame gap is branded but never somebody else's logo. -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/splash_background" />
-    <item>
-        <bitmap
-            android:gravity="fill"
-            android:src="@drawable/splash_hero" />
-    </item>
 </layer-list>
