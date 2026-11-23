@@ -24,6 +24,8 @@ import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.View
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.TextView
@@ -137,11 +139,17 @@ class VeraActivity : NativeActivity() {
             val open = runCatching { nativeTextEntryOpen() }.getOrDefault(false)
             if (open) {
                 hideChips()
-                if (!textEntryShowing) openTextEntry()
+                // Do not pop the keyboard host back up for the same field it
+                // already finished with: the engine edit stays open until Enter
+                // sends the line, so an unsuppressed poll would relaunch the
+                // host on every tick after "写回"/"取消". Only a fresh focus
+                // (closed then open again, tracked below) may auto-open.
+                if (!entrySuppressed && !textEntryShowing) openTextEntry()
                 // Still the same field: keep watching, a second activity would
                 // steal the keyboard back mid-sentence.
                 imeHandler.postDelayed(this, TEXT_POLL_MS)
             } else {
+                entrySuppressed = false
                 textEntryShowing = false
                 showChips()
                 imeHandler.postDelayed(this, TEXT_POLL_MS * 2)
@@ -150,6 +158,10 @@ class VeraActivity : NativeActivity() {
     }
 
     private var textEntryShowing = false
+
+    /// The host was closed and the engine field is still focused: stop
+    /// auto-opening until that field really closes first.
+    private var entrySuppressed = false
 
     /**
      * Opens the keyboard host. It is an ordinary activity, so Android gives it
@@ -168,6 +180,17 @@ class VeraActivity : NativeActivity() {
     private var chips: PopupWindow? = null
     private var chipBar: LinearLayout? = null
     private var chipKeys: LinearLayout? = null
+
+    /** Strip position in decor-view pixels; -1 until first shown. */
+    private var chipX = -1
+    private var chipY = -1
+
+    /** Drag bookkeeping for the strip. */
+    private var dragRawX = 0f
+    private var dragRawY = 0f
+    private var dragOriginX = 0
+    private var dragOriginY = 0
+    private var chipDragging = false
 
     /**
      * The fallback strip: keys the system keyboard does not send to a game window.
@@ -191,6 +214,7 @@ class VeraActivity : NativeActivity() {
             gravity = Gravity.CENTER_VERTICAL
         }
         bar.addView(chipKeys)
+        bar.setOnTouchListener(stripDragListener)
         chipBar = bar
         val popup = PopupWindow(bar, LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT, false)
         popup.isOutsideTouchable = false
@@ -198,15 +222,64 @@ class VeraActivity : NativeActivity() {
         chips = popup
     }
 
+    /** Drag the strip anywhere; taps still fall through to the chips. */
+    private val stripDragListener = View.OnTouchListener { view, event ->
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                dragRawX = event.rawX
+                dragRawY = event.rawY
+                dragOriginX = chipX.coerceAtLeast(0)
+                dragOriginY = chipY.coerceAtLeast(0)
+                chipDragging = false
+                // Do not consume the down: a tap must reach the chip click.
+                false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val dx = (event.rawX - dragRawX).toInt()
+                val dy = (event.rawY - dragRawY).toInt()
+                if (!chipDragging && kotlin.math.abs(dx) + kotlin.math.abs(dy) > dp(8)) {
+                    chipDragging = true
+                }
+                if (chipDragging) {
+                    val decor = window.decorView
+                    val stripW = chipBar?.width ?: view.width
+                    val stripH = chipBar?.height ?: view.height
+                    val maxX = decor.width - stripW
+                    val maxY = decor.height - stripH
+                    chipX = (dragOriginX + dx).coerceIn(0, maxX.coerceAtLeast(0))
+                    chipY = (dragOriginY + dy).coerceIn(0, maxY.coerceAtLeast(0))
+                    chips?.update(chipX, chipY, -1, -1)
+                }
+                chipDragging
+            }
+            MotionEvent.ACTION_UP -> {
+                val wasDragging = chipDragging
+                chipDragging = false
+                wasDragging
+            }
+            else -> false
+        }
+    }
+
     private fun showChips() {
         val popup = chips ?: return
         val bar = chipBar ?: return
+        val decor = window.decorView
+        if (chipX < 0) {
+            bar.measure(
+                View.MeasureSpec.makeMeasureSpec(decor.width, View.MeasureSpec.AT_MOST),
+                View.MeasureSpec.makeMeasureSpec(decor.height, View.MeasureSpec.AT_MOST),
+            )
+            chipX = dp(12)
+            chipY = (decor.height - dp(16) - bar.measuredHeight).coerceAtLeast(dp(16))
+        }
         if (popup.isShowing) {
+            popup.update(chipX, chipY, -1, -1)
             syncChipKeys()
             return
         }
         runCatching {
-            popup.showAtLocation(window.decorView, Gravity.BOTTOM or Gravity.START, dp(12), dp(16))
+            popup.showAtLocation(decor, Gravity.TOP or Gravity.START, chipX, chipY)
         }.onFailure { Log.w("VeraZip", "chip strip: " + it.message) }
         syncChipKeys()
     }
@@ -234,6 +307,7 @@ class VeraActivity : NativeActivity() {
         container.removeAllViews()
         for ((label, bit, name) in wanted) {
             val chip = chip(label, mask and bit != 0)
+            chip.setOnTouchListener(stripDragListener)
             chip.setOnClickListener {
                 // Re-read the live state on the tap instead of trusting the
                 // closure captured when the chip was built; a poll between two
@@ -288,6 +362,9 @@ class VeraActivity : NativeActivity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == REQUEST_TEXT_ENTRY) {
             textEntryShowing = false
+            // Same focused field: hold off auto-reopening until the engine
+            // reports it closed on a later poll.
+            entrySuppressed = true
             val text = if (resultCode == Activity.RESULT_OK) {
                 data?.getStringExtra(TextEntryActivity.EXTRA_TEXT)
             } else {
