@@ -1380,6 +1380,11 @@ class LauncherActivity : Activity() {
     private fun showDirectory(dir: File) {
         currentDir = dir
         entries.clear()
+        // The read is a snapshot of this folder, not an addition to it: a
+        // re-entry (tapping the Files tab again, coming back from a viewer)
+        // used to append the whole listing to the last one, so every visit
+        // doubled the rows and same-named entries piled up.
+        allEntries.clear()
         val showHidden = Prefs.getBoolean(this, Prefs.SHOW_HIDDEN, false)
         allEntries.addAll(
             dir.listFiles()
