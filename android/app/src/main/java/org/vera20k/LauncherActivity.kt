@@ -61,10 +61,15 @@ class LauncherActivity : Activity() {
         const val REQUEST_MOD_ZIP = 0x5657
         const val REQUEST_MOD_TREE = 0x5658
 
-        val ZIP_MIME_TYPES = arrayOf(
+        /** A ZIP / 7z to unpack into private storage, then use as game or mod. */
+        const val REQUEST_ARCHIVE = 0x5659
+
+        /** What the archive picker offers; the format is sniffed, not trusted. */
+        val ARCHIVE_MIME_TYPES = arrayOf(
             "application/zip",
             "application/x-zip-compressed",
             "application/x-zip",
+            "application/x-7z-compressed",
             "application/octet-stream",
         )
     }
@@ -388,7 +393,7 @@ class LauncherActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL
             setPadding(dp(18), dp(10), dp(18), dp(2))
         }
-        actions.addView(modAction("导入 ZIP") { startModZip() },
+        actions.addView(modAction("导入压缩包") { startModZip() },
             LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(8) })
         actions.addView(modAction("导入文件夹") { startModTree() },
             LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(8) })
@@ -690,7 +695,7 @@ class LauncherActivity : Activity() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, ZIP_MIME_TYPES)
+            putExtra(Intent.EXTRA_MIME_TYPES, ARCHIVE_MIME_TYPES)
         }
         startActivityForResult(intent, REQUEST_MOD_ZIP)
     }
@@ -702,7 +707,7 @@ class LauncherActivity : Activity() {
         startActivityForResult(intent, REQUEST_MOD_TREE)
     }
 
-    /** A ZIP becomes one folder in `Mods`, named after the archive. */
+    /** A ZIP or 7z becomes one folder in `Mods`, named after the archive. */
     private fun importModZip(uri: Uri) {
         val label = Importers.displayName(this, uri).substringBeforeLast('.')
         val counter = progress("正在导入模组…")
@@ -712,7 +717,7 @@ class LauncherActivity : Activity() {
                 ".import-" + System.currentTimeMillis(),
             )
             val message = try {
-                Importers.extractZip(this, uri, staging) { files, bytes ->
+                Importers.extractArchive(this, uri, staging) { files, bytes ->
                     if (files < 4 || files % 50 == 0) {
                         counter("已解压 $files 个文件\n" + formatSize(bytes))
                     }
@@ -812,6 +817,16 @@ class LauncherActivity : Activity() {
         tools.addView(mineRow(R.drawable.ic_folder_tool, "地图浏览", ".map / .mpr / .yrm 缩略图") {
             startActivity(Intent(this@LauncherActivity, MapActivity::class.java))
         })
+        tools.addView(divider())
+        // The community site players already use for maps and mods. Only a
+        // browser link: this app neither downloads nor hosts anything from it.
+        tools.addView(
+            mineRow(
+                R.drawable.ic_import,
+                "资源站",
+                "mycnc.net · 第三方站点，用浏览器打开",
+            ) { openResourceSite() },
+        )
         column.addView(tools)
 
         val about = LinearLayout(this).apply {
@@ -898,6 +913,26 @@ class LauncherActivity : Activity() {
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(1),
         )
+    }
+
+    /**
+     * Opens the community resource site in whatever browser the phone has.
+     *
+     * Deliberately a plain link, not a downloader: the site is run by other
+     * people, this app does not host, mirror or verify anything on it, and the
+     * download lands wherever the browser puts it. The player then brings the
+     * archive back through 「导入压缩包」, which unpacks it into this app's own
+     * folder and asks whether it is the game or a mod.
+     */
+    private fun openResourceSite() {
+        val opened = runCatching {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.mycnc.net/")))
+        }.isSuccess
+        if (!opened) {
+            toast("没有可用的浏览器")
+            return
+        }
+        toast("第三方站点，注意确认资源授权\n下载完成后回到这里，用「导入压缩包」选择它")
     }
 
     /** A floating pill over the content, the shape modern phone apps settled on. */
@@ -2081,7 +2116,11 @@ class LauncherActivity : Activity() {
             subtitle = "文件会放进当前目录：" + displayPath(currentDir ?: gameRoot),
             actions = listOf(
                 SheetAction("导入文件…") { startImportFiles() },
-                SheetAction("导入 ZIP 并解压…") { startImportZip() },
+                // The archive route: unpacked into private storage first, then
+                // kept as the game itself or as a mod — never dumped blindly
+                // into whatever folder the browser happens to show.
+                SheetAction("导入压缩包（ZIP / 7z）…") { startArchivePick() },
+                SheetAction("解压到当前目录（ZIP / 7z）…") { startImportZip() },
                 SheetAction("新建文件夹") { promptNewFolder() },
             ),
         )
@@ -2100,9 +2139,19 @@ class LauncherActivity : Activity() {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, ZIP_MIME_TYPES)
+            putExtra(Intent.EXTRA_MIME_TYPES, ARCHIVE_MIME_TYPES)
         }
         startActivityForResult(intent, REQUEST_IMPORT_ZIP)
+    }
+
+    /** The archive entry: unpack into private storage, then ask what it is. */
+    private fun startArchivePick() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, ARCHIVE_MIME_TYPES)
+        }
+        startActivityForResult(intent, REQUEST_ARCHIVE)
     }
 
     @Deprecated("Deprecated in Java")
@@ -2118,6 +2167,10 @@ class LauncherActivity : Activity() {
             }
             REQUEST_MOD_TREE -> {
                 data.data?.let { importModTree(it) }
+                return
+            }
+            REQUEST_ARCHIVE -> {
+                data.data?.let { importArchive(it) }
                 return
             }
         }
@@ -2168,7 +2221,7 @@ class LauncherActivity : Activity() {
         val counter = progress("正在解压…")
         Thread {
             val result = try {
-                val pair = Importers.extractZip(this, uri, dir) { files, bytes ->
+                val pair = Importers.extractArchive(this, uri, dir) { files, bytes ->
                     counter("已解压 $files 个文件\n" + formatSize(bytes))
                 }
                 "已解压 ${pair.first} 个文件（" + formatSize(pair.second) + "）"
@@ -2179,6 +2232,123 @@ class LauncherActivity : Activity() {
                 dismissProgress()
                 toast(result)
                 afterImport()
+            }
+        }.start()
+    }
+
+    // --- archives into private storage --------------------------------------
+
+    /**
+     * Unpacks an archive into a private staging folder, then asks what it is
+     * for. Nothing is written into the game folder or `Mods` before that
+     * answer: a badly packed upload would otherwise leave a half-installed
+     * game behind.
+     */
+    private fun importArchive(uri: Uri) {
+        val label = Importers.displayName(this, uri).substringBeforeLast('.')
+        val counter = progress("正在解压…")
+        Thread {
+            val staging = File(
+                Importers.settingsDir(this),
+                ".archive-" + System.currentTimeMillis(),
+            )
+            val failure = try {
+                Importers.extractArchive(this, uri, staging) { files, bytes ->
+                    if (files < 4 || files % 50 == 0) {
+                        counter("已解压 $files 个文件\n" + formatSize(bytes))
+                    }
+                }
+                null
+            } catch (error: Throwable) {
+                Importers.deleteTree(staging)
+                "解压失败：" + (error.message ?: "压缩包可能已损坏或被加密")
+            }
+            runOnUiThread {
+                dismissProgress()
+                if (failure != null) {
+                    toast(failure)
+                } else {
+                    askArchiveTarget(staging, label)
+                }
+            }
+        }.start()
+    }
+
+    /** What to do with an unpacked archive: game, mod, or nothing. */
+    private fun askArchiveTarget(root: File, label: String) {
+        val masters = Importers.locateMasters(root)
+        val found = if (masters != null) {
+            "检测到 ra2md.mix / ra2.mix"
+        } else {
+            "没有检测到 ra2md.mix / ra2.mix"
+        }
+        showSheet(
+            "导入「$label」",
+            "$found。\n" +
+                "· 作为游戏本体 → 放进 " + displayPath(gameRoot) + "\n" +
+                "· 作为模组 → 放进 Mods，之后在「模组」页启用",
+            listOf(
+                SheetAction("作为游戏本体") { useArchiveAsBase(root, label) },
+                SheetAction("作为模组") { useArchiveAsMod(root, label) },
+                SheetAction("取消并删除", danger = true) {
+                    Importers.deleteTree(root)
+                },
+            ),
+        )
+    }
+
+    /** Puts the unpacked tree where the engine reads the game from. */
+    private fun useArchiveAsBase(root: File, label: String) {
+        val counter = progress("正在放进游戏目录…")
+        Thread {
+            val message = try {
+                // A download often wraps the installation one or two folders
+                // deep ("RA2YR/Patch1.001/…"): install from the folder that
+                // really holds the archives, not from the wrapper.
+                val source = Importers.locateMasters(root) ?: root
+                val pair = Importers.mergeTree(source, gameRoot) { files, bytes ->
+                    if (files < 4 || files % 25 == 0) {
+                        counter("已写入 $files 个文件\n" + formatSize(bytes))
+                    }
+                }
+                Importers.deleteTree(root)
+                Importers.registerGameDir(this, gameRoot)
+                "「$label」已放进 " + gameRoot.name + "（${pair.first} 个文件）"
+            } catch (error: Throwable) {
+                "放入失败：" + (error.message ?: "无法写入游戏目录")
+            }
+            runOnUiThread {
+                dismissProgress()
+                toast(message)
+                afterImport()
+            }
+        }.start()
+    }
+
+    /** Puts the unpacked tree into `Mods` as one mod folder, ready to enable. */
+    private fun useArchiveAsMod(root: File, label: String) {
+        val counter = progress("正在放进 Mods…")
+        Thread {
+            val message = try {
+                val source = Importers.collapseSingleFolder(root)
+                val target = Importers.uniqueDir(
+                    Importers.modsDir(this),
+                    Importers.plainFolderName(label),
+                )
+                if (!Importers.moveTree(source, target)) {
+                    throw java.io.IOException("无法把文件移进 Mods")
+                }
+                Importers.stripArchiveNoise(target)
+                if (source != root) Importers.deleteTree(root)
+                "已作为模组导入「${target.name}」\n到「模组」页点它启用"
+            } catch (error: Throwable) {
+                Importers.deleteTree(root)
+                "导入模组失败：" + (error.message ?: "无法写入 Mods")
+            }
+            runOnUiThread {
+                dismissProgress()
+                toast(message)
+                refreshMods()
             }
         }.start()
     }

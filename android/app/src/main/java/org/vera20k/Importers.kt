@@ -129,6 +129,112 @@ internal object Importers {
         return File(context.filesDir, "ra2").apply { mkdirs() }
     }
 
+    // --- archives -----------------------------------------------------------
+
+    /**
+     * Unpack any archive this app reads (ZIP and 7z) into [destination].
+     *
+     * The format is decided by the file's own signature, not by its name: a
+     * `.7z` renamed to `.zip` still unpacks, and an archive saved without an
+     * extension is not silently treated as ZIP. RAR is told apart so the player
+     * gets "convert it" instead of "the archive is corrupt".
+     */
+    fun extractArchive(
+        context: Context,
+        uri: Uri,
+        destination: File,
+        onProgress: (files: Int, bytes: Long) -> Unit,
+    ): Pair<Int, Long> {
+        // 7z needs a random-access file, and a full game archive is unpacked
+        // beside its own copy: refuse up front instead of failing at 90 %.
+        val size = documentSize(context, uri)
+        if (size > 0 && context.filesDir.usableSpace < size * 2) {
+            throw IOException(
+                "空间不足：压缩包 " + (size shr 20) + " MB，大约还要两倍空间，当前剩余 " +
+                    (context.filesDir.usableSpace shr 20) + " MB",
+            )
+        }
+        return when (archiveKind(context, uri)) {
+            "7z" -> {
+                val temp = File(context.cacheDir, "archive-" + System.currentTimeMillis() + ".7z")
+                try {
+                    copyDocument(context, uri, temp) { }
+                    Archives.extractSevenZip(temp, destination, onProgress)
+                } finally {
+                    temp.delete()
+                }
+            }
+            "rar" -> throw IOException("暂不支持 RAR：请先解成 ZIP 或 7z 再导入")
+            else -> extractZip(context, uri, destination, onProgress)
+        }
+    }
+
+    /** The archive's kind from its first bytes: "7z", "zip", "rar" or "". */
+    private fun archiveKind(context: Context, uri: Uri): String {
+        val head = ByteArray(8)
+        try {
+            context.contentResolver.openInputStream(uri)?.use { raw ->
+                val input = java.io.BufferedInputStream(raw)
+                input.mark(16)
+                val read = input.read(head)
+                input.reset()
+                if (read > 0) return Archives.kindOf(head.copyOf(read))
+            }
+        } catch (_: Throwable) {
+            // An unreadable stream falls back to the ZIP path, whose own error
+            // message ("无法打开压缩包") is the one worth showing.
+        }
+        return ""
+    }
+
+    /** The size the picker reports for a document; 0 when it does not say. */
+    private fun documentSize(context: Context, uri: Uri): Long {
+        context.contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)
+            ?.use { cursor ->
+                val index = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (index >= 0 && cursor.moveToFirst() && !cursor.isNull(index)) {
+                    return cursor.getLong(index)
+                }
+            }
+        return 0
+    }
+
+    /** Copies a tree's contents into [target], overwriting what shares a name. */
+    fun mergeTree(
+        source: File,
+        target: File,
+        onProgress: (files: Int, bytes: Long) -> Unit,
+    ): Pair<Int, Long> {
+        var files = 0
+        var bytes = 0L
+        fun walk(dir: File, into: File) {
+            into.mkdirs()
+            dir.listFiles()?.forEach { child ->
+                val dest = File(into, child.name)
+                if (child.isDirectory) {
+                    walk(child, dest)
+                    return@forEach
+                }
+                dest.parentFile?.mkdirs()
+                child.inputStream().use { input ->
+                    dest.outputStream().use { sink ->
+                        val buffer = ByteArray(1 shl 16)
+                        while (true) {
+                            val read = input.read(buffer)
+                            if (read <= 0) break
+                            sink.write(buffer, 0, read)
+                        }
+                    }
+                }
+                files++
+                bytes += child.length()
+                onProgress(files, bytes)
+            }
+        }
+        walk(source, target)
+        return Pair(files, bytes)
+    }
+
     // --- mods ---------------------------------------------------------------
 
     /**

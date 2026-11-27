@@ -11,6 +11,11 @@ kotlin {
 
 dependencies {
     testImplementation("junit:junit:4.13.2")
+    // 7z: most CNC resource sites ship solid 7z archives, and java.util.zip
+    // reads only ZIP. Commons Compress is pure Java — no extra .so per ABI —
+    // and XZ is the LZMA/LZMA2 codec it calls for 7z's usual methods.
+    implementation("org.apache.commons:commons-compress:1.27.1")
+    implementation("org.tukaani:xz:1.10")
 }
 
 // versionName reads the Cargo package version, so the APK and the binary inside
@@ -23,7 +28,7 @@ val veraVersionName: String = rootProject.file("../Cargo.toml")
     .first { it.trimStart().startsWith("version = ") }
     .substringAfter('"')
     .substringBefore('"')
-val veraVersionCode = 209
+val veraVersionCode = 210
 
 android {
     namespace = "org.vera20k"
