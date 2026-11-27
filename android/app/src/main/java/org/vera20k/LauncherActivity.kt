@@ -57,6 +57,10 @@ class LauncherActivity : Activity() {
         const val REQUEST_IMPORT_ZIP = 0x5655
         const val REQUEST_IMPORT_TREE = 0x5656
 
+        /** Mods: a ZIP to unpack into `Mods`, and a folder to copy in. */
+        const val REQUEST_MOD_ZIP = 0x5657
+        const val REQUEST_MOD_TREE = 0x5658
+
         val ZIP_MIME_TYPES = arrayOf(
             "application/zip",
             "application/x-zip-compressed",
@@ -94,10 +98,21 @@ class LauncherActivity : Activity() {
     private lateinit var enterButton: TextView
     private lateinit var heroSub: TextView
 
+    /** The resource half of the hero subtitle; the mod suffix follows it. */
+    private var heroBase = ""
+
     private var activeTab = 0
     private lateinit var tabHome: View
     private lateinit var tabFiles: View
+    private lateinit var tabMods: View
     private lateinit var tabMine: View
+    private lateinit var modList: LinearLayout
+    private lateinit var modStatusTitle: TextView
+    private lateinit var modStatusSub: TextView
+
+    /** Rows whose file count is still being walked, refreshed off the UI thread. */
+    private val modMetaRows = mutableListOf<Triple<String, File, TextView>>()
+    private var modScanToken = 0
     private val navIcons = mutableListOf<ImageView>()
     private val navLabels = mutableListOf<TextView>()
 
@@ -138,6 +153,23 @@ class LauncherActivity : Activity() {
 
     // --- layout -------------------------------------------------------------
 
+    /**
+     * The engine's own Mods page can also change the choice, so the launcher
+     * re-reads it whenever it comes back in front.
+     */
+    override fun onResume() {
+        super.onResume()
+        if (::modList.isInitialized) refreshMods()
+        updateHeroSub()
+    }
+
+    /** Resource state plus the mod the next launch plays, on the hero card. */
+    private fun updateHeroSub() {
+        if (!::heroSub.isInitialized || heroBase.isEmpty()) return
+        val mod = Importers.activeMod(this)
+        heroSub.text = heroBase + if (mod != null) " · 模组 $mod" else ""
+    }
+
     private fun buildLayout(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -146,11 +178,13 @@ class LauncherActivity : Activity() {
 
         tabHome = buildHomeTab()
         tabFiles = buildFilesTab()
+        tabMods = buildModsTab()
         tabMine = buildMineTab()
 
         val host = FrameLayout(this).apply {
             addView(tabHome, full())
             addView(tabFiles, full())
+            addView(tabMods, full())
             addView(tabMine, full())
         }
         root.addView(host, LinearLayout.LayoutParams(
@@ -173,13 +207,14 @@ class LauncherActivity : Activity() {
         ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
     )
 
-    /** 0 首页, 1 文件, 2 我的. One content pane at a time, no fragments needed. */
+    /** 0 首页, 1 文件, 2 模组, 3 我的. One content pane at a time. */
     private fun showTab(index: Int) {
         activeTab = index
         tabHome.visibility = if (index == 0) View.VISIBLE else View.GONE
         tabFiles.visibility = if (index == 1) View.VISIBLE else View.GONE
-        tabMine.visibility = if (index == 2) View.VISIBLE else View.GONE
-        for (i in 0 until 3) {
+        tabMods.visibility = if (index == 2) View.VISIBLE else View.GONE
+        tabMine.visibility = if (index == 3) View.VISIBLE else View.GONE
+        for (i in 0 until 4) {
             val colour = if (i == index) COL_ACCENT else COL_TEXT_DIM
             navIcons.getOrNull(i)?.setColorFilter(colour, PorterDuff.Mode.SRC_IN)
             navLabels.getOrNull(i)?.setTextColor(colour)
@@ -187,6 +222,7 @@ class LauncherActivity : Activity() {
         // Coming back to the browser after an import elsewhere should show that
         // import rather than a list read before it happened.
         if (index == 1) currentDir?.let { showDirectory(it) }
+        if (index == 2) refreshMods()
     }
 
     private fun buildHomeTab(): View {
@@ -300,6 +336,450 @@ class LauncherActivity : Activity() {
         return column
     }
 
+    // --- mods ---------------------------------------------------------------
+
+    /**
+     * VERA's own Mods page is shaped for a desktop: it adds mods through a
+     * native file chooser, shows the folder in a file manager, and switches the
+     * choice with a restart — none of which exists on a phone. This tab does the
+     * same work with what Android does have: it fills `Mods` through the
+     * Storage Access Framework and writes the one `[paths] mod` line the engine
+     * reads at start-up, so the engine's own loading is untouched.
+     */
+    private fun buildModsTab(): View {
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        column.addView(TextView(this).apply {
+            text = "模组"
+            sp(19f)
+            setTextColor(COL_TEXT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            setPadding(dp(18), dp(14), dp(18), dp(2))
+        })
+
+        val status = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(13), dp(16), dp(13))
+            background = cardBg()
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply {
+                leftMargin = dp(18)
+                rightMargin = dp(18)
+                topMargin = dp(10)
+            }
+        }
+        modStatusTitle = TextView(this).apply {
+            text = "正在读取…"
+            sp(14f)
+            setTextColor(COL_TEXT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+        }
+        modStatusSub = TextView(this).apply {
+            text = "选择只在进入游戏时生效"
+            sp(11f)
+            setTextColor(COL_TEXT_DIM)
+            setPadding(0, dp(4), 0, 0)
+        }
+        status.addView(modStatusTitle)
+        status.addView(modStatusSub)
+        column.addView(status)
+
+        val actions = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(18), dp(10), dp(18), dp(2))
+        }
+        actions.addView(modAction("导入 ZIP") { startModZip() },
+            LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(8) })
+        actions.addView(modAction("导入文件夹") { startModTree() },
+            LinearLayout.LayoutParams(0, dp(44), 1f).apply { rightMargin = dp(8) })
+        actions.addView(modAction("玩原版") { disableMod() },
+            LinearLayout.LayoutParams(0, dp(44), 1f))
+        column.addView(actions)
+
+        modList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(8), dp(18), dp(18))
+        }
+        column.addView(ScrollView(this).apply {
+            isFillViewport = true
+            addView(modList, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+        return column
+    }
+
+    private fun modAction(label: String, run: () -> Unit): TextView = TextView(this).apply {
+        text = label
+        sp(12f)
+        gravity = Gravity.CENTER
+        setTextColor(COL_ACCENT)
+        background = ripple(pill(COL_SURFACE, 14, 0x33EFB44C), 0x26FFFFFF)
+        setOnClickListener { run() }
+    }
+
+    /** Re-reads `Mods` and the engine's choice; nothing is cached across tabs. */
+    private fun refreshMods() {
+        if (!::modList.isInitialized) return
+        val modsDir = Importers.modsDir(this)
+        val active = Importers.activeMod(this)
+        val folders = (modsDir.listFiles() ?: emptyArray())
+            .filter { it.isDirectory && !it.name.startsWith(".") }
+            .sortedBy { it.name.lowercase(Locale.US) }
+        val activeDir = active?.let { name -> folders.firstOrNull { it.name.equals(name, true) } }
+        modStatusTitle.text = when {
+            active == null -> "当前：原版游戏"
+            activeDir == null -> "当前：原版游戏 · 找不到「$active」"
+            else -> "当前：" + modTitle(activeDir)
+        }
+        modStatusSub.text = when {
+            active == null -> "在下面的模组上点「启用」，再进入游戏"
+            activeDir == null -> "配置里写的文件夹已经不在 Mods 里，点「玩原版」清掉"
+            else -> "已启用 · 下次进入游戏生效"
+        }
+
+        modList.removeAllViews()
+        modMetaRows.clear()
+        val token = ++modScanToken
+        if (folders.isEmpty()) {
+            modList.addView(
+                hintCard(
+                    "还没有模组",
+                    "用上面的「导入 ZIP」或「导入文件夹」放一个进来。一个模组就是 Mods 里的一个文件夹，" +
+                        "里面放它要覆盖的 rulesmd.ini / artmd.ini 等文件，可以再加一个 mod.ini 写名字。",
+                ),
+            )
+            return
+        }
+        for (dir in folders) {
+            modList.addView(modRow(dir, dir === activeDir))
+        }
+        // File counts are walked off the UI thread: a total-conversion mod is
+        // hundreds of megabytes in thousands of files.
+        Thread {
+            for ((_, dir, meta) in modMetaRows.toList()) {
+                val (files, bytes) = countTree(dir)
+                runOnUiThread {
+                    if (token != modScanToken || isFinishing) return@runOnUiThread
+                    meta.text = modMetaText(dir, files, bytes)
+                }
+            }
+        }.start()
+    }
+
+    private fun modRow(dir: File, active: Boolean): View {
+        val title = TextView(this).apply {
+            text = modTitle(dir)
+            sp(13f)
+            setTextColor(COL_TEXT)
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            maxLines = 1
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        val meta = TextView(this).apply {
+            text = modMetaText(dir, -1, 0)
+            sp(10f)
+            setTextColor(COL_TEXT_DIM)
+            setPadding(0, dp(3), 0, 0)
+            maxLines = 2
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        modMetaRows += Triple(dir.name, dir, meta)
+        val column = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, dp(10), 0)
+        }
+        column.addView(title)
+        column.addView(meta)
+
+        val badge = TextView(this).apply {
+            text = if (active) "使用中" else "启用"
+            sp(10f)
+            gravity = Gravity.CENTER
+            setTextColor(if (active) COL_DARK_TEXT else COL_ACCENT)
+            background = pill(
+                if (active) COL_ACCENT else Color.TRANSPARENT,
+                9,
+                if (active) 0 else 0x33EFB44C,
+            )
+            setPadding(dp(9), dp(4), dp(9), dp(4))
+        }
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+            background = ripple(cardBg())
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { bottomMargin = dp(8) }
+            setOnClickListener { showModSheet(dir, active) }
+            setOnLongClickListener {
+                showModSheet(dir, active)
+                true
+            }
+            addView(column, LinearLayout.LayoutParams(
+                0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f,
+            ))
+            addView(badge, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }
+    }
+
+    private fun hintCard(title: String, body: String): View =
+        LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(14), dp(16), dp(14))
+            background = cardBg()
+            addView(TextView(this@LauncherActivity).apply {
+                text = title
+                sp(13f)
+                setTextColor(COL_TEXT)
+                typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            })
+            addView(TextView(this@LauncherActivity).apply {
+                text = body
+                sp(11f)
+                setTextColor(COL_TEXT_DIM)
+                setLineSpacing(dp(2).toFloat(), 1.05f)
+                setPadding(0, dp(5), 0, 0)
+            })
+        }
+
+    /** The name the Mods page shows: `mod.ini`'s `Name=`, else the folder. */
+    private fun modTitle(dir: File): String =
+        modIniValues(dir)["name"]?.takeIf { it.isNotBlank() } ?: dir.name
+
+    /** Author, version and size on one line; `files < 0` means still counting. */
+    private fun modMetaText(dir: File, files: Int, bytes: Long): String {
+        val info = modIniValues(dir)
+        val parts = mutableListOf<String>()
+        info["author"]?.takeIf { it.isNotBlank() }?.let { parts += it }
+        info["version"]?.takeIf { it.isNotBlank() }?.let { parts += "v$it" }
+        if (files < 0) {
+            parts += "统计中…"
+        } else {
+            parts += "$files 个文件"
+            if (bytes > 0) parts += formatSize(bytes)
+        }
+        return parts.joinToString(" · ")
+    }
+
+    /** `mod.ini`'s `[Mod]` keys, lower-cased; an absent file is an empty map. */
+    private fun modIniValues(dir: File): Map<String, String> {
+        val file = dir.listFiles()?.firstOrNull { it.isFile && it.name.equals("mod.ini", true) }
+            ?: return emptyMap()
+        val values = HashMap<String, String>()
+        try {
+            var section = ""
+            file.forEachLine { raw ->
+                val line = raw.substringBefore(';').trim()
+                if (line.startsWith("[")) {
+                    section = line.removePrefix("[").substringBefore(']').trim().lowercase(Locale.US)
+                    return@forEachLine
+                }
+                if (section != "mod") return@forEachLine
+                val equals = line.indexOf('=')
+                if (equals <= 0) return@forEachLine
+                values[line.substring(0, equals).trim().lowercase(Locale.US)] =
+                    line.substring(equals + 1).trim()
+            }
+        } catch (_: Throwable) {
+            return values
+        }
+        return values
+    }
+
+    private fun countTree(root: File): Pair<Int, Long> {
+        var files = 0
+        var bytes = 0L
+        fun walk(dir: File) {
+            val children = dir.listFiles() ?: return
+            for (child in children) {
+                if (child.isDirectory) walk(child) else {
+                    files++
+                    bytes += child.length()
+                }
+            }
+        }
+        walk(root)
+        return Pair(files, bytes)
+    }
+
+    /** Tap or long-press on a row: enable, read it, or take it away. */
+    private fun showModSheet(dir: File, active: Boolean) {
+        val actions = mutableListOf<SheetAction>()
+        if (active) {
+            actions += SheetAction("停用 · 玩原版") { disableMod() }
+        } else {
+            actions += SheetAction("启用（下次进入游戏生效）") { enableMod(dir.name) }
+        }
+        actions += SheetAction("详情") { showModDetails(dir) }
+        actions += SheetAction("删除", danger = true) { confirmDeleteMod(dir, active) }
+        showSheet(
+            modTitle(dir),
+            dir.name + " · " + if (active) "使用中" else "未启用",
+            actions,
+        )
+    }
+
+    private fun showModDetails(dir: File) {
+        val info = modIniValues(dir)
+        val (files, bytes) = countTree(dir)
+        val lines = mutableListOf<String>()
+        info["author"]?.takeIf { it.isNotBlank() }?.let { lines += "作者：$it" }
+        info["version"]?.takeIf { it.isNotBlank() }?.let { lines += "版本：$it" }
+        info["needs"]?.takeIf { it.isNotBlank() }?.let { lines += "要求引擎：$it" }
+        info["about"]?.takeIf { it.isNotBlank() }?.let { lines += "\n$it" }
+        info["terms"]?.takeIf { it.isNotBlank() }?.let { lines += "\n使用条款：$it" }
+        lines += "\n$files 个文件 · " + formatSize(bytes)
+        lines += "文件夹：Mods/" + dir.name
+        showSheet(
+            modTitle(dir),
+            lines.joinToString("\n"),
+            listOf(SheetAction("关闭") {}),
+        )
+    }
+
+    private fun enableMod(folder: String) {
+        if (Importers.activeMod(this).equals(folder, ignoreCase = true)) {
+            toast("「$folder」已经启用")
+            return
+        }
+        if (!Importers.setActiveMod(this, folder)) {
+            toast("写入 config.toml 失败：先把游戏资源导入进来")
+            return
+        }
+        refreshMods()
+        updateHeroSub()
+        toast("已启用「$folder」，进入游戏后生效")
+    }
+
+    private fun disableMod() {
+        if (Importers.activeMod(this) == null) {
+            toast("现在就是原版游戏")
+            return
+        }
+        if (!Importers.setActiveMod(this, null)) {
+            toast("写入 config.toml 失败")
+            return
+        }
+        refreshMods()
+        updateHeroSub()
+        toast("已切回原版游戏")
+    }
+
+    private fun confirmDeleteMod(dir: File, active: Boolean) {
+        showSheet(
+            "删除「${modTitle(dir)}」？",
+            if (active) "它正在使用中，删除后会自动切回原版游戏。" else "这会连同文件夹一起从 Mods 里移除。",
+            listOf(
+                SheetAction("删除", danger = true) {
+                    if (active) Importers.setActiveMod(this, null)
+                    val removed = deleteTree(dir)
+                    refreshMods()
+                    updateHeroSub()
+                    toast(if (removed) "已删除「${dir.name}」" else "有文件删不掉，请重试")
+                },
+                SheetAction("取消") {},
+            ),
+        )
+    }
+
+    private fun startModZip() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, ZIP_MIME_TYPES)
+        }
+        startActivityForResult(intent, REQUEST_MOD_ZIP)
+    }
+
+    private fun startModTree() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        startActivityForResult(intent, REQUEST_MOD_TREE)
+    }
+
+    /** A ZIP becomes one folder in `Mods`, named after the archive. */
+    private fun importModZip(uri: Uri) {
+        val label = Importers.displayName(this, uri).substringBeforeLast('.')
+        val counter = progress("正在导入模组…")
+        Thread {
+            val staging = File(
+                Importers.modsDir(this),
+                ".import-" + System.currentTimeMillis(),
+            )
+            val message = try {
+                Importers.extractZip(this, uri, staging) { files, bytes ->
+                    if (files < 4 || files % 50 == 0) {
+                        counter("已解压 $files 个文件\n" + formatSize(bytes))
+                    }
+                }
+                finishModImport(staging, label)
+            } catch (error: Throwable) {
+                Importers.deleteTree(staging)
+                "导入失败：" + (error.message ?: "压缩包可能已损坏或被加密")
+            }
+            runOnUiThread {
+                dismissProgress()
+                toast(message)
+                refreshMods()
+            }
+        }.start()
+    }
+
+    /** A picked folder is copied in whole, named after the folder. */
+    private fun importModTree(uri: Uri) {
+        val label = Importers.displayName(this, uri)
+        val counter = progress("正在复制模组…")
+        Thread {
+            val staging = File(
+                Importers.modsDir(this),
+                ".import-" + System.currentTimeMillis(),
+            )
+            val message = try {
+                Importers.copyTree(this, uri, staging) { files, bytes ->
+                    if (files < 4 || files % 50 == 0) {
+                        counter("已复制 $files 个文件\n" + formatSize(bytes))
+                    }
+                }
+                finishModImport(staging, label)
+            } catch (error: Throwable) {
+                Importers.deleteTree(staging)
+                "导入失败：" + (error.message ?: "无法读取所选文件夹")
+            }
+            runOnUiThread {
+                dismissProgress()
+                toast(message)
+                refreshMods()
+            }
+        }.start()
+    }
+
+    /**
+     * Moves what was unpacked into its own folder in `Mods`. A ZIP made on a
+     * desktop usually carries one wrapper folder, and a mod dropped into
+     * `Mods` under that wrapper would never be read: `collapseSingleFolder`
+     * takes the real root out of it first.
+     */
+    private fun finishModImport(staging: File, label: String): String {
+        val root = Importers.collapseSingleFolder(staging)
+        val target = Importers.uniqueDir(
+            Importers.modsDir(this),
+            Importers.plainFolderName(label),
+        )
+        if (!Importers.moveTree(root, target)) {
+            throw java.io.IOException("无法把文件移进 Mods")
+        }
+        // A zip made on a Mac leaves __MACOSX beside the real files; it is not
+        // part of the mod and the engine would list it as one more folder.
+        Importers.stripArchiveNoise(target)
+        if (root != staging) Importers.deleteTree(staging)
+        return "已导入「${target.name}」\n点它启用，再进入游戏生效"
+    }
+
     private fun buildMineTab(): View {
         val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         column.addView(TextView(this).apply {
@@ -348,7 +828,7 @@ class LauncherActivity : Activity() {
             }
         }
         about.addView(TextView(this).apply {
-            text = "VeraZip 0.2.7"
+            text = "VeraZip 0.4.1"
             sp(14f)
             setTextColor(COL_TEXT)
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
@@ -435,7 +915,9 @@ class LauncherActivity : Activity() {
             LinearLayout.LayoutParams(0, dp(52), 1f))
         bar.addView(navItem(R.drawable.ic_folder, "文件", 1),
             LinearLayout.LayoutParams(0, dp(52), 1f))
-        bar.addView(navItem(R.drawable.ic_person, "我的", 2),
+        bar.addView(navItem(R.drawable.ic_tools, "模组", 2),
+            LinearLayout.LayoutParams(0, dp(52), 1f))
+        bar.addView(navItem(R.drawable.ic_person, "我的", 3),
             LinearLayout.LayoutParams(0, dp(52), 1f))
         wrap.addView(bar, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, dp(64),
@@ -998,11 +1480,12 @@ class LauncherActivity : Activity() {
                 sizeValue.text = formatSize(bytes)
                 sizeCount.text = String.format(Locale.US, "%,d 个文件", files)
                 enterButton.text = if (complete) "进入游戏" else "进入游戏 · 缺资源"
-                heroSub.text = if (complete) {
+                heroBase = if (complete) {
                     "ra2md.mix / ra2.mix 就位 · 可直接进入"
                 } else {
                     "还缺 " + REQUIRED_ARCHIVES.filter { present[it] != true }.joinToString(" / ")
                 }
+                updateHeroSub()
             }
         }.start()
     }
@@ -1622,6 +2105,17 @@ class LauncherActivity : Activity() {
         @Suppress("DEPRECATION")
         super.onActivityResult(requestCode, resultCode, data)
         if (resultCode != RESULT_OK || data == null) return
+        // Mods fill their own folder, not the one the browser shows.
+        when (requestCode) {
+            REQUEST_MOD_ZIP -> {
+                data.data?.let { importModZip(it) }
+                return
+            }
+            REQUEST_MOD_TREE -> {
+                data.data?.let { importModTree(it) }
+                return
+            }
+        }
         val dir = currentDir ?: return
         when (requestCode) {
             REQUEST_IMPORT_FILES -> {

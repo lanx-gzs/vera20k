@@ -129,6 +129,197 @@ internal object Importers {
         return File(context.filesDir, "ra2").apply { mkdirs() }
     }
 
+    // --- mods ---------------------------------------------------------------
+
+    /**
+     * The folder the engine keeps its own settings in: `[paths] settings_dir`
+     * when config.toml names one, else the app's files folder — which is what
+     * the engine itself falls back to on Android.
+     */
+    fun settingsDir(context: Context): File {
+        val raw = configPathsValue(context, "settings_dir")
+        val dir = when {
+            raw.isNullOrBlank() -> context.filesDir
+            File(raw).isAbsolute -> File(raw)
+            else -> File(context.filesDir, raw)
+        }
+        dir.mkdirs()
+        return dir
+    }
+
+    /** `Mods` under the settings folder: one subfolder per mod. */
+    fun modsDir(context: Context): File = File(settingsDir(context), "Mods").apply { mkdirs() }
+
+    /** The folder `[paths] mod` names; null means the original game. */
+    fun activeMod(context: Context): String? =
+        configPathsValue(context, "mod")?.takeIf { it.isNotBlank() }
+
+    /**
+     * Keep the mod the next launch plays, as `[paths] mod` in the config the
+     * engine reads; null (or blank) plays the original game. Refused while no
+     * config exists: the engine would then report a missing `ra2_dir`, not a
+     * missing game, and the player would lose the wizard's explanation.
+     */
+    fun setActiveMod(context: Context, folder: String?): Boolean {
+        val config = File(context.filesDir, "config.toml")
+        if (!config.isFile) return false
+        return try {
+            val updated = setPathsKey(config.readText(), "mod", folder.orEmpty())
+            val temp = File(config.parentFile, "config.toml.tmp")
+            temp.writeText(updated)
+            if (!temp.renameTo(config)) temp.copyTo(config, overwrite = true)
+            log("config.toml mod -> " + (folder ?: "(original)"))
+            true
+        } catch (error: Throwable) {
+            log("config.toml mod write failed: " + error.message)
+            false
+        }
+    }
+
+    /** The value under `[paths] key` in config.toml, unquoted; null when absent. */
+    fun configPathsValue(context: Context, key: String): String? {
+        val config = File(context.filesDir, "config.toml")
+        if (!config.isFile) return null
+        var section = ""
+        val lines = try {
+            config.readLines()
+        } catch (_: Throwable) {
+            return null
+        }
+        for (raw in lines) {
+            val line = raw.trim()
+            if (line.startsWith("[")) {
+                section = line.removePrefix("[").substringBefore(']').trim()
+                continue
+            }
+            if (section != "paths" || line.startsWith("#") || !line.contains('=')) continue
+            if (line.substringBefore('=').trim() != key) continue
+            return tomlString(line.substringAfter('='))
+        }
+        return null
+    }
+
+    /** A TOML string value with its quotes taken off; bare words kept whole. */
+    private fun tomlString(raw: String): String? {
+        val text = raw.trim()
+        if (text.isEmpty()) return null
+        val quote = text.first()
+        if (quote == '"' || quote == '\'') {
+            val end = text.indexOf(quote, 1)
+            return if (end < 0) null else text.substring(1, end)
+        }
+        return text.substringBefore(' ').substringBefore('\t')
+    }
+
+    /**
+     * The mod's own folder inside an unpacked archive.
+     *
+     * Archives are made in three shapes: the mod's files at the root, one
+     * wrapper folder, or a wrapper folder beside a README. A mod left one level
+     * deeper than `Mods` is never read, so the wrapper is stepped out of —
+     * but only when the level holds no mod files of its own, so a real mod tree
+     * (with its own `Rules/`, `Art/`…) is never flattened by mistake.
+     */
+    fun collapseSingleFolder(root: File): File {
+        var dir = root
+        repeat(3) {
+            val children = (dir.listFiles() ?: return dir).filterNot { noise(it.name) }
+            if (children.isEmpty()) return dir
+            val folders = children.filter { it.isDirectory }
+            val files = children.filterNot { it.isDirectory }
+            // Files that are part of a mod — anything but a note beside it.
+            if (files.any { !isNote(it.name) }) return dir
+            if (folders.size != 1) return dir
+            dir = folders[0]
+        }
+        return dir
+    }
+
+    /** Names a desktop archive leaves behind: never a mod's own folder. */
+    private fun noise(name: String): Boolean =
+        name.startsWith('.') ||
+            name.equals("__MACOSX", ignoreCase = true) ||
+            name.equals("Thumbs.db", ignoreCase = true) ||
+            name.equals("desktop.ini", ignoreCase = true)
+
+    /** A readme or screenshot that ships beside a mod's folder. */
+    private fun isNote(name: String): Boolean {
+        val extension = name.substringAfterLast('.', "").lowercase()
+        return extension in setOf(
+            "txt", "md", "pdf", "doc", "docx", "rtf", "html", "htm",
+            "url", "jpg", "jpeg", "png", "gif", "bmp",
+        )
+    }
+
+    /** Removes what a desktop archive leaves at a mod's root (`__MACOSX`). */
+    fun stripArchiveNoise(mod: File) {
+        mod.listFiles()?.forEach { child ->
+            if (noise(child.name)) deleteTree(child)
+        }
+    }
+
+    /** A folder name that is safe on every file system; "模组" when nothing is left. */
+    fun plainFolderName(name: String): String {
+        val cleaned = name
+            .replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001f]"), " ")
+            .trim()
+            .trim('.')
+            .trim()
+        return cleaned.ifBlank { "模组" }
+    }
+
+    /** `dir/name`, or `dir/name (2)` and on while one of those names is there. */
+    fun uniqueDir(dir: File, name: String): File {
+        var target = File(dir, name)
+        if (!target.exists()) return target
+        var index = 2
+        while (true) {
+            target = File(dir, "$name ($index)")
+            if (!target.exists()) return target
+            index++
+        }
+    }
+
+    /** Move a tree whole; a rename the file system refuses falls back to a copy. */
+    fun moveTree(source: File, target: File): Boolean {
+        target.parentFile?.mkdirs()
+        if (source.renameTo(target)) return true
+        return try {
+            copyFiles(source, target)
+            deleteTree(source)
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun copyFiles(source: File, target: File) {
+        if (source.isDirectory) {
+            target.mkdirs()
+            source.listFiles()?.forEach { copyFiles(it, File(target, it.name)) }
+            return
+        }
+        target.parentFile?.mkdirs()
+        source.inputStream().use { input ->
+            target.outputStream().use { sink ->
+                val buffer = ByteArray(1 shl 16)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read <= 0) break
+                    sink.write(buffer, 0, read)
+                }
+            }
+        }
+    }
+
+    /** Remove a tree best-effort; false when something survived. */
+    fun deleteTree(root: File): Boolean {
+        if (root.isDirectory) {
+            root.listFiles()?.forEach { deleteTree(it) }
+        }
+        return root.delete() || !root.exists()
+    }
+
     /** Both masters the engine requires, in the order it names them. */
     private val MASTERS = listOf("ra2md.mix", "ra2.mix")
 
