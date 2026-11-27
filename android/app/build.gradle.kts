@@ -23,7 +23,7 @@ val veraVersionName: String = rootProject.file("../Cargo.toml")
     .first { it.trimStart().startsWith("version = ") }
     .substringAfter('"')
     .substringBefore('"')
-val veraVersionCode = 207
+val veraVersionCode = 208
 
 android {
     namespace = "org.vera20k"
