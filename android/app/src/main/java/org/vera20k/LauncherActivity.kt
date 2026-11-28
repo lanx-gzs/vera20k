@@ -64,6 +64,9 @@ class LauncherActivity : Activity() {
         /** A ZIP / 7z to unpack into private storage, then use as game or mod. */
         const val REQUEST_ARCHIVE = 0x5659
 
+        /** The in-app site browser; it returns the file it downloaded. */
+        const val REQUEST_BROWSER = 0x5660
+
         /** What the archive picker offers; the format is sniffed, not trusted. */
         val ARCHIVE_MIME_TYPES = arrayOf(
             "application/zip",
@@ -818,13 +821,13 @@ class LauncherActivity : Activity() {
             startActivity(Intent(this@LauncherActivity, MapActivity::class.java))
         })
         tools.addView(divider())
-        // The community site players already use for maps and mods. Only a
-        // browser link: this app neither downloads nor hosts anything from it.
+        // The community site players already use for maps and mods, opened in
+        // the app's own browser so a download comes straight back here.
         tools.addView(
             mineRow(
                 R.drawable.ic_import,
                 "资源站",
-                "mycnc.net · 第三方站点，用浏览器打开",
+                "mycnc.net · 应用内浏览，下载后直接导入",
             ) { openResourceSite() },
         )
         column.addView(tools)
@@ -916,23 +919,19 @@ class LauncherActivity : Activity() {
     }
 
     /**
-     * Opens the community resource site in whatever browser the phone has.
+     * Opens the community resource site in the app's own browser.
      *
-     * Deliberately a plain link, not a downloader: the site is run by other
-     * people, this app does not host, mirror or verify anything on it, and the
-     * download lands wherever the browser puts it. The player then brings the
-     * archive back through 「导入压缩包」, which unpacks it into this app's own
-     * folder and asks whether it is the game or a mod.
+     * In-app on purpose: the download then lands in `filesDir`, and comes
+     * straight back here so the player can say whether it is the game or a
+     * mod — no trip through the phone's Download folder, no file manager.
+     * The site itself is run by other people; this app hosts none of it.
      */
     private fun openResourceSite() {
-        val opened = runCatching {
-            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.mycnc.net/")))
-        }.isSuccess
-        if (!opened) {
-            toast("没有可用的浏览器")
-            return
-        }
-        toast("第三方站点，注意确认资源授权\n下载完成后回到这里，用「导入压缩包」选择它")
+        startActivityForResult(
+            Intent(this, BrowserActivity::class.java)
+                .putExtra(BrowserActivity.EXTRA_URL, BrowserActivity.START_URL),
+            REQUEST_BROWSER,
+        )
     }
 
     /** A floating pill over the content, the shape modern phone apps settled on. */
@@ -2173,6 +2172,10 @@ class LauncherActivity : Activity() {
                 data.data?.let { importArchive(it) }
                 return
             }
+            REQUEST_BROWSER -> {
+                data.getStringExtra(BrowserActivity.EXTRA_FILE)?.let { acceptDownload(it) }
+                return
+            }
         }
         val dir = currentDir ?: return
         when (requestCode) {
@@ -2246,33 +2249,139 @@ class LauncherActivity : Activity() {
      */
     private fun importArchive(uri: Uri) {
         val label = Importers.displayName(this, uri).substringBeforeLast('.')
+        unpackThenAsk(label) { staging, counter ->
+            Importers.extractArchive(this, uri, staging) { files, bytes ->
+                if (files < 4 || files % 50 == 0) {
+                    counter("已解压 $files 个文件\n" + formatSize(bytes))
+                }
+            }
+        }
+    }
+
+    /**
+     * A file the in-app browser downloaded.
+     *
+     * Archives go through the same staging-then-ask path as a picked one; a
+     * loose file (a single .mix, .map, .ini …) cannot be "a game" on its own,
+     * so it is offered as one file placed either in the game folder or inside
+     * a mod folder of its own.
+     */
+    private fun acceptDownload(path: String) {
+        val file = File(path)
+        if (!file.isFile || file.length() == 0L) {
+            toast("下载的文件不存在或为空")
+            return
+        }
+        val label = file.name.substringBeforeLast('.').ifBlank { file.name }
+        when (Importers.archiveKindOf(file)) {
+            "zip", "7z" -> unpackThenAsk(label, onDone = { dropDownload(file) }) { staging, counter ->
+                Importers.extractArchive(this, file, staging) { files, bytes ->
+                    if (files < 4 || files % 50 == 0) {
+                        counter("已解压 $files 个文件\n" + formatSize(bytes))
+                    }
+                }
+            }
+            "rar" -> {
+                dropDownload(file)
+                toast("暂不支持 RAR：请先在站点上换成 ZIP 或 7z")
+            }
+            else -> askLooseFile(file, label)
+        }
+    }
+
+    /** The sheet for a non-archive download: one file, two places, or delete. */
+    private fun askLooseFile(file: File, label: String) {
+        showSheet(
+            "已下载「${file.name}」",
+            "这不是压缩包（" + formatSize(file.length()) + "）。\n" +
+                "只有单个文件时，可以放进游戏目录，或单独做成一个模组。",
+            listOf(
+                SheetAction("放进游戏目录") { placeLoose(file, mod = false) },
+                SheetAction("作为模组放进 Mods") { placeLoose(file, mod = true) },
+                SheetAction("删除", danger = true) {
+                    dropDownload(file)
+                    toast("已删除下载的文件")
+                },
+            ),
+        )
+    }
+
+    private fun placeLoose(file: File, mod: Boolean) {
+        val counter = progress(if (mod) "正在放进 Mods…" else "正在放进游戏目录…")
+        Thread {
+            val message = try {
+                val target = if (mod) {
+                    Importers.uniqueDir(Importers.modsDir(this), Importers.plainFolderName(file.nameWithoutExtension))
+                } else {
+                    gameRoot
+                }
+                if (!Importers.moveTree(file, File(target, file.name))) {
+                    throw java.io.IOException("无法写入 " + target.name)
+                }
+                dropDownload(file)
+                if (mod) {
+                    "已放进 Mods/${target.name}\n到「模组」页点它启用"
+                } else {
+                    "已放进 " + gameRoot.name
+                }
+            } catch (error: Throwable) {
+                "放入失败：" + (error.message ?: "无法写入")
+            }
+            runOnUiThread {
+                dismissProgress()
+                toast(message)
+                if (mod) refreshMods() else afterImport()
+            }
+        }.start()
+    }
+
+    /** Removes the per-download folder; the file in it has been dealt with. */
+    private fun dropDownload(file: File) {
+        val parent = file.parentFile
+        if (parent != null && parent.name.startsWith(".download-")) {
+            Importers.deleteTree(parent)
+        } else {
+            file.delete()
+        }
+    }
+
+    /**
+     * Unpack into a private staging folder, then ask what it is for.
+     *
+     * `onDone` runs after a successful unpack (the source download can then be
+     * dropped); on failure the staging folder is removed and the message is
+     * shown instead, so a bad archive never leaves half an installation.
+     */
+    private fun unpackThenAsk(
+        label: String,
+        onDone: () -> Unit = {},
+        unpack: (staging: File, counter: (String) -> Unit) -> Pair<Int, Long>,
+    ) {
         val counter = progress("正在解压…")
         Thread {
             val staging = File(
                 Importers.settingsDir(this),
                 ".archive-" + System.currentTimeMillis(),
             )
-            val failure = try {
-                Importers.extractArchive(this, uri, staging) { files, bytes ->
-                    if (files < 4 || files % 50 == 0) {
-                        counter("已解压 $files 个文件\n" + formatSize(bytes))
-                    }
-                }
-                null
+            var failure: String? = null
+            try {
+                unpack(staging) { counter(it) }
             } catch (error: Throwable) {
                 Importers.deleteTree(staging)
-                "解压失败：" + (error.message ?: "压缩包可能已损坏或被加密")
+                failure = "解压失败：" + (error.message ?: "压缩包可能已损坏或被加密")
             }
             runOnUiThread {
                 dismissProgress()
                 if (failure != null) {
                     toast(failure)
                 } else {
+                    onDone()
                     askArchiveTarget(staging, label)
                 }
             }
         }.start()
     }
+
 
     /** What to do with an unpacked archive: game, mod, or nothing. */
     private fun askArchiveTarget(root: File, label: String) {
