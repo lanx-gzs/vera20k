@@ -177,46 +177,6 @@ internal object Importers {
         }
     }
 
-    /**
-     * Unpack an archive that is already a file in this app's own storage.
-     *
-     * The browser downloads straight into `filesDir`, so there is no document
-     * to copy first: 7z is read in place, ZIP through the same stream reader
-     * the picker uses. Same signature check, same up-front space check.
-     */
-    fun extractArchive(
-        context: Context,
-        file: File,
-        destination: File,
-        onProgress: (files: Int, bytes: Long) -> Unit,
-    ): Pair<Int, Long> {
-        val size = file.length()
-        if (size > 0 && context.filesDir.usableSpace < size * 2) {
-            throw IOException(
-                "空间不足：压缩包 " + (size shr 20) + " MB，大约还要两倍空间，当前剩余 " +
-                    (context.filesDir.usableSpace shr 20) + " MB",
-            )
-        }
-        return when (archiveKindOf(file)) {
-            "7z" -> Archives.extractSevenZip(file, destination, onProgress)
-            "rar" -> throw IOException("暂不支持 RAR：请先解成 ZIP 或 7z 再导入")
-            else -> unpackZip(file.inputStream(), destination, onProgress)
-        }
-    }
-
-    /** The archive's kind from its first bytes: "7z", "zip", "rar" or "". */
-    fun archiveKindOf(file: File): String {
-        val head = ByteArray(8)
-        return try {
-            file.inputStream().use { input ->
-                val read = input.read(head)
-                if (read > 0) Archives.kindOf(head.copyOf(read)) else ""
-            }
-        } catch (_: Throwable) {
-            ""
-        }
-    }
-
     /** The archive's kind from its first bytes: "7z", "zip", "rar" or "". */
     private fun archiveKind(context: Context, uri: Uri): String {
         val head = ByteArray(8)

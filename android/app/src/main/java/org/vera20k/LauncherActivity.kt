@@ -64,9 +64,6 @@ class LauncherActivity : Activity() {
         /** A ZIP / 7z to unpack into private storage, then use as game or mod. */
         const val REQUEST_ARCHIVE = 0x5659
 
-        /** The in-app site browser; it returns the file it downloaded. */
-        const val REQUEST_BROWSER = 0x5660
-
         /** What the archive picker offers; the format is sniffed, not trusted. */
         val ARCHIVE_MIME_TYPES = arrayOf(
             "application/zip",
@@ -695,12 +692,7 @@ class LauncherActivity : Activity() {
     }
 
     private fun startModZip() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, ARCHIVE_MIME_TYPES)
-        }
-        startActivityForResult(intent, REQUEST_MOD_ZIP)
+        startActivityForResult(archivePicker(), REQUEST_MOD_ZIP)
     }
 
     private fun startModTree() {
@@ -827,7 +819,7 @@ class LauncherActivity : Activity() {
             mineRow(
                 R.drawable.ic_import,
                 "资源站",
-                "mycnc.net · 应用内浏览，下载后直接导入",
+                "mycnc.net · 第三方站点，用系统浏览器打开",
             ) { openResourceSite() },
         )
         column.addView(tools)
@@ -919,19 +911,25 @@ class LauncherActivity : Activity() {
     }
 
     /**
-     * Opens the community resource site in the app's own browser.
+     * Opens the community resource site in the phone's own browser.
      *
-     * In-app on purpose: the download then lands in `filesDir`, and comes
-     * straight back here so the player can say whether it is the game or a
-     * mod — no trip through the phone's Download folder, no file manager.
-     * The site itself is run by other people; this app hosts none of it.
+     * A WebView was tried first and dropped: the site's pages are heavier than
+     * a small in-app view handles well, and the system browser already has the
+     * logins, the download handling and the PDF/JS quirks worked out. The cost
+     * is that the file lands in the phone's Download folder rather than in
+     * `filesDir`, so the import sheet opens the picker at that folder and the
+     * player picks the archive from there — no permissions, no file manager
+     * digging. The site is run by other people; this app hosts none of it.
      */
     private fun openResourceSite() {
-        startActivityForResult(
-            Intent(this, BrowserActivity::class.java)
-                .putExtra(BrowserActivity.EXTRA_URL, BrowserActivity.START_URL),
-            REQUEST_BROWSER,
-        )
+        val opened = runCatching {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.mycnc.net/")))
+        }.isSuccess
+        if (!opened) {
+            toast("没有可用的浏览器")
+            return
+        }
+        toast("第三方站点，注意确认资源授权\n下载完成后回到「文件」→「导入」→「导入压缩包」，从「下载」里选它")
     }
 
     /** A floating pill over the content, the shape modern phone apps settled on. */
@@ -2135,22 +2133,35 @@ class LauncherActivity : Activity() {
     }
 
     private fun startImportZip() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, ARCHIVE_MIME_TYPES)
-        }
-        startActivityForResult(intent, REQUEST_IMPORT_ZIP)
+        startActivityForResult(archivePicker(), REQUEST_IMPORT_ZIP)
     }
 
     /** The archive entry: unpack into private storage, then ask what it is. */
     private fun startArchivePick() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, ARCHIVE_MIME_TYPES)
+        startActivityForResult(archivePicker(), REQUEST_ARCHIVE)
+    }
+
+    /**
+     * The picker for archives, opened at the phone's Download folder.
+     *
+     * Since the resource site is browsed in the system browser, its download
+     * lands there — that is the folder a player is about to look in, so the
+     * picker starts in it. The extra is a hint only: a provider that does not
+     * understand it ignores it and opens wherever it normally would.
+     */
+    private fun archivePicker(): Intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+        addCategory(Intent.CATEGORY_OPENABLE)
+        type = "*/*"
+        putExtra(Intent.EXTRA_MIME_TYPES, ARCHIVE_MIME_TYPES)
+        runCatching {
+            putExtra(
+                android.provider.DocumentsContract.EXTRA_INITIAL_URI,
+                android.provider.DocumentsContract.buildRootUri(
+                    "com.android.providers.downloads.documents",
+                    "downloads",
+                ),
+            )
         }
-        startActivityForResult(intent, REQUEST_ARCHIVE)
     }
 
     @Deprecated("Deprecated in Java")
@@ -2170,10 +2181,6 @@ class LauncherActivity : Activity() {
             }
             REQUEST_ARCHIVE -> {
                 data.data?.let { importArchive(it) }
-                return
-            }
-            REQUEST_BROWSER -> {
-                data.getStringExtra(BrowserActivity.EXTRA_FILE)?.let { acceptDownload(it) }
                 return
             }
         }
@@ -2255,93 +2262,6 @@ class LauncherActivity : Activity() {
                     counter("已解压 $files 个文件\n" + formatSize(bytes))
                 }
             }
-        }
-    }
-
-    /**
-     * A file the in-app browser downloaded.
-     *
-     * Archives go through the same staging-then-ask path as a picked one; a
-     * loose file (a single .mix, .map, .ini …) cannot be "a game" on its own,
-     * so it is offered as one file placed either in the game folder or inside
-     * a mod folder of its own.
-     */
-    private fun acceptDownload(path: String) {
-        val file = File(path)
-        if (!file.isFile || file.length() == 0L) {
-            toast("下载的文件不存在或为空")
-            return
-        }
-        val label = file.name.substringBeforeLast('.').ifBlank { file.name }
-        when (Importers.archiveKindOf(file)) {
-            "zip", "7z" -> unpackThenAsk(label, onDone = { dropDownload(file) }) { staging, counter ->
-                Importers.extractArchive(this, file, staging) { files, bytes ->
-                    if (files < 4 || files % 50 == 0) {
-                        counter("已解压 $files 个文件\n" + formatSize(bytes))
-                    }
-                }
-            }
-            "rar" -> {
-                dropDownload(file)
-                toast("暂不支持 RAR：请先在站点上换成 ZIP 或 7z")
-            }
-            else -> askLooseFile(file, label)
-        }
-    }
-
-    /** The sheet for a non-archive download: one file, two places, or delete. */
-    private fun askLooseFile(file: File, label: String) {
-        showSheet(
-            "已下载「${file.name}」",
-            "这不是压缩包（" + formatSize(file.length()) + "）。\n" +
-                "只有单个文件时，可以放进游戏目录，或单独做成一个模组。",
-            listOf(
-                SheetAction("放进游戏目录") { placeLoose(file, mod = false) },
-                SheetAction("作为模组放进 Mods") { placeLoose(file, mod = true) },
-                SheetAction("删除", danger = true) {
-                    dropDownload(file)
-                    toast("已删除下载的文件")
-                },
-            ),
-        )
-    }
-
-    private fun placeLoose(file: File, mod: Boolean) {
-        val counter = progress(if (mod) "正在放进 Mods…" else "正在放进游戏目录…")
-        Thread {
-            val message = try {
-                val target = if (mod) {
-                    Importers.uniqueDir(Importers.modsDir(this), Importers.plainFolderName(file.nameWithoutExtension))
-                } else {
-                    gameRoot
-                }
-                if (!Importers.moveTree(file, File(target, file.name))) {
-                    throw java.io.IOException("无法写入 " + target.name)
-                }
-                dropDownload(file)
-                if (mod) {
-                    "已放进 Mods/${target.name}\n到「模组」页点它启用"
-                } else {
-                    "已放进 " + gameRoot.name
-                }
-            } catch (error: Throwable) {
-                "放入失败：" + (error.message ?: "无法写入")
-            }
-            runOnUiThread {
-                dismissProgress()
-                toast(message)
-                if (mod) refreshMods() else afterImport()
-            }
-        }.start()
-    }
-
-    /** Removes the per-download folder; the file in it has been dealt with. */
-    private fun dropDownload(file: File) {
-        val parent = file.parentFile
-        if (parent != null && parent.name.startsWith(".download-")) {
-            Importers.deleteTree(parent)
-        } else {
-            file.delete()
         }
     }
 
